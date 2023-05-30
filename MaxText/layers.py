@@ -31,6 +31,7 @@ import numpy as np
 import jax
 from jax import lax
 from jax import random
+from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
 
 
@@ -313,10 +314,13 @@ class MultiHeadDotProductAttention(nn.Module):
     query = nn.with_logical_constraint(
         query, ('activation_batch', 'activation_length', 'activation_heads', 'activation_kv')
     )
+    query = checkpoint_name(query, 'query_proj')
     key = nn.with_logical_constraint(key, ('activation_batch', 'activation_length', 'activation_heads', 'activation_kv'))
+    key = checkpoint_name(key, 'key_proj')
     value = nn.with_logical_constraint(
         value, ('activation_batch', 'activation_length', 'activation_heads', 'activation_kv')
     )
+    value = checkpoint_name(value, 'value_proj')
 
     if decode:
       # Detect if we're initializing by absence of existing cache data.
@@ -342,7 +346,7 @@ class MultiHeadDotProductAttention(nn.Module):
         expected_shape = (batch, 1, num_heads, head_dim)
         if expected_shape != query.shape:
           raise ValueError(f"""Autoregressive cache shape error,
-                           expected query shape %s instead got 
+                           expected query shape %s instead got
                            {(expected_shape, query.shape)}""")
         # Create a OHE of the current index. NOTE: the index is increased below.
         cur_index = cache_index.value
@@ -417,6 +421,7 @@ class MultiHeadDotProductAttention(nn.Module):
         deterministic=deterministic,
         dtype=self.dtype,
         float32_logits=self.float32_logits)
+    x = checkpoint_name(x, 'context')
 
     # Back to the original inputs dimensions.
     out = DenseGeneral(
@@ -425,8 +430,8 @@ class MultiHeadDotProductAttention(nn.Module):
         kernel_init=self.kernel_init,
         kernel_axes=('heads', 'kv', 'embed'),
         dtype=self.dtype,
-        name='out')(
-            x)
+        name='out')(x)
+    out = checkpoint_name(out, 'out_proj')
     return out
 
 
@@ -1011,8 +1016,15 @@ class Decoder(nn.Module):
     if cfg.remat_policy not in (None, 'none'):
       if cfg.remat_policy == 'minimal':
         policy = jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims
-      else:
+      elif cfg.remat_policy == 'full':
         policy = None
+      elif cfg.remat_policy == 'custom':
+        #policy_1 = jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims
+        policy = jax.checkpoint_policies.save_only_these_names(
+            'query_proj', 'value_proj', 'key_proj'
+        )
+        #policy = jax.checkpoint_policies.save_from_both_policies(policy_1, policy_2)
+
       BlockLayer = nn.remat(  # pylint: disable=invalid-name
           BlockLayer,
           prevent_cse=not cfg.scan_layers,

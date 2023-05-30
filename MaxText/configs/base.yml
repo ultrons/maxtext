@@ -26,17 +26,17 @@ metrics_file: "" # for testing, local file that stores scalar metrics. If empty,
 # Activation dtypes.
 dtype: "bfloat16"
 scale: 1
-base_emb_dim: 2048
-base_num_heads: 8
-base_mlp_dim: 8192
-base_num_decoder_layers: 16
-head_dim: 256
+base_emb_dim: 5120
+base_num_heads: 40
+base_mlp_dim: 20480
+base_num_decoder_layers: 80
+head_dim: 128
 # activation functions are .
 mlp_activations: ["relu"]
 dropout_rate: 0
 logits_via_embedding: True  # NOTE: this is True just for testing.
 # minimal, full, or none
-remat_policy: 'minimal'
+remat_policy: 'custom'
 scan_layers: True
 param_scan_axis: 1
 
@@ -67,7 +67,7 @@ dcn_fsdp_parallelism: 1
 dcn_tensor_parallelism: 1
 ici_data_parallelism: 1
 ici_fsdp_parallelism: -1
-ici_tensor_parallelism: 1
+ici_tensor_parallelism: 4
 
 
 # Dataset
@@ -78,19 +78,19 @@ vocab_relative_path: "vocabs"  # Assumes we're allowed
 dataset_name: 'c4/en:3.0.1'
 eval_dataset_name: 'c4/en:3.0.1'
 eval_split: 'validation'
-per_device_batch_size: 32
+per_device_batch_size: 2
 eval_per_device_batch_size: 0
 max_corpus_chars: 10_000_000
 
 # Training loop
-steps: 150_001
+steps: 10
 log_period: 10
 save_period: 10_000
 learning_rate: 3.e-5
 warmup_steps: 15_000
 
 # Maximum length cutoff for training examples.
-max_target_length: 1024
+max_target_length: 2048
 # Maximum length cutoff for held-out evaluation examples.
 max_eval_target_length: 512
 
@@ -104,7 +104,7 @@ eos_id: 2  # sentencepiece default
 # Prompt for language model sampling.
 prompt: "I love to "
 
-enable_profiler: False
+enable_profiler: True
 enable_checkpointing: True
 
 # Set these two to False to run deterministically (i.e. reproducible losses)
