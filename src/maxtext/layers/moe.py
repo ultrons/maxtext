@@ -1884,10 +1884,17 @@ class RoutedMoE(nnx.Module):
         raise ValueError(f"moe_n_chunks={n_chunks} must evenly divide the MoE sequence length {seq_len}.")
       chunk = seq_len // n_chunks
       outs, lb_losses, bias_updates_list = [], [], []
+      _prev = None
       for c in range(n_chunks):
         sl = slice(c * chunk, (c + 1) * chunk)
+        x_c = x[:, sl, :]
+        # Diagnostic: fence each chunk's input on the previous chunk's output so XLA
+        # cannot interleave/fuse the chunks -- forces sequential pipelining. Math is
+        # unchanged (the barrier is identity), so loss stays bit-exact.
+        if self.config.moe_chunk_barrier and _prev is not None:
+          x_c, _prev = jax.lax.optimization_barrier((x_c, _prev))
         out_c, lb_c, bu_c = _moe_body(
-            x[:, sl, :],
+            x_c,
             logits[:, sl, :],
             None if pre_bias_logits is None else pre_bias_logits[:, sl, :],
             w0,
@@ -1899,6 +1906,8 @@ class RoutedMoE(nnx.Module):
             None if sharded_input_ids is None else sharded_input_ids[:, sl],
             rngs,
         )
+        if self.config.moe_chunk_barrier:
+          _prev = out_c
         outs.append(out_c)
         lb_losses.append(lb_c)
         bias_updates_list.append(bu_c)
