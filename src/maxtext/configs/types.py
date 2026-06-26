@@ -763,6 +763,16 @@ class MoEGeneral(BaseModel):
           "overlaps the previous chunk's GMM compute. Requires use_ring_of_experts=True."
       ),
   )
+  moe_chunk_barrier: bool = Field(
+      False,
+      description=(
+          "Diagnostic (profiling, not production). When True, chain the chunked ring-of-experts MoE loop so each "
+          "chunk's input is fenced with jax.lax.optimization_barrier on the previous chunk's output, forcing XLA "
+          "to run the chunks sequentially (no interleave/fusion). Math is unchanged (barrier is identity), so loss "
+          "stays bit-exact. Used to test whether the token-AG/RS chunks overlap at all today. Requires "
+          "moe_n_chunks>1 and use_ring_of_experts=True to have any effect."
+      ),
+  )
   moe_expert_input_dim: int = Field(
       -1,
       description="Dimension of tokens entering the MoE layer. If < 0, defaults to emb_dim.",

@@ -208,6 +208,7 @@ megablox: true
 sparse_matmul: true
 capacity_factor: -1.0 # a factor to decide expert capacity for token dropping, and no dropping by default
 moe_n_chunks: 1 # split routed-MoE tokens into N chunks (ring-of-experts path) so each chunk's EP all-gather / reduce-scatter overlaps the previous chunk's GMM compute. 1 = disabled (identical to baseline).
+moe_chunk_barrier: false # diagnostic (profiling, not production): chain the chunked ring-of-experts MoE loop with optimization_barrier so each chunk's input is fenced on the previous chunk's output, forcing sequential (no-interleave) chunk execution. Math unchanged (barrier is identity), loss bit-exact. Needs moe_n_chunks>1 + use_ring_of_experts=True to matter.
 ragged_buffer_factor: -1.0 # a factor to determine the size of the ragged buffer for routed MoE activations.
 # By default (-1), the routed buffer is worst case size to ensure no dropping.
 # When set to 1.0 this buffer if set to the size assuming perfectly balanced. If the routing dictates
