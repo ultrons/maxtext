@@ -1781,32 +1781,7 @@ class RoutedMoE(nnx.Module):
           axis_name=self._expert_parallelism_name,
       )
 
-    @functools.partial(
-        jax.shard_map,
-        mesh=self.mesh,
-        in_specs=(
-            input_partition_pspec,
-            gate_logits_pspec,
-            pre_bias_logits_pspec,
-            w0_pspec,
-            w1_pspec,
-            wo_pspec,
-            w0_bias_pspec,
-            w1_bias_pspec,
-            wo_bias_pspec,
-            decoder_tokens_pspec,
-            P(),  # Replicate the input key
-        ),
-        out_specs=(
-            self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", "activation_embed")),
-            P(),  # Handle None or replicate the output
-            P(),  # Handle None or replicate the output
-        ),
-        check_vma=self.config.check_vma,
-    )
-    def sparse_matmul_route_and_compute(
-        x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs
-    ):
+    def _moe_body(x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs):
       batch_size, sequence_length, _ = x.shape
       x, routing, route_metadata = route(x, logits, pre_bias_logits, rngs, input_ids=sharded_input_ids)
 
@@ -1881,6 +1856,75 @@ class RoutedMoE(nnx.Module):
       )
 
       return output, routing.lb_loss, routing.bias_updates
+
+    @functools.partial(
+        jax.shard_map,
+        mesh=self.mesh,
+        in_specs=(
+            input_partition_pspec,
+            gate_logits_pspec,
+            pre_bias_logits_pspec,
+            w0_pspec,
+            w1_pspec,
+            wo_pspec,
+            w0_bias_pspec,
+            w1_bias_pspec,
+            wo_bias_pspec,
+            decoder_tokens_pspec,
+            P(),  # Replicate the input key
+        ),
+        out_specs=(
+            self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", "activation_embed")),
+            P(),  # Handle None or replicate the output
+            P(),  # Handle None or replicate the output
+        ),
+        check_vma=self.config.check_vma,
+    )
+    def sparse_matmul_route_and_compute(
+        x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs
+    ):
+      # The expert weights (w0/w1/wo) are all-gathered over FSDP once at this
+      # shard_map entry (implicitly, via the `embed_tensor_transpose` pspec which
+      # drops fsdp -> GSPMD inserts the boundary all-gather) and reused across all
+      # chunks of the ring-of-experts pipeline below.
+      n_chunks = self.config.moe_n_chunks
+      if n_chunks <= 1 or not self.config.use_ring_of_experts:
+        return _moe_body(x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs)
+
+      # Chunked ring-of-experts pipeline: split the per-shard tokens along the
+      # sequence dim into `n_chunks` data-independent chunks. Each chunk runs the
+      # full route -> GMM -> combine path; with no barrier between them XLA is
+      # free to overlap chunk (c+1)'s EP all-gather and chunk (c-1)'s
+      # reduce-scatter with chunk c's GMM compute. Token routing is per-token, so
+      # the main (lm) output is identical to n_chunks=1; only the aggregate
+      # load-balance loss / bias updates are averaged across chunks.
+      seq_len = x.shape[1]
+      if seq_len % n_chunks != 0:
+        raise ValueError(f"moe_n_chunks={n_chunks} must evenly divide the MoE sequence length {seq_len}.")
+      chunk = seq_len // n_chunks
+      outs, lb_losses, bias_updates_list = [], [], []
+      for c in range(n_chunks):
+        sl = slice(c * chunk, (c + 1) * chunk)
+        out_c, lb_c, bu_c = _moe_body(
+            x[:, sl, :],
+            logits[:, sl, :],
+            None if pre_bias_logits is None else pre_bias_logits[:, sl, :],
+            w0,
+            w1,
+            wo,
+            w0_bias,
+            w1_bias,
+            wo_bias,
+            None if sharded_input_ids is None else sharded_input_ids[:, sl],
+            rngs,
+        )
+        outs.append(out_c)
+        lb_losses.append(lb_c)
+        bias_updates_list.append(bu_c)
+      output = jnp.concatenate(outs, axis=1)
+      lb_loss = None if lb_losses[0] is None else sum(lb_losses) / n_chunks
+      bias_updates = None if bias_updates_list[0] is None else sum(bias_updates_list) / n_chunks
+      return output, lb_loss, bias_updates
 
     if self.config.moe_fsdp_use_two_stage_all_gather:
       # Unshard on fsdp axis
