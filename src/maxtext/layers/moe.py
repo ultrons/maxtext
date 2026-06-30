@@ -37,6 +37,7 @@ from maxtext.layers import attentions, linears, nnx_wrappers, quantizations
 from maxtext.layers.initializers import NdInitializer, default_bias_init, nd_dense_init, variable_to_logically_partitioned
 from maxtext.kernels.ragged.ragged_sort import a2a_ragged_sort
 from maxtext.kernels.ragged.ragged_sort import a2a_ragged_unsort
+from maxtext.kernels.ragged.ragged_sort import chunked_ring_combine_reduce_scatter
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_sort
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_unsort
 from maxtext.utils import max_logging
@@ -1830,6 +1831,37 @@ class RoutedMoE(nnx.Module):
       if self.config.mlp_bias:
         intermediate_output = intermediate_output + wo_bias
       intermediate_output = adc.checkpoint_name(adc.checkpoint_name(intermediate_output, "mlpwo"), "moe_mlpwo")
+
+      if (
+          self.config.use_ring_of_experts
+          and self.config.decouple_combine_rs_chunks > 1
+          and isinstance(self._expert_parallelism_name, str)
+      ):
+        # DECOUPLED chunked combine->RS: the GMM ran FULL above; here we chunk ONLY combine+RS so
+        # each chunk's reduce-scatter hides under the next chunk's combine (validated v7x). The
+        # expert-sorted GMM output is read WHOLE per chunk; only the token (output) axis is chunked.
+        # See chunked_ring_combine_reduce_scatter for the expert->token handling + the permute trick.
+        output = chunked_ring_combine_reduce_scatter(
+            intermediate_output,
+            routing.group_sizes,
+            routing.sorted_selected_experts,
+            self.num_experts_per_tok,
+            self.config.num_experts // self.get_expert_parallelism_size(),
+            self._expert_parallelism_name,
+            jnp.ravel(routing.weights).astype(jnp.float32),
+            self.get_expert_parallelism_size(),
+            self.config.decouple_combine_rs_chunks,
+            enforce_gather_fallback=self.config.ragged_gather_fallback,
+            enforce_gather_reduce_fallback=self.config.ragged_gather_reduce_fallback,
+            gather_flops_override=self.config.ragged_gather_cost_estimate_flops,
+            gather_reduce_flops_override=self.config.ragged_gather_reduce_cost_estimate_flops,
+            gather_bytes_accessed_override=self.config.ragged_gather_cost_estimate_bytes_accessed,
+            gather_reduce_bytes_accessed_override=self.config.ragged_gather_reduce_cost_estimate_bytes_accessed,
+        )
+        output = output.reshape(
+            -1, sequence_length, self.moe_expert_input_dim // self.get_tensor_parallelism_size()
+        ).astype(self.dtype)
+        return output, routing.lb_loss, routing.bias_updates
 
       if self.config.use_ring_of_experts:
         # Unsort and deduplicate the outputs locally.
