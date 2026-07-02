@@ -162,7 +162,15 @@ def main_kernel(
   )
   def inner_kernel():
     core_id = pl.program_id(0)
-    row_partition_size = in_hbm_ref.shape[0] // num_row_partitions
+    # Partition stride over the SLOT arrays (src/dst indices, weights) must be
+    # derived from the indices operand itself, NOT from the input buffer: the
+    # chunked combine (decouple_combine_rs_chunks) passes the FULL expert-sorted
+    # buffer with a per-chunk SLICE of the indices, so in_hbm_ref.shape[0] can be
+    # N x larger than the slot arrays. Deriving the stride from in_hbm_ref made
+    # every row partition p >= 1 read src/dst/weights OUT OF BOUNDS (silently,
+    # with disable_bounds_checks=True) and scatter garbage -- for EVERY n_chunks
+    # > 1. For the un-chunked call the two are equal, so this is a no-op there.
+    row_partition_size = src_indices_hbm_ref.shape[0] // num_row_partitions
     row_partition_id = core_id // num_column_partitions
     col_partition_id = core_id % num_column_partitions
 
@@ -522,9 +530,19 @@ def ragged_gather_reduce(
   )
   pad_input_size = padded_input_size - input_size
 
+  # Pad x's ROWS independently of the index count: x's row count is not tied
+  # to indices.size (the chunked combine passes the full buffer with a slice of
+  # the indices; the truncated-buffer mode passes a packed buffer shorter than
+  # the index list). We need (a) row 0..padded index targets valid, and (b) the
+  # row count to remain a multiple of the 32-bit packing factor used by the
+  # kernel's bitcast view. For the standard x.shape[0] == input_size call this
+  # equals the previous ((0, pad_input_size)) padding exactly.
+  input_packing = 32 // (dtype_bytes * 8)
+  pad_x_rows = max(padded_input_size - x.shape[0], 0)
+  pad_x_rows += -(x.shape[0] + pad_x_rows) % input_packing
   x = jnp.pad(
       x,
-      ((0, pad_input_size), (0, aligned_hidden_size - hidden_size)),
+      ((0, pad_x_rows), (0, aligned_hidden_size - hidden_size)),
       constant_values=0,
   )
   indices = jnp.pad(indices, (0, pad_input_size), constant_values=0)

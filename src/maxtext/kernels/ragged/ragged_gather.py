@@ -333,7 +333,16 @@ def _fallback_implementation(
   """Fallback to (non-ragged) JAX implementation for ragged gather."""
   out = x[indices]
   if has_weights:
-    out = out * weights[:, None]
+    # Match the SC kernel's dtype contract: weights are applied in float32 and
+    # the result is written back in x.dtype (the kernel unpacks bf16 -> f32,
+    # multiplies by the f32 weight, and repacks to bf16; its output buffer is
+    # x.dtype). The previous version let bf16 * f32 PROMOTE the output to f32,
+    # which leaked an f32 cotangent out of _ring_ragged_unsort_bwd into the
+    # tokamax gmm_v2 backward: an f32-LHS gmm sets size_lhs_sublane=8, and its
+    # bf16 output zero-fill then fails Mosaic tiling ("Expected the 2nd minor
+    # dimension is aligned to the tile", memref 8192x128xbf16 ->
+    # 1024x8x128xbf16 in left_fill_zero/dma_start).
+    out = (out.astype(jnp.float32) * weights[:, None].astype(jnp.float32)).astype(x.dtype)
   return out
 
 

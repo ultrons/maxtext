@@ -135,10 +135,101 @@ def _report(name, ref, out, ep_size, n_chunks):
   return max_all, max_c0, max_rest
 
 
+def _emulate_sc_gather_reduce(x, indices, weights, valid_mask, k, num_row_partitions, lanes, stride_from_buffer):
+  """Numpy emulation of the SC ragged_gather_reduce wrapper + main_kernel ADDRESSING.
+
+  Mirrors: wrapper padding, _preprocess (per-partition validity compaction, src/dst/weights),
+  and inner_kernel's row-partition addressing (row_start = p * row_partition_size, reading
+  ceil(nvalid_p / lanes) * lanes rows of the slot arrays). ``stride_from_buffer=True``
+  reproduces the ORIGINAL bug: row_partition_size = in_hbm_ref.shape[0] // P (the x buffer's
+  row count); ``False`` uses the FIXED expression: src_indices_hbm_ref.shape[0] // P. Raises
+  IndexError when a partition would read the slot arrays out of bounds (on hardware this is a
+  SILENT garbage read: disable_bounds_checks=True); otherwise returns the numeric result.
+  """
+  import math as _math
+
+  n = indices.shape[0]
+  p_cnt, hidden = num_row_partitions, x.shape[1]
+  align = _math.lcm(p_cnt * lanes, k)
+  padded = -(-n // align) * align
+  idx = np.pad(indices, (0, padded - n))
+  wts = np.pad(weights, (0, padded - n))
+  msk = np.pad(valid_mask, (0, padded - n))
+  x_rows = max(padded, x.shape[0])  # wrapper pads x rows up to padded_input_size if shorter
+  xp = np.zeros((x_rows, hidden), np.float32)
+  xp[: x.shape[0]] = x
+
+  # _preprocess: compact valid slots to the front of each partition (stable), build src/dst/w
+  rps = padded // p_cnt
+  m2 = msk.reshape(p_cnt, rps)
+  order = np.argsort(~m2, axis=-1, kind="stable") + np.arange(p_cnt)[:, None] * rps
+  order = order.reshape(-1)
+  src, dst, w_s = idx[order], order // k, wts[order]
+  nvalid = m2.sum(axis=-1)
+
+  # inner_kernel addressing
+  stride = (x_rows if stride_from_buffer else padded) // p_cnt
+  out = np.zeros((padded // k, hidden), np.float32)
+  for p in range(p_cnt):
+    n_rows = int(-(-int(nvalid[p]) // lanes) * lanes)  # kernel reads whole lane tiles
+    row_start = p * stride
+    if n_rows and row_start + n_rows > padded:
+      raise IndexError(
+          f"partition {p}: reads slot rows [{row_start}, {row_start + n_rows}) beyond "
+          f"slot-array length {padded} (buffer rows {x_rows}); silent garbage on SC"
+      )
+    for j in range(int(nvalid[p])):
+      r = row_start + j
+      out[dst[r]] += w_s[r] * xp[src[r]]
+  group_mask = msk.reshape(-1, k).any(axis=-1)
+  out = np.where(group_mask[:, None], out, 0.0)
+  return out[: n // k]
+
+
+def sc_kernel_contract_checks(failures):
+  """Emulated-SC checks: the buggy buffer-derived stride violates the slot-array bounds for
+  EVERY n_chunks > 1 (N-independent, matching the cluster step-0 NaN); the fixed stride is
+  exact for all N and identical to the old behavior at N=1."""
+  lanes, p_cnt = 16, 2  # v7x-like: sc num_lanes=16; 16 subcores -> 8 col partitions x 2 row partitions
+  key = jax.random.PRNGKey(0)
+  revert, group_sizes = _make_routing(key, skew=3.0)
+  n_slots = NUM_TOKENS * TOPK
+  x = np.asarray(jax.random.normal(jax.random.fold_in(key, 1), (n_slots, HIDDEN), dtype=jnp.float32))
+  w = np.asarray(jax.random.uniform(jax.random.fold_in(key, 2), (n_slots,), dtype=jnp.float32))
+  starts, ends = _shard_ranges(group_sizes, 8)
+  rv = np.asarray(revert)
+  s = 3  # emulate shard 3's combine call
+  mask_full = (rv >= starts[s]) & (rv < ends[s])
+
+  for n_chunks in (1, 2, 4, 8):
+    spc = n_slots // n_chunks
+    ok_fixed = True
+    oob_chunks = 0
+    for c in range(n_chunks):
+      sl = slice(c * spc, (c + 1) * spc)
+      ref = (x[rv[sl]] * w[sl][:, None] * mask_full[sl][:, None]).reshape(-1, TOPK, HIDDEN).sum(axis=1)
+      got = _emulate_sc_gather_reduce(x, rv[sl], w[sl], mask_full[sl], TOPK, p_cnt, lanes, False)
+      ok_fixed &= np.allclose(ref, got, atol=1e-5)
+      try:
+        _emulate_sc_gather_reduce(x, rv[sl], w[sl], mask_full[sl], TOPK, p_cnt, lanes, True)
+      except IndexError:
+        oob_chunks += 1
+    print(f"  SC-emulation N={n_chunks}: fixed-stride exact={ok_fixed}, buggy-stride OOB chunks={oob_chunks}/{n_chunks}")
+    if not ok_fixed:
+      failures.append(f"SC-emulation N={n_chunks}: fixed stride numerically wrong")
+    if n_chunks > 1 and oob_chunks == 0:
+      failures.append(f"SC-emulation N={n_chunks}: buggy stride did NOT violate bounds (expected OOB)")
+    if n_chunks == 1 and oob_chunks:
+      failures.append("SC-emulation N=1: un-chunked call must not go OOB with either stride")
+
+
 def main():
   devices = np.array(jax.devices())
   assert len(devices) >= 8, f"need 8 CPU devices, got {len(devices)}"
   failures = []
+
+  print("SC ragged_gather_reduce kernel-contract emulation (row-partition stride):")
+  sc_kernel_contract_checks(failures)
 
   for ep_size in (8, 4):
     mesh = jax.sharding.Mesh(devices[:ep_size], ("ep",))
