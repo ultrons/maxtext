@@ -236,6 +236,7 @@ def ring_ragged_unsort(
     gather_bytes_accessed_override=-1,
     gather_reduce_bytes_accessed_override=-1,
     full_num_slots=None,
+    slot_window=None,
 ):
   """Dual of :func:`ring_ragged_sort`.
 
@@ -262,10 +263,17 @@ def ring_ragged_unsort(
     topk_weights: ``[num_tokens_local * topk]`` tensor of per-slot routing weights.
     full_num_slots: static ``int`` -- the TOTAL flat slot count (num_tokens * topk) of the
       WHOLE combine problem. Only needed when ``topk_argsort_revert_indices`` is a SLICE of
-      the full revert permutation (decouple_combine_rs_chunks): the packed-vs-global
-      buffering-mode decision below is a property of the buffer layout (full problem), NOT
-      of the index slice length, so it must compare ``buffer_size`` against the FULL slot
-      count. Defaults to ``topk_argsort_revert_indices.shape[0]`` (un-chunked call).
+      the full revert permutation: the packed-vs-global buffering-mode decision below is a
+      property of the buffer layout (full problem), NOT of the index slice length, so it
+      must compare ``buffer_size`` against the FULL slot count. Defaults to
+      ``topk_argsort_revert_indices.shape[0]`` (un-chunked call).
+    slot_window: optional static ``(start, end)`` pair of Python ints -- restrict this call
+      to the contiguous window of output SLOTS ``[start, end)``. ALL operands keep their
+      FULL (un-chunked) shapes -- the window only ANDs into the validity mask, so the SC
+      kernels see exactly the shapes/contracts of the un-chunked call while doing only the
+      window's share of gather/reduce work (their validity compaction skips masked rows).
+      Output rows outside ``[start // topk, end // topk)`` are zero. This is how
+      decouple_combine_rs_chunks chunks the combine WITHOUT slicing kernel operands.
 
   Returns:
     A 2D ``[num_tokens_local, hidden]`` tensor with expert outputs scattered back
@@ -305,6 +313,16 @@ def ring_ragged_unsort(
     # chunk's slice length while the buffer is still packed/truncated -- comparing against
     # the slice length would mis-read packed local rows at global positions (the
     # decouple_combine_rs_chunks c>0 shard-misalignment bug).
+    if slot_window is not None:
+      # Static contiguous slot window (decouple_combine_rs_chunks): full-shape operands,
+      # validity-restricted work. Slots outside [win_start, win_end) are masked invalid, so
+      # the SC kernel's per-partition validity compaction skips them (~window/total work).
+      win_start, win_end = slot_window
+      slot_pos = jax.lax.iota(jnp.int32, num_tokens)
+      window_mask = (slot_pos >= win_start) & (slot_pos < win_end)
+    else:
+      window_mask = None
+
     if buffer_size >= num_slots:
       # Express the scatter as a gather-reduce: each output row pulls
       # from sorted_tokens_local at position `topk_argsort_revert_indices[i]` if
@@ -313,6 +331,8 @@ def ring_ragged_unsort(
       valid_rows_mask = (topk_argsort_revert_indices >= shard_output_start) & (
           topk_argsort_revert_indices < shard_output_end
       )
+      if window_mask is not None:
+        valid_rows_mask = valid_rows_mask & window_mask
       out = ragged_gather_reduce(
           sorted_tokens_local,
           topk_argsort_revert_indices,
@@ -329,6 +349,8 @@ def ring_ragged_unsort(
       local_num_tokens = shard_output_end - shard_output_start
       limit = jnp.minimum(local_num_tokens, buffer_size)
       valid_rows_mask = (shifted_indices >= 0) & (shifted_indices < limit)
+      if window_mask is not None:
+        valid_rows_mask = valid_rows_mask & window_mask
       safe_indices = jnp.where(valid_rows_mask, shifted_indices, 0)
 
       out = ragged_gather_reduce(
@@ -476,38 +498,37 @@ def chunked_ring_combine_reduce_scatter(
   absorbed). This is DISTINCT from ``moe_n_chunks``, which chunks the whole body (GMM included) and
   so caps at ~2 on GMM efficiency -- here the GMM is untouched, so n_chunks can go large.
 
-  EXPERT-SORTED INPUT vs TOKEN-SORTED RS -- the subtle part, handled explicitly:
-    * ``sorted_tokens_local`` (the GMM2 output) is EXPERT-sorted, and is passed WHOLE to every
-      chunk -- it is NEVER sliced. ``ring_ragged_unsort`` reads that full expert-sorted buffer via
-      ``revert_indices`` and emits TOKEN-ordered output, so the expert->token un-sort happens
-      INSIDE the combine on the complete buffer.
-    * We chunk only the TOKEN (output) axis, by slicing ``revert_indices`` / ``topk_weights`` (a
-      contiguous range of output tokens). Each chunk's combine gathers its tokens' scattered rows
-      from the full buffer -> token-ordered chunk -> ``psum_scatter``. The RS therefore only ever
-      sees TOKEN-ordered data; there is NO expert/token mismatch at the reduce-scatter.
+  FULL-SHAPE OPERANDS + STATIC VALIDITY WINDOW (no operand slicing):
+    Handing the SC kernels CHUNK-SHAPED (sliced) operands broke their internal contracts (the
+    gather-reduce kernel derives its row-partition stride assuming x.rows == indices.rows, and
+    the fallback's shapes/dtypes fanned out differently) -- so we never slice a kernel operand.
+    Every per-chunk ``ring_ragged_unsort`` call is IDENTICAL in shape to the un-chunked call
+    (full buffer, full revert indices, full weights); chunk c is expressed as the STATIC slot
+    window ``[c * slots_per_chunk, (c + 1) * slots_per_chunk)`` which only ANDs into the
+    validity mask inside the combine. The SC kernel's validity compaction skips out-of-window
+    rows, so each invocation does ~1/N of the gather/reduce DMA work; kernel shapes, padding,
+    and preprocessing are byte-identical to the un-chunked call by construction. Each chunk's
+    output rows are a contiguous token range, so the per-chunk ``psum_scatter`` consumes a
+    plain OUTPUT slice (slicing dense XLA values is always safe).
+
+  EXPERT-SORTED INPUT vs TOKEN-SORTED RS:
+    * ``sorted_tokens_local`` (the GMM2 output) is EXPERT-sorted and read WHOLE by every chunk;
+      ``ring_ragged_unsort`` emits TOKEN-ordered output, so the expert->token un-sort happens
+      INSIDE the combine and the RS only ever sees TOKEN-ordered data.
     * Token order THROUGH the per-chunk RS is corrected by ``_permute_tokens_for_chunked_rs``
-      (vLLM trick): reorder the token axis chunk-major BEFORE chunking so that per-chunk
-      ``psum_scatter`` + ``concat`` reassembles the correct GLOBAL token order. Without it the
-      concat would interleave (shard's slice of chunk 0, then chunk 1, ...) -- wrong order.
+      (vLLM trick): reorder the token axis chunk-major (a full-shape permutation of the
+      revert-index/weight VALUES -- not a slicing) so that per-chunk ``psum_scatter`` +
+      ``concat`` reassembles the correct GLOBAL token order. Without it the concat would
+      interleave (shard's slice of chunk 0, then chunk 1, ...) -- wrong order.
 
   No new custom_vjp: per chunk we reuse the existing ``ring_ragged_unsort`` (its hand-written
-  combine bwd) + ``jax.lax.psum_scatter`` (auto all_gather-transpose bwd), so the gradient map is
-  unchanged.
-
-  SHARD-ALIGNMENT FIX (the c>0 bug): each per-chunk ``ring_ragged_unsort`` call gets
-  ``full_num_slots`` (the WHOLE problem's flat slot count), because its packed-vs-global
-  buffering-mode decision compares ``buffer_size`` against the index length. With a truncated
-  buffer (ragged_buffer_factor > 0) and chunk slices short enough that
-  ``buffer_size >= slots_per_chunk``, the per-chunk combine used to flip into the
-  global-positions mode and read PACKED local rows at GLOBAL positions -- combining misaligned
-  shards' partial sums (garbage/uninitialized GMM rows, in-range indices, huge magnitudes) for
-  every chunk once the flip engaged. Isolated full-buffer tests never see it because the full
-  buffer is legitimately in the global-positions mode at any chunk size.
+  combine bwd) + ``jax.lax.psum_scatter`` (auto all_gather-transpose bwd), so the gradient map
+  is unchanged. The window needs no bwd handling: the output slice's transpose zero-pads the
+  cotangent outside the window, which zeroes exactly the out-of-window grad contributions.
 
   Returns ``[num_tokens // ep_size, hidden]`` (this shard's reduce-scattered slice).
   """
   num_tokens = topk_argsort_revert_indices.shape[0] // topk
-  full_num_slots = topk_argsort_revert_indices.shape[0]
 
   def _permute_tokens_for_chunked_rs(a):  # a: [num_tokens, topk] -> chunk-major token reorder
     per = num_tokens // (n_chunks * ep_size)
@@ -520,23 +541,27 @@ def chunked_ring_combine_reduce_scatter(
     w = _permute_tokens_for_chunked_rs(w.reshape(num_tokens, topk)).reshape(-1)
 
   slots_per_chunk = (num_tokens // n_chunks) * topk
+  rows_per_chunk = num_tokens // n_chunks
   outs = []
   for c in range(n_chunks):
-    s0, s1 = c * slots_per_chunk, (c + 1) * slots_per_chunk
-    # combine: FULL expert-sorted buffer in (unsliced), token-ordered chunk out (existing custom_vjp)
-    combined = ring_ragged_unsort(
+    # combine: FULL-shape operands (identical to the un-chunked call); chunk c is a static
+    # validity window, so the SC kernels' contracts/padding/preprocessing are preserved by
+    # construction while only the window's rows are gathered/reduced.
+    combined_full = ring_ragged_unsort(
         sorted_tokens_local,
         group_sizes_local,
-        ridx[s0:s1],
+        ridx,
         topk,
         local_num_experts,
         ep_name,
-        topk_weights=w[s0:s1],
-        full_num_slots=full_num_slots,
+        topk_weights=w,
+        slot_window=(c * slots_per_chunk, (c + 1) * slots_per_chunk),
         **unsort_kwargs,
     )
+    # the window's output rows are contiguous: slice the OUTPUT (never a kernel operand) and
     # reduce-scatter the TOKEN-ordered chunk over the expert axis (auto bwd = all_gather)
-    outs.append(jax.lax.psum_scatter(combined, ep_name, scatter_dimension=0, tiled=True))
+    chunk_out = jax.lax.slice_in_dim(combined_full, c * rows_per_chunk, (c + 1) * rows_per_chunk, axis=0)
+    outs.append(jax.lax.psum_scatter(chunk_out, ep_name, scatter_dimension=0, tiled=True))
   return jnp.concatenate(outs, axis=0)
 
 

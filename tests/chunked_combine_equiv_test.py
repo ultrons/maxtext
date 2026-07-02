@@ -187,9 +187,15 @@ def _emulate_sc_gather_reduce(x, indices, weights, valid_mask, k, num_row_partit
 
 
 def sc_kernel_contract_checks(failures):
-  """Emulated-SC checks: the buggy buffer-derived stride violates the slot-array bounds for
-  EVERY n_chunks > 1 (N-independent, matching the cluster step-0 NaN); the fixed stride is
-  exact for all N and identical to the old behavior at N=1."""
+  """Emulated-SC checks for the ragged_gather_reduce row-partition-stride fix.
+
+  Demonstrates WHY sliced-operand chunking was abandoned: with per-chunk SLICED indices
+  (x.rows = N * indices.rows) the buggy buffer-derived stride read the slot arrays out of
+  bounds for EVERY chunk at EVERY n_chunks > 1 (N-independent, matching the cluster step-0
+  NaN); the fixed stride is exact for all N and identical at N=1. The production chunked
+  combine now passes FULL-shape operands with a validity window (slot_window), so the kernel
+  never sees sliced operands -- the stride fix stays as kernel hardening (it also covers the
+  truncated-buffer mode, where x.rows < indices.rows even un-chunked)."""
   lanes, p_cnt = 16, 2  # v7x-like: sc num_lanes=16; 16 subcores -> 8 col partitions x 2 row partitions
   key = jax.random.PRNGKey(0)
   revert, group_sizes = _make_routing(key, skew=3.0)
