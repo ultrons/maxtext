@@ -835,6 +835,13 @@ class MoEGeneral(BaseModel):
       "-1 means auto-compute, any > 0 value overrides the bytes_accessed cost estimate.",
   )
   use_random_routing: bool = Field(False, description="Whether to use random routing for debugging.")
+  moe_routing_key_as_input: bool = Field(
+      False,
+      description="Random routing: derive the routing key from a CONSTANT seed (pure jax, in-scope) instead of "
+      "the nnx rngs stream, so a hand-written MoE backward can recompute routing exactly. Freezes the routing "
+      "pattern across steps.",
+  )
+  moe_random_routing_seed: int = Field(0, description="Seed for the constant routing key (moe_routing_key_as_input).")
   interleave_moe_layer_step: int = Field(1, description="Frequency of MoE layers, e.g., 2 means every 2nd layer is MoE.")
   moe_fsdp_use_two_stage_all_gather: bool = Field(
       False,

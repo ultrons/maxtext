@@ -673,10 +673,16 @@ class RoutedMoE(nnx.Module):
     # shape of top_k_weights & top_k_indices:
     # (batch, sequence, num_experts_per_tok).
     if self.config.use_random_routing:
-      if rngs is None:
-        raise ValueError("The random key cannot be None for random routing.")
-      # Reuse the 'params' RNG stream to ensure random routing
-      rng = rngs.params()
+      if self.config.moe_routing_key_as_input:
+        # Constant-seed key, derived in-scope (pure jax, no rng state): byte-identical when the MoE
+        # is re-traced (e.g. a hand-written layer backward recomputing routing). Routing is frozen
+        # across steps by construction.
+        rng = jax.random.key(self.config.moe_random_routing_seed)
+      else:
+        if rngs is None:
+          raise ValueError("The random key cannot be None for random routing.")
+        # Reuse the 'params' RNG stream to ensure random routing
+        rng = rngs.params()
       top_k_weights, top_k_indices = random_routing(rng, gate_logits, self.num_experts_per_tok)
       return top_k_weights, top_k_indices
 
