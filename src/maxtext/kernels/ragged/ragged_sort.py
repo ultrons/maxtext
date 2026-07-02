@@ -498,37 +498,42 @@ def chunked_ring_combine_reduce_scatter(
   absorbed). This is DISTINCT from ``moe_n_chunks``, which chunks the whole body (GMM included) and
   so caps at ~2 on GMM efficiency -- here the GMM is untouched, so n_chunks can go large.
 
-  FULL-SHAPE OPERANDS + STATIC VALIDITY WINDOW (no operand slicing):
-    Handing the SC kernels CHUNK-SHAPED (sliced) operands broke their internal contracts (the
-    gather-reduce kernel derives its row-partition stride assuming x.rows == indices.rows, and
-    the fallback's shapes/dtypes fanned out differently) -- so we never slice a kernel operand.
-    Every per-chunk ``ring_ragged_unsort`` call is IDENTICAL in shape to the un-chunked call
-    (full buffer, full revert indices, full weights); chunk c is expressed as the STATIC slot
-    window ``[c * slots_per_chunk, (c + 1) * slots_per_chunk)`` which only ANDs into the
-    validity mask inside the combine. The SC kernel's validity compaction skips out-of-window
-    rows, so each invocation does ~1/N of the gather/reduce DMA work; kernel shapes, padding,
-    and preprocessing are byte-identical to the un-chunked call by construction. Each chunk's
-    output rows are a contiguous token range, so the per-chunk ``psum_scatter`` consumes a
-    plain OUTPUT slice (slicing dense XLA values is always safe).
+  SLICED-OPERAND FORMULATION (A/B variant vs the full-shape window formulation):
+    Each chunk slices ``revert_indices`` / ``topk_weights`` to its contiguous slot range
+    (tpu-inference style) and calls ``ring_ragged_unsort`` on the slice; the expert-sorted
+    buffer is still read WHOLE (never sliced). Per-chunk SC preprocessing / validity
+    compaction is therefore O(T/N) per call -- the window formulation invokes the kernel N
+    times at FULL slot-array shapes and pays an O(T) fixed cost per call (measured +1.32s on
+    the SC lane at N=4 on v7x, TC unchanged), which is why this variant slices.
+
+    Sliced operands are SAFE only because of three fixes that ride along:
+      * ragged_gather_reduce's row-partition stride is derived from the indices operand
+        (src_indices_hbm_ref.shape[0], as tpu-inference always did), not from the x buffer --
+        pre-fix, x.rows = N x indices.rows made every partition p >= 1 read the slot arrays
+        out of bounds (the step-0 NaN at every N > 1).
+      * ``full_num_slots`` pins ring_ragged_unsort's packed-vs-global buffering-mode decision
+        to the WHOLE problem's slot count (a chunk-length comparison flips modes with a
+        truncated buffer).
+      * ragged_gather's fallback applies weights in f32 then casts back to x.dtype (the SC
+        kernel contract), so the per-chunk bwd cotangent dtype does not fan out.
 
   EXPERT-SORTED INPUT vs TOKEN-SORTED RS:
     * ``sorted_tokens_local`` (the GMM2 output) is EXPERT-sorted and read WHOLE by every chunk;
       ``ring_ragged_unsort`` emits TOKEN-ordered output, so the expert->token un-sort happens
       INSIDE the combine and the RS only ever sees TOKEN-ordered data.
     * Token order THROUGH the per-chunk RS is corrected by ``_permute_tokens_for_chunked_rs``
-      (vLLM trick): reorder the token axis chunk-major (a full-shape permutation of the
-      revert-index/weight VALUES -- not a slicing) so that per-chunk ``psum_scatter`` +
-      ``concat`` reassembles the correct GLOBAL token order. Without it the concat would
-      interleave (shard's slice of chunk 0, then chunk 1, ...) -- wrong order.
+      (vLLM trick): reorder the token axis chunk-major BEFORE chunking so that per-chunk
+      ``psum_scatter`` + ``concat`` reassembles the correct GLOBAL token order. Without it the
+      concat would interleave (shard's slice of chunk 0, then chunk 1, ...) -- wrong order.
 
   No new custom_vjp: per chunk we reuse the existing ``ring_ragged_unsort`` (its hand-written
-  combine bwd) + ``jax.lax.psum_scatter`` (auto all_gather-transpose bwd), so the gradient map
-  is unchanged. The window needs no bwd handling: the output slice's transpose zero-pads the
-  cotangent outside the window, which zeroes exactly the out-of-window grad contributions.
+  combine bwd, incl. the chunked-input grad scatter-back for buffer_size > n) +
+  ``jax.lax.psum_scatter`` (auto all_gather-transpose bwd), so the gradient map is unchanged.
 
   Returns ``[num_tokens // ep_size, hidden]`` (this shard's reduce-scattered slice).
   """
   num_tokens = topk_argsort_revert_indices.shape[0] // topk
+  full_num_slots = topk_argsort_revert_indices.shape[0]
 
   def _permute_tokens_for_chunked_rs(a):  # a: [num_tokens, topk] -> chunk-major token reorder
     per = num_tokens // (n_chunks * ep_size)
@@ -541,27 +546,24 @@ def chunked_ring_combine_reduce_scatter(
     w = _permute_tokens_for_chunked_rs(w.reshape(num_tokens, topk)).reshape(-1)
 
   slots_per_chunk = (num_tokens // n_chunks) * topk
-  rows_per_chunk = num_tokens // n_chunks
   outs = []
   for c in range(n_chunks):
-    # combine: FULL-shape operands (identical to the un-chunked call); chunk c is a static
-    # validity window, so the SC kernels' contracts/padding/preprocessing are preserved by
-    # construction while only the window's rows are gathered/reduced.
-    combined_full = ring_ragged_unsort(
+    s0, s1 = c * slots_per_chunk, (c + 1) * slots_per_chunk
+    # combine: FULL expert-sorted buffer in (unsliced), sliced indices/weights -> O(T/N)
+    # per-chunk kernel preprocessing; token-ordered chunk out (existing custom_vjp)
+    combined = ring_ragged_unsort(
         sorted_tokens_local,
         group_sizes_local,
-        ridx,
+        ridx[s0:s1],
         topk,
         local_num_experts,
         ep_name,
-        topk_weights=w,
-        slot_window=(c * slots_per_chunk, (c + 1) * slots_per_chunk),
+        topk_weights=w[s0:s1],
+        full_num_slots=full_num_slots,
         **unsort_kwargs,
     )
-    # the window's output rows are contiguous: slice the OUTPUT (never a kernel operand) and
     # reduce-scatter the TOKEN-ordered chunk over the expert axis (auto bwd = all_gather)
-    chunk_out = jax.lax.slice_in_dim(combined_full, c * rows_per_chunk, (c + 1) * rows_per_chunk, axis=0)
-    outs.append(jax.lax.psum_scatter(chunk_out, ep_name, scatter_dimension=0, tiled=True))
+    outs.append(jax.lax.psum_scatter(combined, ep_name, scatter_dimension=0, tiled=True))
   return jnp.concatenate(outs, axis=0)
 
 
