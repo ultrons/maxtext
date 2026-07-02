@@ -842,6 +842,31 @@ class MoEGeneral(BaseModel):
       "pattern across steps.",
   )
   moe_random_routing_seed: int = Field(0, description="Seed for the constant routing key (moe_routing_key_as_input).")
+  moe_weight_ag_scheduling_group: bool = Field(
+      False,
+      description=(
+          "Ring-of-experts only (shard_exp_on_fsdp=False). When True, pre-gather the routed FSDP expert "
+          "weights (w0/w1/wo embed dim) via an explicit all-gather custom_vjp emitted in the attention "
+          "phase, tagged with an XLA _scheduling_group_id, so the scheduler overlaps the otherwise-exposed "
+          "weight all-gather with attention compute. Default False = implicit boundary gather (unchanged "
+          "behavior)."
+      ),
+  )
+  moe_handwritten_bwd: bool = Field(
+      False,
+      description=(
+          "DeepSeek MoE ring-of-experts only. When True (requires moe_weight_ag_scheduling_group=True, "
+          "no mhc/engram), wrap the whole DeepSeek MoE decoder layer (hoisted weight gather + attention + "
+          "MoE) in a jax.custom_vjp INSIDE nn.scan with a hand-written backward. The bwd replays the "
+          "attention forward (attention-fwd remat) and emits the annotated weight RE-gather adjacent to "
+          "it, then MoE-bwd -> gather-bwd (psum_scatter -> FSDP-sharded weight grads, reusing "
+          "_make_cv_gather) -> attn-bwd. Residuals = decoder_layer_input + sharded params only (no "
+          "gathered weights saved). We own the remat, so the gather||attention annotation cannot cycle "
+          "against auto-remat. Numerically identical to autodiff (same pieces, kernels' own VJPs). The "
+          "MoE layer is NOT nn.remat-wrapped when this is on. Default False = autodiff + auto-remat "
+          "(reference)."
+      ),
+  )
   interleave_moe_layer_step: int = Field(1, description="Frequency of MoE layers, e.g., 2 means every 2nd layer is MoE.")
   moe_fsdp_use_two_stage_all_gather: bool = Field(
       False,

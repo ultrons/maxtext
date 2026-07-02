@@ -223,6 +223,8 @@ moe_routing_key_as_input: false # random routing: derive the routing key from a 
                                 # hand-written MoE backward can recompute routing exactly. Routing is then
                                 # frozen across steps (constant key).
 moe_random_routing_seed: 0 # seed for the constant routing key when moe_routing_key_as_input is True
+moe_weight_ag_scheduling_group: false # ring-of-experts: pre-gather the routed FSDP weights (explicit all-gather via a custom_vjp, tagged with an XLA _scheduling_group_id) in the attention phase so the scheduler overlaps the otherwise-exposed weight all-gather with attention compute
+moe_handwritten_bwd: false # DeepSeek MoE: wrap layer (gather+attn+MoE) in jax.custom_vjp inside nn.scan; hand-written bwd places annotated weight re-gather adjacent to the attention-fwd remat; we own remat (no cycle); residuals = layer input + sharded params only; bit-exact to autodiff. Requires moe_weight_ag_scheduling_group=True.
 use_custom_sort_vjp: true # whether to use a custom VJP sort for efficient backward pass processing in sparse matmul
 use_ring_of_experts: false # whether to use ring of experts for sparse matmul expert parallelism
 # If true, peel the 'expert' mesh axis off the MoE dispatch/MLP batch dim so the expert GEMM

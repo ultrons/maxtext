@@ -53,6 +53,23 @@ import tokamax
 set_xla_metadata = xla_metadata.set_xla_metadata
 
 
+def _scheduling_group(group_id):
+  """Tag enclosed ops with an XLA `_scheduling_group_id`.
+
+  Instructions sharing a `_scheduling_group_id` are candidates for the XLA
+  scheduler to overlap (see batchsplit's `scheduling_group`). Used here to tag
+  the explicit FSDP weight all-gather so the scheduler overlaps the (otherwise
+  exposed) weight-AG with attention-phase compute in the same decoder layer.
+  """
+  return set_xla_metadata(_scheduling_group_id=group_id)
+
+
+# Fixed scheduling-group id shared by the MoE FSDP weight all-gather and the
+# attention earlier in the same (scanned) decoder layer. Under
+# scan_layers=true the body is traced once, so a fixed id scopes to one layer.
+_WEIGHT_AG_SCHED_GROUP = 1
+
+
 DISPATCH = "dispatch"
 COMBINE = "combine"
 
@@ -2637,14 +2654,99 @@ class RoutedMoE(nnx.Module):
     wo_kernel = max_utils.unbox_logicallypartioned(wo_kernel)
     return w0_kernel, w1_kernel, wo_kernel
 
+  def gather_weights(self):
+    """FSDP-all-gather the routed expert weights (wi_0/wi_1/wo) early, so the
+    all-gather can be emitted in the ATTENTION phase (program-order before the
+    attention kernel) and overlap it.
+
+    Returns (w0, w1, wo) gathered to the same layout sparse_matmul would use,
+    for passing back as `pregathered_weights`; or None when the simple bf16
+    ring path doesn't hold (prefuse / sparsity / per-expert-scale / serve-quant),
+    in which case the caller falls back to the normal in-MoE gather.
+    """
+    cfg = self.config
+    if not (cfg.moe_weight_ag_scheduling_group and cfg.use_ring_of_experts and not cfg.shard_exp_on_fsdp):
+      return None
+    # Only the plain path is safe to pre-gather; otherwise weights need
+    # post-processing (scale/sparsity/fuse) that happens in __call__.
+    if (
+        cfg.prefuse_moe_weights
+        or self.wi_0_sparsity_module is not None
+        or self.per_expert_scale is not None
+        or quantizations.in_serve_mode(self.quant)
+    ):
+      return None
+
+    w0 = jnp.asarray(self.wi_0[...], self.dtype)
+    w1 = jnp.asarray(self.wi_1[...], self.dtype)
+    wo = jnp.asarray(self.wo[...], self.dtype)
+    # in = fsdp-sharded-on-embed kernel layout; out = the gathered (mlp_no_fsdp /
+    # embed_tensor_transpose) layout sparse_matmul expects (default ring branch).
+    wi_in = self._logical_to_mesh_axes(self.wi_kernel_axes)
+    wo_in = self._logical_to_mesh_axes(self.wo_kernel_axes)
+    w0_out = self._logical_to_mesh_axes(("exp", "embed_tensor_transpose", "mlp_no_fsdp"))
+    wo_out = self._logical_to_mesh_axes(("exp", "mlp_no_fsdp", "embed_tensor_transpose"))
+
+    # custom_vjp so the FORWARD gather carries the _scheduling_group_id (overlaps the
+    # attention) while the BACKWARD/remat path re-gathers PLAINLY (no annotation)
+    # and nothing big is saved. This avoids BOTH failure modes seen earlier:
+    #   (1) tagging the backward gather -> the gather's reduce-scatter back-edges into
+    #       the rematerialized forward -> FAILED_PRECONDITION scheduling cycle;
+    #   (2) saving/offloading the full gathered weights to dodge the cycle -> ~325GB/core
+    #       across the scanned layers -> HBM/host OOM.
+    # The custom_vjp PRIMAL is the plain (unannotated) gather, which is what
+    # remat_policy=custom recomputes in the backward -> no annotation in the rematted
+    # gather -> no cycle. The custom forward rule applies the annotation (forward
+    # overlap). Grad of a tiled fsdp all-gather is a tiled psum_scatter (the transpose),
+    # so FSDP weight grads stay correct; nothing big is held as a residual.
+    def _make_cv_gather(in_pspec, out_pspec, gather_axis, sched_group):
+      @jax.custom_vjp
+      def _g(w):  # PRIMAL: plain gather (what remat recomputes in the backward)
+        return jax.shard_map(
+            lambda x: jax.lax.all_gather(x, "fsdp", axis=gather_axis, tiled=True),
+            mesh=self.mesh, in_specs=(in_pspec,), out_specs=out_pspec, check_vma=False)(w)
+
+      def _g_fwd(w):  # FORWARD under diff: annotated gather (overlaps attention)
+        def _fn(x):
+          with _scheduling_group(sched_group):
+            return jax.lax.all_gather(x, "fsdp", axis=gather_axis, tiled=True)
+        w_full = jax.shard_map(_fn, mesh=self.mesh, in_specs=(in_pspec,), out_specs=out_pspec, check_vma=False)(w)
+        return w_full, None  # no big residual saved (sharded w is recomputed cheaply / not needed)
+
+      def _g_bwd(_res, ct):  # transpose of tiled all-gather over fsdp = tiled psum_scatter
+        g_sharded = jax.shard_map(
+            lambda gg: jax.lax.psum_scatter(gg, "fsdp", scatter_dimension=gather_axis, tiled=True),
+            mesh=self.mesh, in_specs=(out_pspec,), out_specs=in_pspec, check_vma=False)(ct)
+        return (g_sharded,)
+
+      _g.defvjp(_g_fwd, _g_bwd)
+      return _g
+
+    # Distinct scheduling-group ids per weight so the all-gather-combiner cannot
+    # fuse the three into one un-hideable monolith; each smaller gather can
+    # then be scheduled independently behind different attention-phase compute.
+    # NO optimization_barrier: it is self-dual, so a barrier on the gathered weight
+    # fences the weight-grad feeding the backward psum_scatter -> pins the RS exposed.
+    # The distinct group ids already prevent the all-gather-combiner fusion.
+    w0 = _make_cv_gather(wi_in, w0_out, 1, _WEIGHT_AG_SCHED_GROUP)(w0)
+    w1 = _make_cv_gather(wi_in, w0_out, 1, _WEIGHT_AG_SCHED_GROUP + 1)(w1)
+    wo = _make_cv_gather(wo_in, wo_out, 2, _WEIGHT_AG_SCHED_GROUP + 2)(wo)
+    return (w0, w1, wo)
+
   def __call__(
       self,
       inputs: jax.Array,
       input_ids: jax.Array | None = None,
       gate_inputs: jax.Array | None = None,
       out_sharding: NamedSharding | None = None,
+      pregathered_weights: tuple | None = None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Executes the routed MoE block.
+
+    `pregathered_weights`, if given, are (w0, w1, wo) already FSDP-all-gathered
+    by `gather_weights` in the attention phase; they replace the in-block read
+    (the boundary gather at the shard_map entry becomes a no-op, so there is no
+    double gather). Only used on the plain bf16 ring path.
 
     Args:
       inputs: The input activations.
@@ -2663,21 +2765,26 @@ class RoutedMoE(nnx.Module):
     routing_inputs = inputs if gate_inputs is None else gate_inputs.astype(gate_dtype)
     gate_logits, pre_bias_logits = self.gate(routing_inputs)
 
-    wo_kernel = jnp.asarray(self.wo[...], self.dtype)
-
     fused_kernel = None
     w0_kernel = None
     w1_kernel = None
-    if cfg.prefuse_moe_weights and cfg.attention == "vllm_rpa" and not self.is_hash_routing:
-      fused_kernel = jnp.asarray(self.wi[...], self.dtype)
-    elif cfg.prefuse_moe_weights:
-      wi = jnp.asarray(self.wi[...], self.dtype)
-      n = wi.shape[-1] // 2
-      w0_kernel = wi[..., :n]
-      w1_kernel = wi[..., n:]
+    if pregathered_weights is not None:
+      # Already FSDP-gathered in the attention phase; skip the in-block read
+      # (gather_weights bailed out of every path that needs post-processing).
+      w0_kernel, w1_kernel, wo_kernel = pregathered_weights
     else:
-      w0_kernel = jnp.asarray(self.wi_0[...], self.dtype)
-      w1_kernel = jnp.asarray(self.wi_1[...], self.dtype)
+      wo_kernel = jnp.asarray(self.wo[...], self.dtype)
+
+      if cfg.prefuse_moe_weights and cfg.attention == "vllm_rpa" and not self.is_hash_routing:
+        fused_kernel = jnp.asarray(self.wi[...], self.dtype)
+      elif cfg.prefuse_moe_weights:
+        wi = jnp.asarray(self.wi[...], self.dtype)
+        n = wi.shape[-1] // 2
+        w0_kernel = wi[..., :n]
+        w1_kernel = wi[..., n:]
+      else:
+        w0_kernel = jnp.asarray(self.wi_0[...], self.dtype)
+        w1_kernel = jnp.asarray(self.wi_1[...], self.dtype)
 
     # Only apply per expert scales if we have not fused with the out-projections at init time.
     if self.per_expert_scale is not None and cfg.model_call_mode != "inference" and not cfg.fuse_expert_scales:
@@ -2802,6 +2909,11 @@ class RoutedAndSharedMoE(nnx.Module):
   def routed_moe(self):
     return self.MoeBlock_0
 
+  def gather_routed_weights(self):
+    """Pre-gather the routed experts' FSDP weights (see RoutedMoE.gather_weights).
+    Call this in the attention phase; pass the result back as pregathered_weights."""
+    return self.MoeBlock_0.gather_weights()
+
   def __call__(
       self,
       inputs: jax.Array,
@@ -2810,6 +2922,7 @@ class RoutedAndSharedMoE(nnx.Module):
       intermediate_sharding: NamedSharding | None = None,
       out_sharding: NamedSharding | None = None,
       input_ids: jax.Array | None = None,
+      pregathered_weights: tuple | None = None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Executes both the routed experts and the shared expert block.
 
@@ -2827,7 +2940,11 @@ class RoutedAndSharedMoE(nnx.Module):
       the load balance loss, and any routed bias updates.
     """
     routed_experts, load_balance_loss, moe_bias_updates = self.routed_moe(
-        inputs, gate_inputs=gate_inputs, out_sharding=out_sharding, input_ids=input_ids
+        inputs,
+        gate_inputs=gate_inputs,
+        out_sharding=out_sharding,
+        input_ids=input_ids,
+        pregathered_weights=pregathered_weights,
     )
     shared_experts = self.shared_experts(inputs, intermediate_sharding=intermediate_sharding, out_sharding=out_sharding)
     return routed_experts + shared_experts, load_balance_loss, moe_bias_updates

@@ -16,9 +16,11 @@
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
+import contextlib
 import functools
 from typing import Optional
 
+from flax import linen as flax_linen
 from flax import nnx
 import jax
 from jax.ad_checkpoint import checkpoint_name
@@ -48,6 +50,32 @@ import transformers
 # -----------------------------------------
 # The Decoder Layer for DeepSeek v3
 # -----------------------------------------
+
+
+@contextlib.contextmanager
+def _detached_linen_module_stack():
+  """Temporarily clear flax's linen module stack so linen↔nnx bridge wrappers take
+  their no-context passthrough branch.
+
+  The to_linen bridge installs a qwix-quantization fixup on every nnx submodule's
+  __call__ that reads ``linen.module._context.module_stack[-1].path``. The stack's
+  resting value is ``[None]`` (a sentinel base), and a valid linen module is only on
+  it while ``ToLinen.__call__`` is executing the forward. The hand-written layer
+  backward (``_handwritten_moe_layer``) re-traces the bridged layer methods OUTSIDE
+  that forward (during the custom_vjp transpose), where ``module_stack[-1]`` is the
+  ``None`` sentinel -> ``None.path`` AttributeError. Clearing the stack to ``[]`` makes
+  the fixup short-circuit to ``call_fn(...)``. This only drops qwix path tracking
+  (a no-op when qwix quantization is off, which the hand-written path requires); the
+  traced computation is identical, so numerics are unchanged.
+  """
+  ctx = flax_linen.module._context  # pylint: disable=protected-access
+  saved = list(ctx.module_stack)
+  ctx.module_stack.clear()
+  try:
+    yield
+  finally:
+    ctx.module_stack.clear()
+    ctx.module_stack.extend(saved)
 
 
 class DeepSeekGenericLayer(nnx.Module):
@@ -575,6 +603,35 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       engram_output = self.engram_op(x, decoder_input_tokens)
       x = x + engram_output
 
+    # Hand-written layer backward (flag: moe_handwritten_bwd): wrap gather + attention + MoE in a
+    # jax.custom_vjp so WE own the backward schedule (place the annotated weight re-gather adjacent
+    # to the recomputed attention forward) and there is no auto-remat to cycle against. Restricted
+    # to the plain ring path (no mhc/engram) where gather_routed_weights returns a real (w0, w1, wo)
+    # tuple. Bit-exact to the autodiff path below.
+    if (
+        self.config.moe_handwritten_bwd
+        and self.config.moe_weight_ag_scheduling_group
+        and not self.is_mhc_enabled
+        and not self.is_engram_enabled
+        # Random routing must be recompute-safe: with moe_routing_key_as_input the routing key is a
+        # compile-time constant derived in-scope (get_topk), so the bwd recompute draws no rng.
+        # Deterministic routing draws no rng either, so it is always safe.
+        and (not self.config.use_random_routing or self.config.moe_routing_key_as_input)
+    ):
+      layer_output, load_balance_loss, moe_bias_updates = self._handwritten_moe_layer(
+          x, decoder_segment_ids, decoder_positions, deterministic
+      )
+      return self.post_process(layer_output, load_balance_loss, moe_bias_updates, kv_cache)
+
+    # Pre-gather the routed MoE FSDP weights HERE, before the attention, so the
+    # weight all-gather is emitted in program order during the attention phase ->
+    # the scheduler overlaps it with the attention compute (the gathers self-tag
+    # a _scheduling_group_id via _make_cv_gather). Returns None unless the plain
+    # bf16 ring path holds, in which case the MoE falls back to its in-block gather.
+    pregathered_weights = None
+    if self.config.moe_weight_ag_scheduling_group:
+      pregathered_weights = self.DeepSeekMoeBlock_0.gather_routed_weights()
+
     hidden_states, intermediate_inputs = self.self_attention_with_norm_op(
         x,
         decoder_segment_ids,
@@ -594,15 +651,140 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       load_balance_loss = metadata["load_balance_loss"]
       moe_bias_updates = metadata["moe_bias_updates"]
     else:
-      mlp_lnx, load_balance_loss, moe_bias_updates = self.mlp_op(hidden_states, deterministic)
+      mlp_lnx, load_balance_loss, moe_bias_updates = self.mlp_op(
+          hidden_states, deterministic, pregathered_weights=pregathered_weights
+      )
       layer_output = mlp_lnx + intermediate_inputs
     layer_output = self.dropout_op(layer_output, deterministic=deterministic)
 
     return self.post_process(layer_output, load_balance_loss, moe_bias_updates, kv_cache)
 
-  def mlp_op(self, x, deterministic, *args, **kwargs):
+  def _handwritten_moe_layer(self, x, decoder_segment_ids, decoder_positions, deterministic):
+    """Layer custom_vjp with a hand-written backward (flag: moe_handwritten_bwd).
+
+    Wraps gather + attention + MoE so WE own the backward schedule. The forward runs the existing
+    forward (gather emitted in program order BEFORE attention -> keeps the structural fwd overlap)
+    and saves only {decoder_layer_input x, sharded params} as residuals -- no gathered weights are
+    held (no OOM) and there is no auto-remat decision to cycle against. The backward replays the
+    three pure pieces, emitting the annotated weight RE-gather adjacent to the recomputed attention
+    forward, then MoE-bwd -> gather-bwd (psum_scatter -> FSDP-sharded weight grads, via
+    _make_cv_gather) -> attn-bwd.
+
+    RNG: with moe_routing_key_as_input, random routing's key is a compile-time constant derived
+    in-scope inside get_topk (from the static config seed) in BOTH fwd and bwd -> no nnx Rngs in
+    the routing path and nothing rng-shaped in the residuals. Separately, the nnx Rngs the bridge
+    attaches (shared by the unused dropout) is SPLIT OUT and replaced with a fresh DUMMY before
+    threading: drawing/reading the bridge key leaks a key<urbg> across nn.scan, and re-consuming it
+    hits nnx's cross-trace-level RngCount guard; the dummy is never drawn (routing is key-driven,
+    dropout is off), so numerics are unchanged.
+
+    Numerics are identical to the autodiff path (given the same routing key): the pieces compose to
+    the same forward and each VJP is the kernel's own; the per-piece param cotangents (disjoint
+    usage) sum to the full gradient. seg/pos are closed over in the primal/fwd and read from
+    residuals in the bwd (no tracer leak). Preconditions enforced by the caller's gate.
+    """
+    det = deterministic  # static python bool
+    seg0, pos0 = decoder_segment_ids, decoder_positions
+
+    # Split the bridge nnx Rngs OUT (RngState filter) so the threaded `rest` carries NO rng key: an
+    # rng key<urbg> in a custom_vjp residual escapes nn.scan (bridge OR a body-built dummy alike). We
+    # capture only STATIC reconstruction specs (Variable types + metadata + treedef -- no bridge
+    # values) and rebuild a fresh DUMMY rng IN-SCOPE inside each merge (fwd and bwd). The dummy is a
+    # constant, never threaded and never drawn (routing is key-driven, dropout is off), so numerics
+    # are unchanged.
+    graphdef, params, rngstate, rest_other = nnx.split(self, nnx.Param, nnx.RngState, ...)
+    _rng_leaves, _rng_treedef = jax.tree.flatten(rngstate, is_leaf=lambda n: isinstance(n, nnx.Variable))
+    _rng_specs = tuple((type(v), v.get_metadata()) for v in _rng_leaves)  # static
+
+    def _dummy_rngstate():
+      leaves = []
+      for vtype, meta in _rng_specs:
+        if vtype is nnx.RngKey:
+          leaves.append(nnx.RngKey(jax.random.key(0), **meta))
+        elif vtype is nnx.RngCount:
+          leaves.append(nnx.RngCount(jnp.zeros((), jnp.uint32), **meta))
+        else:
+          raise TypeError(f"unexpected RngState variable {vtype}")
+      return jax.tree.unflatten(_rng_treedef, leaves)
+
+    def _merge(p, rest_):  # merge with a fresh in-scope dummy rng (rest_ carries no rng key)
+      return nnx.merge(graphdef, p, _dummy_rngstate(), rest_)
+
+    # `rest_other` holds forward-trace tracers, so it must be THREADED through residuals -- never
+    # closed over in the bwd -- or it leaks across the nn.scan boundary. graphdef/det are static.
+    def _gather(p, rest_):
+      # annotated custom_vjp gather (see RoutedMoE.gather_weights / _make_cv_gather).
+      return _merge(p, rest_).DeepSeekMoeBlock_0.gather_routed_weights()
+
+    def _attn(p, x_in, seg, pos, rest_):
+      return _merge(p, rest_).self_attention_with_norm_op(x_in, seg, pos, det)  # (hidden, intermediate)
+
+    def _moe(p, hidden_states, intermediate_inputs, weights, rest_):
+      m = _merge(p, rest_)
+      mlp_lnx, load_balance_loss, moe_bias_updates = m.mlp_op(hidden_states, det, pregathered_weights=weights)
+      layer_output = m.dropout_op(mlp_lnx + intermediate_inputs, deterministic=det)
+      return layer_output, load_balance_loss, moe_bias_updates
+
+    def _forward_once(p, x_in, rest_):
+      # SINGLE merged module for the whole forward (gather + attention + MoE), like the autodiff
+      # structure: the gather and attention read the SAME module so XLA keeps hiding the weight
+      # all-gather behind the attention compute. (The backward still takes 3 separate jax.vjp
+      # pieces for the manual cotangent routing -- merge is just structuring, so numerics are
+      # identical and the gradient is unchanged.) gather is emitted FIRST (program-order before
+      # attention) to preserve the hoist.
+      m = _merge(p, rest_)
+      weights = m.DeepSeekMoeBlock_0.gather_routed_weights()
+      hidden_states, intermediate_inputs = m.self_attention_with_norm_op(x_in, seg0, pos0, det)
+      mlp_lnx, load_balance_loss, moe_bias_updates = m.mlp_op(hidden_states, det, pregathered_weights=weights)
+      layer_output = m.dropout_op(mlp_lnx + intermediate_inputs, deterministic=det)
+      return layer_output, load_balance_loss, moe_bias_updates
+
+    @jax.custom_vjp
+    def fused(p, x_in):
+      return _forward_once(p, x_in, rest_other)
+
+    def fused_fwd(p, x_in):
+      out = _forward_once(p, x_in, rest_other)
+      # Residuals: sharded params + decoder_layer_input + (seg, pos, rest_other). seg/pos are closed
+      # over in the primal/fwd and read from residuals in the bwd (no tracer leak).
+      return out, (p, x_in, seg0, pos0, rest_other)
+
+    def fused_bwd(res, cotangents):
+      p, x_in, seg, pos, rest_ = res
+      # Re-tracing the bridged layer methods happens OUTSIDE the linen forward, so detach the
+      # linen module stack to avoid the qwix-fixup None.path crash (see helper docstring).
+      with _detached_linen_module_stack():
+        # 1) HOIST the weight re-gather to the attention INPUT (emit it BEFORE the attention
+        # recompute), mirroring the forward's structural hoist that overlaps the gather with the QKV
+        # matmuls. The re-gather depends only on p (independent of attention), so emitting it first
+        # lets its async all-gather float over the recomputed QKV matmuls instead of being launched
+        # after them. Structural placement; the gather custom_vjp's forward rule self-tags the
+        # _scheduling_group_id. bwd of the gather = tiled psum_scatter -> sharded weight grads.
+        weights, vjp_gather = jax.vjp(lambda pp: _gather(pp, rest_), p)
+        # 2) recompute attention forward + build its VJP (weight-independent)
+        (hidden_states, intermediate_inputs), vjp_attn = jax.vjp(
+            lambda pp, xx: _attn(pp, xx, seg, pos, rest_), p, x_in
+        )
+        # 3) recompute MoE forward (routing key recomputed in-scope, no nnx Rngs) + build its VJP
+        _out, vjp_moe = jax.vjp(
+            lambda pp, hh, ii, ww: _moe(pp, hh, ii, ww, rest_), p, hidden_states, intermediate_inputs, weights
+        )
+        dp_moe, d_hidden, d_inter, d_weights = vjp_moe(cotangents)
+        (dp_gather,) = vjp_gather(d_weights)
+        dp_attn, dx = vjp_attn((d_hidden, d_inter))
+      # disjoint per-piece param cotangents (zeros elsewhere) -> sum reconstructs the full gradient.
+      dp = jax.tree.map(lambda a, b, c: a + b + c, dp_attn, dp_moe, dp_gather)
+      return dp, dx
+
+    fused.defvjp(fused_fwd, fused_bwd)
+    return fused(params, x)
+
+  def mlp_op(self, x, deterministic, *args, pregathered_weights=None, **kwargs):
     mlp_lnx, load_balance_loss, moe_bias_updates = self.DeepSeekMoeBlock_0(
-        x, intermediate_sharding=self.mlp_intermediate_sharding, out_sharding=self.out_sharding
+        x,
+        intermediate_sharding=self.mlp_intermediate_sharding,
+        out_sharding=self.out_sharding,
+        pregathered_weights=pregathered_weights,
     )
     return self.with_logical_constraint(mlp_lnx), load_balance_loss, moe_bias_updates
 
