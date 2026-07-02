@@ -415,9 +415,13 @@ def ragged_gather(
 
   dtype = x.dtype
 
+  if enforce_fallback:
+    # Fallback is enforced. Use JAX reference. (Checked BEFORE get_tpu_info(),
+    # which raises on non-TPU backends -- keeps the pure-JAX path CPU-testable.)
+    return _fallback_implementation(x, indices, weights, has_weights)
   sc_info = pltpu.get_tpu_info().sparse_core
-  if sc_info is None or enforce_fallback:
-    # Sparse core is not available or fallback is enforced. Use JAX reference.
+  if sc_info is None:
+    # Sparse core is not available. Use JAX reference.
     return _fallback_implementation(x, indices, weights, has_weights)
 
   hidden_size = x.shape[-1]

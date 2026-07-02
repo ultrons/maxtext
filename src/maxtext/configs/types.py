@@ -773,6 +773,16 @@ class MoEGeneral(BaseModel):
           "moe_n_chunks>1 and use_ring_of_experts=True to have any effect."
       ),
   )
+  decouple_combine_rs_chunks: int = Field(
+      0,
+      description=(
+          "DECOUPLED chunked combine->reduce-scatter (ring-of-experts): run the GMM FULL, chunk ONLY the "
+          "post-GMM combine+RS loop so each chunk's RS hides under the next chunk's combine. Distinct from "
+          "moe_n_chunks, which chunks the whole body INCL the GMM (caps ~2 on GMM efficiency); here the GMM is "
+          "untouched so N can go large. Must divide num_tokens by (N*ep_size). 0/1 = disabled (baseline). "
+          "Single-axis `expert` only (skips when expert axis is a tuple). Requires use_ring_of_experts=True."
+      ),
+  )
   moe_expert_input_dim: int = Field(
       -1,
       description="Dimension of tokens entering the MoE layer. If < 0, defaults to emb_dim.",

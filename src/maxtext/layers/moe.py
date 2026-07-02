@@ -37,6 +37,7 @@ from maxtext.layers import attentions, linears, nnx_wrappers, quantizations
 from maxtext.layers.initializers import NdInitializer, default_bias_init, nd_dense_init, variable_to_logically_partitioned
 from maxtext.kernels.ragged.ragged_sort import a2a_ragged_sort
 from maxtext.kernels.ragged.ragged_sort import a2a_ragged_unsort
+from maxtext.kernels.ragged.ragged_sort import chunked_ring_combine_reduce_scatter
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_sort
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_unsort
 from maxtext.utils import max_logging
@@ -1257,8 +1258,14 @@ class RoutedMoE(nnx.Module):
       w1_bias,
       wo_bias,
       input_ids=None,
+      use_chunked_combine=True,
   ):
-    """Perform sparse matrix multiplication of inputs and Experts."""
+    """Perform sparse matrix multiplication of inputs and Experts.
+
+    `use_chunked_combine` (static bool) gates the decouple_combine_rs_chunks combine path; the
+    moe_handwritten_bwd recompute passes False so the backward differentiates the un-chunked
+    combine (forward-only chunking in rung 6).
+    """
 
     def jax_ragged_dot_gmm(inputs, kernel, tiling, group_sizes, expert_assignments, padding_amount):
       """Execute jax.lax.ragged_dot, with potential quantization"""
@@ -1828,6 +1835,40 @@ class RoutedMoE(nnx.Module):
       if self.config.mlp_bias:
         intermediate_output = intermediate_output + wo_bias
       intermediate_output = adc.checkpoint_name(adc.checkpoint_name(intermediate_output, "mlpwo"), "moe_mlpwo")
+
+      if (
+          self.config.use_ring_of_experts
+          and self.config.decouple_combine_rs_chunks > 1
+          and use_chunked_combine
+          and isinstance(self._expert_parallelism_name, str)
+      ):
+        # DECOUPLED chunked combine->RS: the GMM ran FULL above; here we chunk ONLY combine+RS so
+        # each chunk's reduce-scatter hides under the next chunk's combine (validated v7x). The
+        # expert-sorted GMM output is read WHOLE per chunk; only the token (output) axis is chunked.
+        # See chunked_ring_combine_reduce_scatter for the expert->token handling + the permute trick.
+        # `use_chunked_combine` is False on the moe_handwritten_bwd RECOMPUTE path (deepseek.py
+        # fused_bwd), which differentiates the un-chunked combine instead (forward-only chunking).
+        output = chunked_ring_combine_reduce_scatter(
+            intermediate_output,
+            routing.group_sizes,
+            routing.sorted_selected_experts,
+            self.num_experts_per_tok,
+            self.config.num_experts // self.get_expert_parallelism_size(),
+            self._expert_parallelism_name,
+            jnp.ravel(routing.weights).astype(jnp.float32),
+            self.get_expert_parallelism_size(),
+            self.config.decouple_combine_rs_chunks,
+            enforce_gather_fallback=self.config.ragged_gather_fallback,
+            enforce_gather_reduce_fallback=self.config.ragged_gather_reduce_fallback,
+            gather_flops_override=self.config.ragged_gather_cost_estimate_flops,
+            gather_reduce_flops_override=self.config.ragged_gather_reduce_cost_estimate_flops,
+            gather_bytes_accessed_override=self.config.ragged_gather_cost_estimate_bytes_accessed,
+            gather_reduce_bytes_accessed_override=self.config.ragged_gather_reduce_cost_estimate_bytes_accessed,
+        )
+        output = output.reshape(
+            -1, sequence_length, self.moe_expert_input_dim // self.get_tensor_parallelism_size()
+        ).astype(self.dtype)
+        return output, routing.lb_loss, routing.bias_updates
 
       if self.config.use_ring_of_experts:
         # Unsort and deduplicate the outputs locally.
@@ -2740,6 +2781,7 @@ class RoutedMoE(nnx.Module):
       gate_inputs: jax.Array | None = None,
       out_sharding: NamedSharding | None = None,
       pregathered_weights: tuple | None = None,
+      use_chunked_combine: bool = True,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Executes the routed MoE block.
 
@@ -2823,7 +2865,17 @@ class RoutedMoE(nnx.Module):
             wo_bias,
         )
       output, lb_loss, bias_updates = self.sparse_matmul(
-          inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias, input_ids
+          inputs,
+          gate_logits,
+          pre_bias_logits,
+          w0_kernel,
+          w1_kernel,
+          wo_kernel,
+          w0_bias,
+          w1_bias,
+          wo_bias,
+          input_ids,
+          use_chunked_combine=use_chunked_combine,
       )
     else:
       output, lb_loss, bias_updates = self.dense_matmul(
@@ -2923,6 +2975,7 @@ class RoutedAndSharedMoE(nnx.Module):
       out_sharding: NamedSharding | None = None,
       input_ids: jax.Array | None = None,
       pregathered_weights: tuple | None = None,
+      use_chunked_combine: bool = True,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Executes both the routed experts and the shared expert block.
 
@@ -2945,6 +2998,7 @@ class RoutedAndSharedMoE(nnx.Module):
         out_sharding=out_sharding,
         input_ids=input_ids,
         pregathered_weights=pregathered_weights,
+        use_chunked_combine=use_chunked_combine,
     )
     shared_experts = self.shared_experts(inputs, intermediate_sharding=intermediate_sharding, out_sharding=out_sharding)
     return routed_experts + shared_experts, load_balance_loss, moe_bias_updates

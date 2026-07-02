@@ -720,8 +720,15 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       return _merge(p, rest_).self_attention_with_norm_op(x_in, seg, pos, det)  # (hidden, intermediate)
 
     def _moe(p, hidden_states, intermediate_inputs, weights, rest_):
+      # BACKWARD RECOMPUTE ONLY (called from fused_bwd below): recompute the MoE forward with the
+      # UN-chunked combine (use_chunked_combine=False) even when decouple_combine_rs_chunks>1 --
+      # the chunked combine is numerically the same function, so its VJP through the un-chunked
+      # form is the correct gradient, and the backward keeps the proven un-chunked combine bwd
+      # (forward-only chunking; the chunked-combine backward lands in a later rung).
       m = _merge(p, rest_)
-      mlp_lnx, load_balance_loss, moe_bias_updates = m.mlp_op(hidden_states, det, pregathered_weights=weights)
+      mlp_lnx, load_balance_loss, moe_bias_updates = m.mlp_op(
+          hidden_states, det, pregathered_weights=weights, use_chunked_combine=False
+      )
       layer_output = m.dropout_op(mlp_lnx + intermediate_inputs, deterministic=det)
       return layer_output, load_balance_loss, moe_bias_updates
 
@@ -779,12 +786,13 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
     fused.defvjp(fused_fwd, fused_bwd)
     return fused(params, x)
 
-  def mlp_op(self, x, deterministic, *args, pregathered_weights=None, **kwargs):
+  def mlp_op(self, x, deterministic, *args, pregathered_weights=None, use_chunked_combine=True, **kwargs):
     mlp_lnx, load_balance_loss, moe_bias_updates = self.DeepSeekMoeBlock_0(
         x,
         intermediate_sharding=self.mlp_intermediate_sharding,
         out_sharding=self.out_sharding,
         pregathered_weights=pregathered_weights,
+        use_chunked_combine=use_chunked_combine,
     )
     return self.with_logical_constraint(mlp_lnx), load_balance_loss, moe_bias_updates
 

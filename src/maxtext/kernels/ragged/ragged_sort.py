@@ -235,6 +235,7 @@ def ring_ragged_unsort(
     gather_reduce_flops_override=-1,
     gather_bytes_accessed_override=-1,
     gather_reduce_bytes_accessed_override=-1,
+    full_num_slots=None,
 ):
   """Dual of :func:`ring_ragged_sort`.
 
@@ -259,6 +260,12 @@ def ring_ragged_unsort(
     local_num_experts: scalar ``int`` representing the count of experts hosted on this shard.
     ep_name: ``str`` identifying the expert parallel axis name.
     topk_weights: ``[num_tokens_local * topk]`` tensor of per-slot routing weights.
+    full_num_slots: static ``int`` -- the TOTAL flat slot count (num_tokens * topk) of the
+      WHOLE combine problem. Only needed when ``topk_argsort_revert_indices`` is a SLICE of
+      the full revert permutation (decouple_combine_rs_chunks): the packed-vs-global
+      buffering-mode decision below is a property of the buffer layout (full problem), NOT
+      of the index slice length, so it must compare ``buffer_size`` against the FULL slot
+      count. Defaults to ``topk_argsort_revert_indices.shape[0]`` (un-chunked call).
 
   Returns:
     A 2D ``[num_tokens_local, hidden]`` tensor with expert outputs scattered back
@@ -286,13 +293,19 @@ def ring_ragged_unsort(
 
     buffer_size = sorted_tokens_local.shape[0]
     num_tokens = topk_argsort_revert_indices.shape[0]
+    num_slots = num_tokens if full_num_slots is None else full_num_slots
 
     # We support two buffering modes:
-    # 1. buffer_size >= num_tokens: sorted_tokens_local has size >= num_tokens,
+    # 1. buffer_size >= num_slots: sorted_tokens_local covers ALL flat slots,
     #    and local tokens are at their global positions [start, end).
-    # 2. buffer_size < num_tokens: sorted_tokens_local has size < num_tokens,
+    # 2. buffer_size < num_slots: sorted_tokens_local is a TRUNCATED buffer,
     #    and local tokens are packed at [0, local_num_tokens).
-    if buffer_size >= num_tokens:
+    # The decision must use the FULL slot count (num_slots), never the possibly-CHUNKED
+    # index length: for a chunked call (full_num_slots set), buffer_size can exceed the
+    # chunk's slice length while the buffer is still packed/truncated -- comparing against
+    # the slice length would mis-read packed local rows at global positions (the
+    # decouple_combine_rs_chunks c>0 shard-misalignment bug).
+    if buffer_size >= num_slots:
       # Express the scatter as a gather-reduce: each output row pulls
       # from sorted_tokens_local at position `topk_argsort_revert_indices[i]` if
       # that position is within this shard's [start, end) range, else zero.
@@ -361,16 +374,19 @@ def ring_ragged_unsort(
     g_hidden_states_local = g_out
 
     n = topk_argsort_revert_indices.shape[0]
+    num_slots = n if full_num_slots is None else full_num_slots
     # Build the inverse permutation idx_inv such that idx_inv[j] = i
     # where revert[i] = j.
     idx_inv = jnp.argsort(topk_argsort_revert_indices)
 
-    # Handle the same two buffering modes for backward pass.
+    # Handle the same two buffering modes for backward pass. The mode decision
+    # mirrors the forward: it compares against the FULL slot count (num_slots),
+    # never the possibly-chunked index slice length n.
     # We let ragged_gather do both the fan-out (by indexing into the
     # un-expanded g_hidden_states_local via idx_inv // topk) and the
     # per-slot weight application (via the fused weights parameter),
     # avoiding an extra HBM read-write pass.
-    if buffer_size >= n:
+    if buffer_size >= num_slots:
       # ragged_gather fans out g_hidden_states_local by reading the same row
       # multiple times when idx_inv // topk maps multiple positions to it.
       # Per-slot routing weights are applied inside the kernel.
@@ -385,6 +401,32 @@ def ring_ragged_unsort(
           enforce_fallback=enforce_gather_fallback,
           flops_override=gather_flops_override,
           bytes_accessed_override=gather_bytes_accessed_override,
+      )
+      if buffer_size > n:
+        # CHUNKED-INPUT combine (decouple_combine_rs_chunks): topk_argsort_revert_indices is a
+        # TOKEN-axis SLICE of the full revert permutation, so grad_sorted_tokens has only n rows
+        # while the primal input sorted_tokens_local has buffer_size rows. JAX requires the bwd
+        # output to match the un-sliced primal shape, so scatter the n grads back into a full
+        # buffer_size zero buffer at the buffer positions this slice read. Each chunk reads a
+        # DISJOINT set of buffer positions, so the N chunks' grads (summed by autodiff over the
+        # shared sorted_tokens_local input) form the complete buffer gradient. No-op when
+        # buffer_size == n (un-chunked path is untouched).
+        sorted_revert = topk_argsort_revert_indices[idx_inv]
+        grad_sorted_tokens = (
+            jnp.zeros((buffer_size,) + grad_sorted_tokens.shape[1:], dtype=grad_sorted_tokens.dtype)
+            .at[sorted_revert]
+            .set(grad_sorted_tokens)
+        )
+    elif full_num_slots is not None and full_num_slots != n:
+      # Truncated (packed) buffer + chunked indices under autodiff: the packed-mode bwd below
+      # assumes idx_inv is indexed by buffer position, which only holds for the FULL revert
+      # permutation. Supporting this needs a dedicated bwd (see the memory-flat single-custom_vjp
+      # design) -- fail loudly instead of silently mis-routing gradients.
+      raise NotImplementedError(
+          "ring_ragged_unsort backward does not support chunked indices with a truncated "
+          "(packed) buffer (decouple_combine_rs_chunks with ragged_buffer_factor > 0 under "
+          "autodiff). Use the un-chunked combine, a full-size buffer, or the hand-written "
+          "layer backward (moe_handwritten_bwd), whose recompute uses the un-chunked combine."
       )
     else:
       # Slice the inverse permutation to match the packed local buffer.
@@ -413,6 +455,89 @@ def ring_ragged_unsort(
   topk_weights_flat = topk_weights.astype(jnp.float32)
 
   return _ring_ragged_unsort(sorted_tokens_local, group_sizes_local, topk_argsort_revert_indices, topk_weights_flat)
+
+
+def chunked_ring_combine_reduce_scatter(
+    sorted_tokens_local,
+    group_sizes_local,
+    topk_argsort_revert_indices,
+    topk,
+    local_num_experts,
+    ep_name,
+    topk_weights,
+    ep_size,
+    n_chunks,
+    **unsort_kwargs,
+):
+  """Decoupled chunked combine -> reduce-scatter (ring-of-experts).
+
+  Runs the GMM FULL and chunks ONLY the post-GMM combine+RS loop, so each chunk's reduce-scatter
+  hides under the next chunk's combine (validated on v7x: ~11.5ms combine-bound region with the RS
+  absorbed). This is DISTINCT from ``moe_n_chunks``, which chunks the whole body (GMM included) and
+  so caps at ~2 on GMM efficiency -- here the GMM is untouched, so n_chunks can go large.
+
+  EXPERT-SORTED INPUT vs TOKEN-SORTED RS -- the subtle part, handled explicitly:
+    * ``sorted_tokens_local`` (the GMM2 output) is EXPERT-sorted, and is passed WHOLE to every
+      chunk -- it is NEVER sliced. ``ring_ragged_unsort`` reads that full expert-sorted buffer via
+      ``revert_indices`` and emits TOKEN-ordered output, so the expert->token un-sort happens
+      INSIDE the combine on the complete buffer.
+    * We chunk only the TOKEN (output) axis, by slicing ``revert_indices`` / ``topk_weights`` (a
+      contiguous range of output tokens). Each chunk's combine gathers its tokens' scattered rows
+      from the full buffer -> token-ordered chunk -> ``psum_scatter``. The RS therefore only ever
+      sees TOKEN-ordered data; there is NO expert/token mismatch at the reduce-scatter.
+    * Token order THROUGH the per-chunk RS is corrected by ``_permute_tokens_for_chunked_rs``
+      (vLLM trick): reorder the token axis chunk-major BEFORE chunking so that per-chunk
+      ``psum_scatter`` + ``concat`` reassembles the correct GLOBAL token order. Without it the
+      concat would interleave (shard's slice of chunk 0, then chunk 1, ...) -- wrong order.
+
+  No new custom_vjp: per chunk we reuse the existing ``ring_ragged_unsort`` (its hand-written
+  combine bwd) + ``jax.lax.psum_scatter`` (auto all_gather-transpose bwd), so the gradient map is
+  unchanged.
+
+  SHARD-ALIGNMENT FIX (the c>0 bug): each per-chunk ``ring_ragged_unsort`` call gets
+  ``full_num_slots`` (the WHOLE problem's flat slot count), because its packed-vs-global
+  buffering-mode decision compares ``buffer_size`` against the index length. With a truncated
+  buffer (ragged_buffer_factor > 0) and chunk slices short enough that
+  ``buffer_size >= slots_per_chunk``, the per-chunk combine used to flip into the
+  global-positions mode and read PACKED local rows at GLOBAL positions -- combining misaligned
+  shards' partial sums (garbage/uninitialized GMM rows, in-range indices, huge magnitudes) for
+  every chunk once the flip engaged. Isolated full-buffer tests never see it because the full
+  buffer is legitimately in the global-positions mode at any chunk size.
+
+  Returns ``[num_tokens // ep_size, hidden]`` (this shard's reduce-scattered slice).
+  """
+  num_tokens = topk_argsort_revert_indices.shape[0] // topk
+  full_num_slots = topk_argsort_revert_indices.shape[0]
+
+  def _permute_tokens_for_chunked_rs(a):  # a: [num_tokens, topk] -> chunk-major token reorder
+    per = num_tokens // (n_chunks * ep_size)
+    ar = a.reshape(ep_size, n_chunks, per, a.shape[-1])
+    return jnp.transpose(ar, (1, 0, 2, 3)).reshape(a.shape)
+
+  ridx, w = topk_argsort_revert_indices, topk_weights
+  if n_chunks > 1 and ep_size > 1:  # reorder the TOKEN axis so per-chunk RS lands in global order
+    ridx = _permute_tokens_for_chunked_rs(ridx.reshape(num_tokens, topk)).reshape(-1)
+    w = _permute_tokens_for_chunked_rs(w.reshape(num_tokens, topk)).reshape(-1)
+
+  slots_per_chunk = (num_tokens // n_chunks) * topk
+  outs = []
+  for c in range(n_chunks):
+    s0, s1 = c * slots_per_chunk, (c + 1) * slots_per_chunk
+    # combine: FULL expert-sorted buffer in (unsliced), token-ordered chunk out (existing custom_vjp)
+    combined = ring_ragged_unsort(
+        sorted_tokens_local,
+        group_sizes_local,
+        ridx[s0:s1],
+        topk,
+        local_num_experts,
+        ep_name,
+        topk_weights=w[s0:s1],
+        full_num_slots=full_num_slots,
+        **unsort_kwargs,
+    )
+    # reduce-scatter the TOKEN-ordered chunk over the expert axis (auto bwd = all_gather)
+    outs.append(jax.lax.psum_scatter(combined, ep_name, scatter_dimension=0, tiled=True))
+  return jnp.concatenate(outs, axis=0)
 
 
 def a2a_ragged_sort(inputs, sort_indices, valid_end, enforce_gather_fallback=False, enforce_gather_reduce_fallback=False):
