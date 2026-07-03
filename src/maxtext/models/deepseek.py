@@ -271,7 +271,7 @@ class DeepSeekGenericLayer(nnx.Module):
     axis_names = ["activation_batch", length_name, "activation_mlp"]
     return axis_names
 
-  def post_process(self, layer_output, load_balance_loss, moe_bias_updates, kv_cache=None):
+  def post_process(self, layer_output, load_balance_loss, moe_bias_updates, kv_cache=None, xlayer_carry=None):
     """postprocessing."""
 
     if self.config.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
@@ -290,6 +290,11 @@ class DeepSeekGenericLayer(nnx.Module):
       )
 
     if self.config.scan_layers:
+      if xlayer_carry is not None:
+        # Backward cross-layer prefetch (moe_bwd_xlayer_prefetch): the scan carry is the tuple
+        # (hidden, dummy_reverse). The dummy is threaded identity in the forward; its cotangent is
+        # the reverse-scan channel that hands the pre-gathered up-proj weights down one backward layer.
+        return (layer_output, xlayer_carry), None
       return layer_output, None
     return layer_output, kv_cache
 
@@ -460,15 +465,25 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       decoder_positions,
       deterministic,
       model_mode,
+      xlayer_w01_prev=None,
+      is_top_bwd=None,
       previous_chunk=None,
       slot: None | int = None,
       kv_cache=None,
       attention_metadata=None,
       decoder_input_tokens=None,
   ):
-    # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
+    # Backward cross-layer prefetch (moe_bwd_xlayer_prefetch): the scan carry is the tuple
+    # (hidden, dummy_reverse). xlayer_w01_prev is the PREVIOUS layer's (wi_0, wi_1) slice (an extra
+    # scan input; this layer's own weights stay in the scanned params) and is_top_bwd flags the top
+    # backward layer. The dummy is threaded identity in the forward; its cotangent hands the
+    # pre-gathered up-proj weights down one backward layer (into the dkv window).
+    _dummy_in = None
     if isinstance(inputs, tuple):
-      inputs = inputs[0]
+      if self.config.moe_bwd_xlayer_prefetch and xlayer_w01_prev is not None:
+        inputs, _dummy_in = inputs
+      else:
+        inputs = inputs[0]
 
     # This code should only be traced during initialization when using
     # batch-split schedule. It is never run during model execution, since
@@ -622,6 +637,18 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
         # Deterministic routing draws no rng either, so it is always safe.
         and (not self.config.use_random_routing or self.config.moe_routing_key_as_input)
     ):
+      if self.config.moe_bwd_xlayer_prefetch and xlayer_w01_prev is not None:
+        # Backward cross-layer prefetch: the fused custom_vjp additionally takes the previous layer's
+        # up-proj slice (xlayer_w01_prev, gathered in the bwd and handed DOWN the reverse scan), the
+        # top-backward-layer flag (is_top_bwd), and the reverse dummy carry (_dummy_in). It returns the
+        # dummy carry-out for the next layer.
+        layer_output, load_balance_loss, moe_bias_updates, dummy_out = self._handwritten_moe_layer(
+            x, decoder_segment_ids, decoder_positions, deterministic,
+            xlayer_w01_prev=xlayer_w01_prev, is_top_bwd=is_top_bwd, dummy_in=_dummy_in,
+        )
+        return self.post_process(
+            layer_output, load_balance_loss, moe_bias_updates, kv_cache, xlayer_carry=dummy_out
+        )
       layer_output, load_balance_loss, moe_bias_updates = self._handwritten_moe_layer(
           x, decoder_segment_ids, decoder_positions, deterministic
       )
@@ -663,7 +690,10 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
 
     return self.post_process(layer_output, load_balance_loss, moe_bias_updates, kv_cache)
 
-  def _handwritten_moe_layer(self, x, decoder_segment_ids, decoder_positions, deterministic):
+  def _handwritten_moe_layer(
+      self, x, decoder_segment_ids, decoder_positions, deterministic,
+      xlayer_w01_prev=None, is_top_bwd=None, dummy_in=None,
+  ):
     """Layer custom_vjp with a hand-written backward (flag: moe_handwritten_bwd).
 
     Wraps gather + attention + MoE so WE own the backward schedule. The forward runs the existing
@@ -930,6 +960,137 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       # disjoint per-piece param cotangents (zeros elsewhere) -> sum reconstructs the full gradient.
       dp = jax.tree.map(lambda a, b, c: a + b + c, dp_attn, dp_moe, dp_gather)
       return dp, dx
+
+    # ------------------------------------------------------------------------------------------
+    # Backward cross-layer prefetch (moe_bwd_xlayer_prefetch): fill the per-layer backward splash-dkv
+    # window with the NEXT-processed backward layer's INDEPENDENT up-proj all-gather. NNX path: this
+    # layer's own up-proj weights (wi_0/wi_1) stay in the scanned params (`p`); the decoder passes the
+    # PREVIOUS layer's slice (xlayer_w01_prev) as an extra scan input, a top-backward-layer flag
+    # (is_top_bwd), and a reverse dummy scan carry (dummy_in). In the reverse (backward) scan:
+    #   - PRODUCER: this layer's bwd all-gathers xlayer_w01_prev (= W01[i-1]) and HANDS it DOWN via the
+    #     dummy's cotangent (d_dummy_in) -> layer (i-1) receives it as its d_dummy_out. Emitted in THIS
+    #     layer's bwd -> overlaps THIS layer's dkv (the goal).
+    #   - CONSUMER: non-top layers take their w0/w1 VALUE from the handed (already-gathered) weights via
+    #     swap_gather (so their OWN up-proj all-gather is NOT emitted -- it was emitted one layer up),
+    #     while the weight-GRAD still flows via swap_gather's psum_scatter -> d(p.wi_0/wi_1). The top
+    #     backward layer (no producer) falls back to its own in-layer gather (lax.cond on is_top_bwd).
+    # Bit-exact vs flag-off: the handed all-gather value == the in-layer one, and the psum_scatter grad
+    # is identical, and the grad still lands on p.wi_0/wi_1 -- only WHERE the all-gather is emitted moves.
+    # wo is gathered in-layer as before. (Grad TREE is unchanged from flag-off: no param lift.)
+    if self.config.moe_bwd_xlayer_prefetch and xlayer_w01_prev is not None:
+      def _gather_wo(p, rest_):
+        return _merge(p, rest_).DeepSeekMoeBlock_0.gather_routed_weights(wo_only=True)
+
+      def _prod_w01(p, xw01_prev, rest_):
+        # PRODUCER: gather the PREVIOUS layer's (wi_0, wi_1) slice (handed down). stop_gradient -> pure
+        # scheduling; the consuming layer's swap_gather carries the grad (sole path -> no double-count).
+        w = _merge(p, rest_).DeepSeekMoeBlock_0.gather_routed_weights(xlayer_w01=xw01_prev, w01_only=True)
+        return jax.tree.map(jax.lax.stop_gradient, w)
+
+      def _w01_value(is_top, p, handed_w0, handed_w1, rest_):
+        # w0/w1 VALUE for THIS layer, grad -> p.wi_0/wi_1. loc = this layer's OWN sharded up-proj (from p).
+        # is_top is a 0.0/1.0 float scalar (a bool tracer cannot be a custom_vjp nondiff arg).
+        m = _merge(p, rest_)
+        loc = (m.DeepSeekMoeBlock_0.MoeBlock_0.wi_0[...], m.DeepSeekMoeBlock_0.MoeBlock_0.wi_1[...])
+        def _top(h0, h1):
+          # top backward layer: no producer -> own in-layer gather of loc (== flag-off gather).
+          return m.DeepSeekMoeBlock_0.gather_routed_weights(xlayer_w01=loc, w01_only=True)
+        def _nontop(h0, h1):
+          # interior: value = handed (all-gather emitted one layer up); grad -> psum_scatter -> loc.
+          return m.DeepSeekMoeBlock_0.swap_gather_routed_w01(h0, h1, loc)
+        return jax.lax.cond(is_top > 0.5, _top, _nontop, handed_w0, handed_w1)
+
+      def _moe_xl(p, hidden_states, intermediate_inputs, weights, rest_):
+        m = _merge(p, rest_)
+        mlp_lnx, load_balance_loss, moe_bias_updates = m.mlp_op(
+            hidden_states, det, pregathered_weights=weights,
+            use_chunked_combine=self.config.moe_chunked_combine_in_remat, use_chunked_dispatch=False,
+        )
+        layer_output = m.dropout_op(mlp_lnx + intermediate_inputs, deterministic=det)
+        return layer_output, load_balance_loss, moe_bias_updates
+
+      _host_off_xl = self.config.moe_splash_host_offload
+
+      def _forward_once_xl(p, x_in, rest_):
+        # FORWARD: stock ring forward (own gather + attention + MoE). The dummy carry is threaded identity
+        # here; the prefetch lives entirely in the backward. moe_splash_host_offload: capture the splash
+        # (out, lse) so fused_xl_fwd can offload them (the bwd loads instead of recomputing the splash).
+        m = _merge(p, rest_)
+        weights = m.DeepSeekMoeBlock_0.gather_routed_weights()
+        wag_cell = {"host_offload_fwd": True} if _host_off_xl else None
+        hidden_states, intermediate_inputs = m.self_attention_with_norm_op(x_in, seg0, pos0, det, wag_cell=wag_cell)
+        so = wag_cell.get("splash_out") if wag_cell is not None else None
+        sl = wag_cell.get("splash_lse") if wag_cell is not None else None
+        sos = wag_cell.get("splash_out_spec") if wag_cell is not None else None
+        sls = wag_cell.get("splash_lse_spec") if wag_cell is not None else None
+        mlp_lnx, load_balance_loss, moe_bias_updates = m.mlp_op(hidden_states, det, pregathered_weights=weights)
+        layer_output = m.dropout_op(mlp_lnx + intermediate_inputs, deterministic=det)
+        return layer_output, load_balance_loss, moe_bias_updates, so, sl, sos, sls
+
+      @jax.custom_vjp
+      def fused_xl(is_top, p, x_in, xw01_prev, dummy_carry):
+        lo, lbl, mbu, _so, _sl, _sos, _sls = _forward_once_xl(p, x_in, rest_other)
+        return (lo, lbl, mbu), dummy_carry  # dummy threaded identity in the forward
+
+      def fused_xl_fwd(is_top, p, x_in, xw01_prev, dummy_carry):
+        lo, lbl, mbu, so, sl, sos, sls = _forward_once_xl(p, x_in, rest_other)
+        host_splash = None
+        if _host_off_xl and so is not None:
+          _host_specs[0], _host_specs[1] = sos, sls  # share sharded specs to the bwd (static)
+
+          def _to_host(a, spec):
+            sh = jax.sharding.NamedSharding(self.mesh, spec).with_memory_kind("pinned_host")
+            return jax.device_put(a, sh)
+
+          host_splash = (_to_host(so, sos), _to_host(sl, sls))
+        return ((lo, lbl, mbu), dummy_carry), (is_top, p, x_in, seg0, pos0, rest_other, xw01_prev, host_splash)
+
+      def fused_xl_bwd(res, cotangents):
+        is_top, p, x_in, seg, pos, rest_, xw01_prev, host_splash = res
+        (cot_out, d_dummy_out) = cotangents  # d_dummy_out = handed (w0g, w1g) from layer i+1 (seed=0 at top)
+        handed_w0, handed_w1 = d_dummy_out
+        with _detached_linen_module_stack():
+          # PRODUCER: gather W01[i-1] and hand DOWN (emitted here -> overlaps this layer's dkv).
+          pref = _prod_w01(p, xw01_prev, rest_)
+          # w0/w1 value + grad (grad -> p.wi_0/wi_1 via swap/own psum_scatter; handed gets zero grad).
+          (w0, w1), vjp_w01 = jax.vjp(
+              lambda pp, h0, h1: _w01_value(is_top, pp, h0, h1, rest_), p, handed_w0, handed_w1
+          )
+          # wo (grad -> p.wo)
+          wo, vjp_wo = jax.vjp(lambda pp: _gather_wo(pp, rest_), p)
+          # attention: host-load the splash (moe_splash_host_offload) or recompute the splash forward.
+          if _host_off_xl and host_splash is not None:
+            _ho, _hl = host_splash
+            (hidden_states, intermediate_inputs), vjp_attn = jax.vjp(
+                lambda pp, xx: _attn_host(pp, xx, seg, pos, rest_, _ho, _hl), p, x_in
+            )
+          else:
+            (hidden_states, intermediate_inputs), vjp_attn = jax.vjp(
+                lambda pp, xx: _attn(pp, xx, seg, pos, rest_), p, x_in
+            )
+          weights = (w0, w1, wo)
+          _out, vjp_moe = jax.vjp(
+              lambda pp, hh, ii, ww: _moe_xl(pp, hh, ii, ww, rest_), p, hidden_states, intermediate_inputs, weights
+          )
+          dp_moe, d_hidden, d_inter, d_weights = vjp_moe(cot_out)
+          d_w0, d_w1, d_wo = d_weights
+          (dp_w01, d_h0, d_h1) = vjp_w01((d_w0, d_w1))
+          (dp_wo,) = vjp_wo(d_wo)
+          dp_attn, dx = vjp_attn((d_hidden, d_inter))
+        # p-grad = attention + MoE(non-weight) + w0/w1 (via dp_w01) + wo-gather. Disjoint per-piece
+        # param cotangents (zeros elsewhere) -> sum reconstructs the full gradient.
+        dp = jax.tree.map(lambda a, b, c, d: a + b + c + d, dp_attn, dp_moe, dp_w01, dp_wo)
+        # d_dummy_in = the producer payload (gather of W01[i-1]) handed to layer (i-1) as ITS d_dummy_out.
+        d_dummy_in = pref
+        # xw01_prev is only read by the stop_gradient'd producer gather -> zero cotangent (no double-count).
+        d_xw01_prev = jax.tree.map(jnp.zeros_like, xw01_prev)
+        # is_top is a constant selector (0/1) with no differentiable dependence -> zero cotangent.
+        d_is_top = jnp.zeros_like(is_top)
+        return d_is_top, dp, dx, d_xw01_prev, d_dummy_in
+
+      fused_xl.defvjp(fused_xl_fwd, fused_xl_bwd)
+      (lo, lbl, mbu), dummy_out = fused_xl(is_top_bwd, params, x, xlayer_w01_prev, dummy_in)
+      return lo, lbl, mbu, dummy_out
 
     fused.defvjp(fused_fwd, fused_bwd)
     return fused(params, x)

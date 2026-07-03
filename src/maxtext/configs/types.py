@@ -966,6 +966,27 @@ class MoEGeneral(BaseModel):
           "dispatch computes its sort internally). Default False = byte-identical."
       ),
   )
+  moe_bwd_xlayer_prefetch: bool = Field(
+      False,
+      description=(
+          "DeepSeek MoE hand-written backward (requires moe_handwritten_bwd=True + "
+          "moe_weight_ag_scheduling_group=True + use_ring_of_experts, no mhc/engram/batch-split): fill the "
+          "per-layer BACKWARD splash-dkv window (the biggest contiguous TC block) with the NEXT-processed "
+          "backward layer's INDEPENDENT weight all-gather. The MoE up-proj weights (wi_0/wi_1) are lifted "
+          "to a Decoder-owned stacked param and threaded per-layer as scanned inputs; layer i also receives "
+          "the PREVIOUS layer's slice (W01[i-1]). In the reverse (backward) scan, layer i's fused_bwd emits "
+          "the FSDP all-gather of layer (i-1)'s w0/w1 (the value, stop_gradient) and hands it DOWN to layer "
+          "(i-1) via the cotangent of an identity-threaded dummy scan carry (a reverse-scan DATA channel, "
+          "verified bit-exact for real grads). Layer (i-1) CONSUMES that gathered value for its MoE "
+          "recompute -- so its all-gather FORWARD is DCE'd, emitted one layer early (in layer i's body, "
+          "overlapping layer i's dkv) -- while its weight-grad still flows via its own gather's "
+          "psum_scatter (the sole grad path -> d(W01[i-1])); the handed value carries ZERO cotangent (no "
+          "double-count). The top backward layer (no producer) falls back to its own in-layer gather. "
+          "Numerically identical to flag-off (the handed all-gather value is bit-identical to the in-layer "
+          "one); costs one layer of gathered-weight lookahead (~2 gathered up-proj weights) in HBM. "
+          "Default False = no lift, no carry (byte-identical schedule)."
+      ),
+  )
   moe_splash_offload_scheduling_group: bool = Field(
       False,
       description=(
@@ -2752,6 +2773,18 @@ class MaxTextConfig(
         raise ValueError(
             "moe_save_sort_indices is incompatible with decouple_dispatch_chunks>1: the chunked dispatch "
             "computes its sort indices internally, so the forward capture path is not wired for it."
+        )
+    if self.moe_bwd_xlayer_prefetch:
+      if not (self.moe_handwritten_bwd and self.moe_weight_ag_scheduling_group):
+        raise ValueError(
+            "moe_bwd_xlayer_prefetch requires moe_handwritten_bwd=True + moe_weight_ag_scheduling_group=True: "
+            "it lifts the MoE up-proj weights to a Decoder-owned stacked param and reverse-prefetches their "
+            "all-gather through the hand-written fused backward's custom_vjp (a reverse-scan carry)."
+        )
+      if not self.use_ring_of_experts:
+        raise ValueError(
+            "moe_bwd_xlayer_prefetch requires use_ring_of_experts=True (the plain bf16 ring gather path is "
+            "the only one whose weight all-gather is expressible as the lifted (w0,w1) prefetch)."
         )
     if self.custom_mesh_and_rule is not CustomRule.DEFAULT:
       custom_mesh_path = os.path.join(

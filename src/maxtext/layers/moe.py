@@ -3086,7 +3086,7 @@ class RoutedMoE(nnx.Module):
       return _SPLASH_OFFLOAD_SCHED_GROUP
     return None
 
-  def gather_weights(self):
+  def gather_weights(self, xlayer_w01=None, w01_only=False, wo_only=False):
     """FSDP-all-gather the routed expert weights (wi_0/wi_1/wo) early, so the
     all-gather can be emitted in the ATTENTION phase (program-order before the
     attention kernel) and overlap it.
@@ -3095,6 +3095,14 @@ class RoutedMoE(nnx.Module):
     for passing back as `pregathered_weights`; or None when the simple bf16
     ring path doesn't hold (prefuse / sparsity / per-expert-scale / serve-quant),
     in which case the caller falls back to the normal in-MoE gather.
+
+    Cross-layer backward prefetch (moe_bwd_xlayer_prefetch):
+      - xlayer_w01: the lifted (wi_0, wi_1) slice for THIS layer (from the Decoder-owned
+        stacked param), used instead of self.wi_0/wi_1 (which are zeros placeholders when
+        the lift is on). wo always lives on this module.
+      - w01_only=True: gather ONLY (w0, w1) and return that 2-tuple -- the reverse-prefetch
+        of the next backward layer's up-proj all-gather (also the top layer's own gather).
+      - wo_only=True: gather ONLY wo (the consumer path, where w0/w1 come from swap_gather_w01).
     """
     cfg = self.config
     if not (cfg.moe_weight_ag_scheduling_group and cfg.use_ring_of_experts and not cfg.shard_exp_on_fsdp):
@@ -3109,8 +3117,12 @@ class RoutedMoE(nnx.Module):
     ):
       return None
 
-    w0 = jnp.asarray(self.wi_0[...], self.dtype)
-    w1 = jnp.asarray(self.wi_1[...], self.dtype)
+    if xlayer_w01 is not None:
+      w0 = jnp.asarray(xlayer_w01[0], self.dtype)
+      w1 = jnp.asarray(xlayer_w01[1], self.dtype)
+    else:
+      w0 = jnp.asarray(self.wi_0[...], self.dtype)
+      w1 = jnp.asarray(self.wi_1[...], self.dtype)
     wo = jnp.asarray(self.wo[...], self.dtype)
     # in = fsdp-sharded-on-embed kernel layout; out = the gathered (mlp_no_fsdp /
     # embed_tensor_transpose) layout sparse_matmul expects (default ring branch).
@@ -3160,10 +3172,57 @@ class RoutedMoE(nnx.Module):
     # NO optimization_barrier: it is self-dual, so a barrier on the gathered weight
     # fences the weight-grad feeding the backward psum_scatter -> pins the RS exposed.
     # The distinct group ids already prevent the all-gather-combiner fusion.
+    if w01_only:
+      # Reverse-prefetch gather of the NEXT backward layer's w0/w1 only (no wo). The producer caller
+      # stop_gradients the result (pure scheduling: the consuming layer routes the grad via swap_gather's
+      # psum_scatter), and the top backward layer uses THIS as its own (grad-live) gather. Returns (w0,w1).
+      w0 = _make_cv_gather(wi_in, w0_out, 1, _WEIGHT_AG_SCHED_GROUP)(w0)
+      w1 = _make_cv_gather(wi_in, w0_out, 1, _WEIGHT_AG_SCHED_GROUP + 1)(w1)
+      return (w0, w1)
+    if wo_only:
+      # Reverse-prefetch consumer: w0/w1 come from swap_gather_w01 (the early-emitted handed all-gather);
+      # gather ONLY wo here (grad -> self.wo). Returns the gathered wo tensor.
+      return _make_cv_gather(wo_in, wo_out, 2, _WEIGHT_AG_SCHED_GROUP + 2)(wo)
     w0 = _make_cv_gather(wi_in, w0_out, 1, _WEIGHT_AG_SCHED_GROUP)(w0)
     w1 = _make_cv_gather(wi_in, w0_out, 1, _WEIGHT_AG_SCHED_GROUP + 1)(w1)
     wo = _make_cv_gather(wo_in, wo_out, 2, _WEIGHT_AG_SCHED_GROUP + 2)(wo)
     return (w0, w1, wo)
+
+  def swap_gather_w01(self, handed_w0, handed_w1, xlayer_w01):
+    """Reverse-prefetch CONSUMER for w0/w1 (moe_bwd_xlayer_prefetch).
+
+    Returns (w0, w1) whose VALUE is the handed, already-gathered up-proj weights (all-gathered
+    ONE backward-layer early by the producer and handed down the reverse scan carry, so THIS
+    layer's own up-proj all-gather is not emitted), and whose BACKWARD is the tiled fsdp
+    psum_scatter (transpose of the all-gather) routed to `xlayer_w01` -- i.e. d(w0/w1) flows to
+    the FSDP-sharded lifted slice exactly as the plain gather's psum_scatter would. The handed
+    value gets ZERO cotangent (its grad path is here, not at the producer). Value == the plain
+    all-gather of xlayer_w01 (bit-identical), and the grad == the plain gather's psum_scatter, so
+    this is bit-exact vs the non-prefetch path -- it only moves WHERE the all-gather is emitted.
+    """
+    wi_in = self._logical_to_mesh_axes(self.wi_kernel_axes)
+    w0_out = self._logical_to_mesh_axes(("exp", "embed_tensor_transpose", "mlp_no_fsdp"))
+
+    def _make_swap():
+      @jax.custom_vjp
+      def _s(handed, loc):  # value = handed (already gathered); loc only pins the grad target
+        return handed
+
+      def _s_fwd(handed, loc):
+        return handed, None
+
+      def _s_bwd(_res, ct):  # transpose of tiled fsdp all-gather = tiled psum_scatter -> sharded loc grad
+        g_loc = jax.shard_map(
+            lambda gg: jax.lax.psum_scatter(gg, "fsdp", scatter_dimension=1, tiled=True),
+            mesh=self.mesh, in_specs=(w0_out,), out_specs=wi_in, check_vma=False)(ct)
+        return (jnp.zeros_like(ct), g_loc)  # zero grad to handed; real grad to the sharded slice
+
+      _s.defvjp(_s_fwd, _s_bwd)
+      return _s
+
+    w0 = _make_swap()(jnp.asarray(handed_w0, self.dtype), jnp.asarray(xlayer_w01[0], self.dtype))
+    w1 = _make_swap()(jnp.asarray(handed_w1, self.dtype), jnp.asarray(xlayer_w01[1], self.dtype))
+    return (w0, w1)
 
   def __call__(
       self,
@@ -3368,10 +3427,15 @@ class RoutedAndSharedMoE(nnx.Module):
   def routed_moe(self):
     return self.MoeBlock_0
 
-  def gather_routed_weights(self):
+  def gather_routed_weights(self, xlayer_w01=None, w01_only=False, wo_only=False):
     """Pre-gather the routed experts' FSDP weights (see RoutedMoE.gather_weights).
-    Call this in the attention phase; pass the result back as pregathered_weights."""
-    return self.MoeBlock_0.gather_weights()
+    Call this in the attention phase; pass the result back as pregathered_weights.
+    xlayer_w01 / w01_only / wo_only: cross-layer backward prefetch (moe_bwd_xlayer_prefetch)."""
+    return self.MoeBlock_0.gather_weights(xlayer_w01=xlayer_w01, w01_only=w01_only, wo_only=wo_only)
+
+  def swap_gather_routed_w01(self, handed_w0, handed_w1, xlayer_w01):
+    """Reverse-prefetch consumer for w0/w1 (see RoutedMoE.swap_gather_w01)."""
+    return self.MoeBlock_0.swap_gather_w01(handed_w0, handed_w1, xlayer_w01)
 
   def __call__(
       self,
