@@ -29,6 +29,12 @@ BIT-EXACT (diff == 0) against the un-chunked bwd for full AND truncated buffers,
 full-permutation ragged_gather's addressing is SC-emulated in-bounds per shard/N, and two
 composition smokes (return_first_combine_token under grad; lax.scan with carry-derived
 ridx/w custom_vjp inputs) guard the fence-cotangent drop and the scan-constvar trap.
+
+Rung 8b addition: the bwd's cotangent all_gather is now ONE tiled AG of the whole g_out with
+the (chunk, shard) -> (shard, chunk) row reorder composed into the bwd gather's token indices
+(no data transpose) instead of N per-chunk AGs; ``cotangent_single_ag_reorder_checks`` gates
+the two constructions bit-exact (f32 + bf16), and every existing BWD gate (bit-exact vs
+un-chunked, token-path, scan) now runs THROUGH the single-AG path.
 """
 
 import os
@@ -386,6 +392,54 @@ def sc_bwd_kernel_contract_checks(failures):
       failures.append("SC-bwd-emulation N=1: un-chunked bounds must be correct")
 
 
+def cotangent_single_ag_reorder_checks(failures):
+  """Rung 8b: OLD per-chunk-AG vs NEW single-AG + composed-index read, bit-exact.
+
+  The memory-flat bwd's step (1) used N per-chunk all_gathers of g_out concatenated in chunk
+  order (profiled: +1866 AG ops / +710ms exposed AG lane per step vs the flat fwd). g_out is
+  contiguous, so the bwd now issues ONE tiled all_gather of the whole buffer (SHARD-major row
+  order) and composes the (chunk, shard) -> (shard, chunk) row map into the gather's token
+  indices (``_bwd_ag_row`` -- pure int arithmetic, no data transpose, no extra cotangent
+  copy). Assert jnp.array_equal (bit-exact) between the per-chunk-AG concat and the
+  composed-index read of the single AG for EVERY row, under shard_map, f32 AND bf16 (the real
+  cotangent dtype), all EP x N combos, INCLUDING the identity-gated cases (n_chunks == 1).
+  """
+  devices = np.array(jax.devices())
+  for ep_size in (8, 4):
+    mesh = jax.sharding.Mesh(devices[:ep_size], ("ep",))
+    for dtype, dname in ((jnp.float32, "f32"), (jnp.bfloat16, "bf16")):
+      g_global = jax.random.normal(jax.random.PRNGKey(3), (NUM_TOKENS, HIDDEN), dtype=jnp.float32).astype(dtype)
+      for n_chunks in (1, 2, 4, 8):
+        rpc = (NUM_TOKENS // n_chunks) // ep_size  # rows_per_chunk_out
+
+        def body(g_out, _n=n_chunks, _rpc=rpc, _ep=ep_size):
+          # OLD (rung 8): N per-chunk AGs, concat in chunk order.
+          old = jnp.concatenate(
+              [jax.lax.all_gather(g_out[c * _rpc : (c + 1) * _rpc], "ep", axis=0, tiled=True) for c in range(_n)],
+              axis=0,
+          )
+          # NEW (rung 8b): ONE tiled AG; read row t through the composed index map, exactly
+          # as _chunked_combine_rs_bwd's _bwd_ag_row (incl. its n_chunks/ep_size gating).
+          g_full = jax.lax.all_gather(g_out, "ep", axis=0, tiled=True)
+          tok = jnp.arange(NUM_TOKENS, dtype=jnp.int32)
+          if _n > 1 and _ep > 1:
+            chunk_rows = _ep * _rpc
+            c, rem = tok // chunk_rows, tok % chunk_rows
+            r, i = rem // _rpc, rem % _rpc
+            tok = r * (_n * _rpc) + c * _rpc + i
+          new = g_full[tok]
+          return old, new
+
+        # check_vma=False: both outputs ARE replicated (tiled all_gather over the full axis)
+        # but the static VMA check cannot infer that.
+        fn = jax.shard_map(body, mesh=mesh, in_specs=(jax.P("ep"),), out_specs=(jax.P(), jax.P()), check_vma=False)
+        old, new = jax.jit(fn)(g_global)
+        exact = bool(jnp.array_equal(old, new))
+        print(f"  cotangent-AG-reorder EP={ep_size} N={n_chunks} {dname}: bit-exact={exact}")
+        if not exact:
+          failures.append(f"cotangent-AG-reorder EP={ep_size} N={n_chunks} {dname}: single-AG reorder != per-chunk AGs")
+
+
 def _token_and_scan_smokes(mesh, ep_size, bufs, group_sizes, revert, w_flat, n_chunks, grads_ref, failures):
   """Two rung-8 bwd composition smokes (one EP/N combo is enough; math is combo-independent).
 
@@ -465,6 +519,9 @@ def main():
 
   print("SC ragged_gather MEMORY-FLAT single-vjp BWD emulation (full-permutation output rows):")
   sc_memory_flat_bwd_contract_checks(failures)
+
+  print("Cotangent single-AG reorder vs per-chunk AGs (rung 8b, bit-exact):")
+  cotangent_single_ag_reorder_checks(failures)
 
   for ep_size in (8, 4):
     mesh = jax.sharding.Mesh(devices[:ep_size], ("ep",))

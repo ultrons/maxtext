@@ -554,9 +554,13 @@ def chunked_ring_combine_reduce_scatter(
     N chunks together ARE one big permuted combine, so the WHOLE chunked loop is wrapped
     in ONE custom_vjp whose backward is exactly the un-chunked ``ring_ragged_unsort`` bwd
     applied to the FULL permuted ``ridx``/``w``:
-      (1) per chunk, all_gather its ``g_out`` slice (the transpose of BOTH psum_scatter
-          and the direct-RS Pallas kernel, see ``_drs_bwd``) and concat in chunk order ->
-          the full combine cotangent in the SAME permuted token order the forward sliced;
+      (1) ONE tiled all_gather of the whole contiguous ``g_out`` (the transpose of BOTH
+          psum_scatter and the direct-RS Pallas kernel, see ``_drs_bwd``), with the
+          (chunk, shard) -> (shard, chunk) row reorder COMPOSED INTO the bwd gather's
+          token indices (``_bwd_ag_row``, pure int arithmetic -- no data transpose, no
+          extra cotangent copy). Rung 8b: replaces N smaller per-chunk all_gathers
+          (profiled +1866 AG ops / +710ms exposed AG lane) -- the gather reads rows
+          bit-identical to the per-chunk concat at single-large-AG cost;
       (2) ONE full-buffer ``ragged_gather`` fan-out with ``idx_inv = argsort(ridx)`` +
           per-slot weights, masked to the shard's [shard_output_start, shard_output_end)
           expert range.
@@ -690,15 +694,29 @@ def chunked_ring_combine_reduce_scatter(
     shard_output_start = group_offsets[experts_start]
     shard_output_end = group_offsets[experts_start + local_num_experts]
 
-    # (1) all_gather each chunk's g_out slice -- the transpose of BOTH jax.lax.psum_scatter and
-    # the direct-RS Pallas kernel (same reduce-scatter math; see _drs_bwd in moe.py) -- and
-    # concat in chunk order: the full combine cotangent in the SAME permuted token order as the
-    # forward's sliced ridx/w.
-    g_chunks = [
-        jax.lax.all_gather(g_out[c * rows_per_chunk_out : (c + 1) * rows_per_chunk_out], ep_name, axis=0, tiled=True)
-        for c in range(n_chunks)
-    ]
-    g_combined_full = jnp.concatenate(g_chunks, axis=0)  # [num_tokens, hidden]
+    # (1) ONE tiled all_gather of the WHOLE contiguous g_out -- the transpose of BOTH
+    # jax.lax.psum_scatter and the direct-RS Pallas kernel (same reduce-scatter math; see
+    # _drs_bwd in moe.py) -- with the row reorder folded into the gather INDICES (rung 8b).
+    # The forward's out is concat_c(psum_scatter(chunk_c)), so shard r's local g_out is
+    # CHUNK-major (local row c*rpc+i = shard r's slice of chunk c) and the tiled AG lands
+    # SHARD-major: permuted-order token t = c*(ep*rpc) + r*rpc + i sits at AG row
+    # r*(N*rpc) + c*rpc + i. The per-chunk-AG construction this replaces (N smaller AGs
+    # concatenated in chunk order -- profiled as +1866 AG ops / +710ms exposed AG lane time
+    # per step) materialized the permuted-order cotangent directly; rather than transposing
+    # the DATA back (an extra num_tokens x hidden cotangent copy -- measured +1 chunk-buffer
+    # of temp on the isolated-block AOT), ``_bwd_ag_row`` composes the (chunk, shard) ->
+    # (shard, chunk) row map into the bwd gather's token indices: pure int arithmetic on the
+    # index array, zero extra HBM buffers. The gather reads the IDENTICAL rows it read from
+    # the per-chunk concat -- bit-identical grads at single-large-AG cost.
+    g_full = jax.lax.all_gather(g_out, ep_name, axis=0, tiled=True)  # [num_tokens, hidden]
+
+    def _bwd_ag_row(tok):  # permuted-order token t -> its row in the SHARD-major AG output
+      if n_chunks == 1 or ep_size == 1:
+        return tok  # the two orders coincide (same gating as the forward token permute)
+      chunk_rows = ep_size * rows_per_chunk_out  # tokens per chunk
+      c, rem = tok // chunk_rows, tok % chunk_rows
+      r, i = rem // rows_per_chunk_out, rem % rows_per_chunk_out
+      return r * (n_chunks * rows_per_chunk_out) + c * rows_per_chunk_out + i
 
     # (2) the un-chunked ring_ragged_unsort bwd applied to the FULL permuted revert. idx_inv is
     # the full inverse permutation (n == full_num_slots), so the gather's output row j IS buffer
@@ -709,8 +727,8 @@ def chunked_ring_combine_reduce_scatter(
     weight_for_sorted = w.astype(jnp.float32)[idx_inv]
     if buffer_size >= full_num_slots:
       grad_sorted_tokens = ragged_gather(
-          g_combined_full,
-          idx_inv // topk,
+          g_full,
+          _bwd_ag_row(idx_inv // topk),
           shard_output_start[None],
           shard_output_end[None],
           weights=weight_for_sorted,
@@ -733,8 +751,8 @@ def chunked_ring_combine_reduce_scatter(
       padded_weights = jnp.pad(weight_for_sorted, (0, buffer_size))
       sliced_weights = jax.lax.dynamic_slice_in_dim(padded_weights, shard_output_start, buffer_size, axis=0)
       grad_sorted_tokens = ragged_gather(
-          g_combined_full,
-          sliced_idx_inv // topk,
+          g_full,
+          _bwd_ag_row(sliced_idx_inv // topk),
           jnp.int32(0)[None],
           gather_end[None],
           weights=sliced_weights,
