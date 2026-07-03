@@ -1431,7 +1431,7 @@ class RoutedMoE(nnx.Module):
         and self.config.moe_n_chunks <= 1
     )
 
-    def jax_ragged_dot_gmm(inputs, kernel, tiling, group_sizes, expert_assignments, padding_amount):
+    def jax_ragged_dot_gmm(inputs, kernel, tiling, group_sizes, expert_assignments, padding_amount, group_offset=0):
       """Execute jax.lax.ragged_dot, with potential quantization"""
       m, k, n = inputs.shape[0], inputs.shape[1], kernel.shape[2]
       tiling = (
@@ -1444,6 +1444,21 @@ class RoutedMoE(nnx.Module):
         if kernel.bias or kernel.sparsity_mask or len(kernel.scale) > 1:
           raise ValueError("Unsupported usecase for ragged_dot with quantized kernel.")
         rhs_inputs = kernel.qvalue
+      # Ring-of-experts EP>1 fallback (CPU/GPU reference): the kernel holds only this shard's
+      # LOCAL experts while group_sizes covers all GLOBAL experts (megablox/tokamax handle this
+      # via group_offset; jax.lax.ragged_dot has no such parameter and previously raised).
+      # inputs is the GLOBAL expert-sorted buffer, so roll the shard's rows (starting at the
+      # group_offset expert's cumulative offset) to the front, run ragged_dot with the LOCAL
+      # group sizes, and roll back. Rows outside the shard's valid range are don't-care
+      # (masked by the downstream combine), matching the TPU kernels' unwritten rows.
+      unshift = None
+      if group_sizes.shape[0] != rhs_inputs.shape[0]:
+        if isinstance(kernel, aqt.QTensor):
+          raise ValueError("group_offset ragged_dot fallback does not support quantized kernels.")
+        offsets = jnp.cumulative_sum(group_sizes.astype(jnp.int32), include_initial=True)
+        unshift = offsets[group_offset]
+        group_sizes = jax.lax.dynamic_slice_in_dim(group_sizes, group_offset, rhs_inputs.shape[0], axis=0)
+        inputs = jnp.roll(inputs, -unshift, axis=0)
       if self.config.use_qwix_quantization:
         # Use full contraction for QWIX quantization to allow quantization
         # fusion (max reduce over contracting dimension).
@@ -1472,6 +1487,8 @@ class RoutedMoE(nnx.Module):
               [(0, padding_amount, 0), (0, 0, 0)],
           )
         output *= scales
+      if unshift is not None:
+        output = jnp.roll(output, unshift, axis=0)
       return output
 
     def get_tokamax_group_sizes(group_sizes, inputs, kernel):
@@ -1569,7 +1586,9 @@ class RoutedMoE(nnx.Module):
             rhs_vma_axes=rhs_vma_axes,
         )
       else:  # jax.lax.ragged_dot
-        output = jax_ragged_dot_gmm(inputs, kernel, tiling, group_sizes, expert_assignments, padding_amount)
+        output = jax_ragged_dot_gmm(
+            inputs, kernel, tiling, group_sizes, expert_assignments, padding_amount, group_offset=group_offset
+        )
       if padding_amount > 0:
         output = output[: orig_inputs_shape[0]]
       return output
