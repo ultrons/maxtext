@@ -40,6 +40,7 @@ from maxtext.layers.initializers import NdInitializer, default_bias_init, nd_den
 from maxtext.kernels.ragged.ragged_sort import a2a_ragged_sort
 from maxtext.kernels.ragged.ragged_sort import a2a_ragged_unsort
 from maxtext.kernels.ragged.ragged_sort import chunked_ring_combine_reduce_scatter
+from maxtext.kernels.ragged.ragged_sort import chunked_ring_dispatch
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_sort
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_unsort
 from maxtext.utils import max_logging
@@ -928,12 +929,25 @@ class RoutedMoE(nnx.Module):
       rngs=None,
       roll_to_expert_id=None,
       input_ids=None,
+      dispatch_x_is_local=False,
   ):
-    """Permute tokens to group by expert to fit gmm call."""
+    """Permute tokens to group by expert to fit gmm call.
+
+    `dispatch_x_is_local` (decouple_dispatch_chunks, rung 9): when True, `inputs` is the PRE-AG
+    LOCAL x (routing tensors gate_logits/pre_bias_logits are still GLOBAL) and the ragged
+    dispatch is done by `chunked_ring_dispatch`, which chunks the token AG internally. The GLOBAL
+    token count then comes from gate_logits, not from the (local) inputs.
+    """
     # reshape inputs (batch, sequence, emb) to (batch * sequence, emb)
     inputs_shape = inputs.shape
-    bsz_times_seq_len = inputs_shape[0] * inputs_shape[1]
-    inputs_2d = jnp.reshape(inputs, (bsz_times_seq_len, inputs_shape[2]))
+    inputs_2d = jnp.reshape(inputs, (inputs_shape[0] * inputs_shape[1], inputs_shape[2]))
+    # Token count for routing/buffer sizing: GLOBAL. Normally inputs is the all-gathered global x
+    # so this equals inputs_shape[0]*inputs_shape[1]; with chunked dispatch inputs is LOCAL, so
+    # take the global count from the (always-global) gate_logits instead.
+    if dispatch_x_is_local:
+      bsz_times_seq_len = gate_logits.shape[0] * gate_logits.shape[1]
+    else:
+      bsz_times_seq_len = inputs_shape[0] * inputs_shape[1]
     weights, selected_experts = self.get_topk(gate_logits, pre_bias_logits, rngs, input_ids)
     lb_loss = None
     if self.config.load_balance_loss_weight > 0.0 and not self.is_hash_routing:
@@ -978,21 +992,40 @@ class RoutedMoE(nnx.Module):
       else:
         buffer_size = None
 
-      sorted_inputs, group_size, sorted_selected_experts = ring_ragged_sort(
-          inputs_2d,
-          topk_indices_2d,
-          self.config.num_experts,
-          self.num_experts_per_tok,
-          self._expert_parallelism_name,
-          num_expert_parallelism,
-          buffer_size=buffer_size,
-          enforce_gather_fallback=self.config.ragged_gather_fallback,
-          enforce_gather_reduce_fallback=self.config.ragged_gather_reduce_fallback,
-          gather_flops_override=self.config.ragged_gather_cost_estimate_flops,
-          gather_reduce_flops_override=self.config.ragged_gather_reduce_cost_estimate_flops,
-          gather_bytes_accessed_override=self.config.ragged_gather_cost_estimate_bytes_accessed,
-          gather_reduce_bytes_accessed_override=self.config.ragged_gather_reduce_cost_estimate_bytes_accessed,
-      )
+      if dispatch_x_is_local:
+        # inputs_2d is the PRE-AG LOCAL x; chunk the token AG + ragged-sort (rung 9). buffer_size
+        # is None here (gated to ragged_buffer_factor<=0), so the full-buffer path is used.
+        sorted_inputs, group_size, sorted_selected_experts = chunked_ring_dispatch(
+            inputs_2d,
+            topk_indices_2d,
+            self.config.num_experts,
+            self.num_experts_per_tok,
+            self._expert_parallelism_name,
+            num_expert_parallelism,
+            self.config.decouple_dispatch_chunks,
+            enforce_gather_fallback=self.config.ragged_gather_fallback,
+            enforce_gather_reduce_fallback=self.config.ragged_gather_reduce_fallback,
+            gather_flops_override=self.config.ragged_gather_cost_estimate_flops,
+            gather_reduce_flops_override=self.config.ragged_gather_reduce_cost_estimate_flops,
+            gather_bytes_accessed_override=self.config.ragged_gather_cost_estimate_bytes_accessed,
+            gather_reduce_bytes_accessed_override=self.config.ragged_gather_reduce_cost_estimate_bytes_accessed,
+        )
+      else:
+        sorted_inputs, group_size, sorted_selected_experts = ring_ragged_sort(
+            inputs_2d,
+            topk_indices_2d,
+            self.config.num_experts,
+            self.num_experts_per_tok,
+            self._expert_parallelism_name,
+            num_expert_parallelism,
+            buffer_size=buffer_size,
+            enforce_gather_fallback=self.config.ragged_gather_fallback,
+            enforce_gather_reduce_fallback=self.config.ragged_gather_reduce_fallback,
+            gather_flops_override=self.config.ragged_gather_cost_estimate_flops,
+            gather_reduce_flops_override=self.config.ragged_gather_reduce_cost_estimate_flops,
+            gather_bytes_accessed_override=self.config.ragged_gather_cost_estimate_bytes_accessed,
+            gather_reduce_bytes_accessed_override=self.config.ragged_gather_reduce_cost_estimate_bytes_accessed,
+        )
     else:
       flatten_selected_experts = jnp.ravel(selected_experts)
 
@@ -1350,6 +1383,7 @@ class RoutedMoE(nnx.Module):
       wo_bias,
       input_ids=None,
       use_chunked_combine=True,
+      use_chunked_dispatch=True,
       return_combine_token=False,
   ):
     """Perform sparse matrix multiplication of inputs and Experts.
@@ -1639,11 +1673,32 @@ class RoutedMoE(nnx.Module):
         # The ring-of-experts strategy first duplicates the inputs to all
         # expert shards, and then routes within each shard.
 
-        # Duplicate inputs to all expert shards.
-        x, logits, pre_bias_logits = tuple(
-            jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True)
-            for z in (x, logits, pre_bias_logits)
+        # DECOUPLED chunked dispatch (decouple_dispatch_chunks, rung 9): chunk the token AG over
+        # the input-token axis so each chunk's all-gather hides under the previous chunk's
+        # ragged-sort. Routing needs only the (small) logits gathered; x stays LOCAL and its AG
+        # is chunked inside chunked_ring_dispatch. Gated to the plain ragged single-axis
+        # full-buffer ring path (the chunked dispatch is the full-buffer variant). Off on the
+        # moe_handwritten_bwd RECOMPUTE (use_chunked_dispatch=False) -> unchunked there.
+        chunk_dispatch = (
+            self.config.decouple_dispatch_chunks > 1
+            and use_chunked_dispatch
+            and self.config.use_ragged_sort
+            and self._expert_parallelism_name == "expert"
+            and self.config.ragged_buffer_factor <= 0
+            and self.config.decoder_block != ctypes.DecoderBlockType.LLAMA4
         )
+        if chunk_dispatch:
+          # Gather ONLY the routing tensors; keep x LOCAL (its AG is chunked in permute).
+          logits, pre_bias_logits = tuple(
+              jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True)
+              for z in (logits, pre_bias_logits)
+          )
+        else:
+          # Duplicate inputs to all expert shards.
+          x, logits, pre_bias_logits = tuple(
+              jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True)
+              for z in (x, logits, pre_bias_logits)
+          )
 
         # "Route" tokens within each shard.
         num_experts_per_shard = self.config.num_experts // num_ep
@@ -1664,6 +1719,7 @@ class RoutedMoE(nnx.Module):
             roll_to_expert_id=num_experts_per_shard * expert_shard_id,
             rngs=rngs,
             input_ids=input_ids,
+            dispatch_x_is_local=chunk_dispatch,
         )
 
       else:
@@ -2923,6 +2979,7 @@ class RoutedMoE(nnx.Module):
       out_sharding: NamedSharding | None = None,
       pregathered_weights: tuple | None = None,
       use_chunked_combine: bool = True,
+      use_chunked_dispatch: bool = True,
       return_combine_token: bool = False,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Executes the routed MoE block.
@@ -3018,6 +3075,7 @@ class RoutedMoE(nnx.Module):
           wo_bias,
           input_ids,
           use_chunked_combine=use_chunked_combine,
+          use_chunked_dispatch=use_chunked_dispatch,
           return_combine_token=return_combine_token,
       )
       # 3-tuple, or 4-tuple (with the combine scheduling token, possibly None) when
@@ -3124,6 +3182,7 @@ class RoutedAndSharedMoE(nnx.Module):
       input_ids: jax.Array | None = None,
       pregathered_weights: tuple | None = None,
       use_chunked_combine: bool = True,
+      use_chunked_dispatch: bool = True,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Executes both the routed experts and the shared expert block.
 
@@ -3149,6 +3208,7 @@ class RoutedAndSharedMoE(nnx.Module):
           input_ids=input_ids,
           pregathered_weights=pregathered_weights,
           use_chunked_combine=use_chunked_combine,
+          use_chunked_dispatch=use_chunked_dispatch,
           return_combine_token=True,
       )
     else:
@@ -3159,6 +3219,7 @@ class RoutedAndSharedMoE(nnx.Module):
           input_ids=input_ids,
           pregathered_weights=pregathered_weights,
           use_chunked_combine=use_chunked_combine,
+          use_chunked_dispatch=use_chunked_dispatch,
       )
       combine_token = None
     shared_input = inputs

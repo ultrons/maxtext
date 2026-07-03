@@ -735,6 +735,10 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
           det,
           pregathered_weights=weights,
           use_chunked_combine=self.config.moe_chunked_combine_in_remat,
+          # Rung 9 forward-only: the recompute uses the UN-chunked dispatch (its ragged-sort bwd is
+          # numerically identical to the chunked dispatch's un-chunked backward, and unchunked keeps
+          # the proven single ragged-sort). No in-remat flag yet (mirrors rung-6's hardcoded False).
+          use_chunked_dispatch=False,
       )
       layer_output = m.dropout_op(mlp_lnx + intermediate_inputs, deterministic=det)
       return layer_output, load_balance_loss, moe_bias_updates
@@ -793,13 +797,16 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
     fused.defvjp(fused_fwd, fused_bwd)
     return fused(params, x)
 
-  def mlp_op(self, x, deterministic, *args, pregathered_weights=None, use_chunked_combine=True, **kwargs):
+  def mlp_op(
+      self, x, deterministic, *args, pregathered_weights=None, use_chunked_combine=True, use_chunked_dispatch=True, **kwargs
+  ):
     mlp_lnx, load_balance_loss, moe_bias_updates = self.DeepSeekMoeBlock_0(
         x,
         intermediate_sharding=self.mlp_intermediate_sharding,
         out_sharding=self.out_sharding,
         pregathered_weights=pregathered_weights,
         use_chunked_combine=use_chunked_combine,
+        use_chunked_dispatch=use_chunked_dispatch,
     )
     return self.with_logical_constraint(mlp_lnx), load_balance_loss, moe_bias_updates
 

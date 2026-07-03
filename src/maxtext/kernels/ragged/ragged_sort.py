@@ -626,6 +626,183 @@ def chunked_ring_combine_reduce_scatter(
   return out
 
 
+def chunked_ring_dispatch(
+    hidden_states_local,
+    topk_indices_global,
+    num_experts,
+    topk,
+    ep_name,
+    ep_size,
+    n_chunks,
+    enforce_gather_fallback=False,
+    enforce_gather_reduce_fallback=False,
+    gather_flops_override=-1,
+    gather_reduce_flops_override=-1,
+    gather_bytes_accessed_override=-1,
+    gather_reduce_bytes_accessed_override=-1,
+):
+  """Decoupled chunked dispatch (INPUT side): chunk the EP all-gather + ragged-sort over the
+  INPUT-token axis so each chunk's all-gather (async ICI) hides under the PREVIOUS chunk's
+  ragged-sort (SparseCore). The GMM runs FULL/un-chunked downstream. Rung-9 flat-buffer variant
+  of the campaign's ``chunked_ring_dispatch`` (source branch decouple-combine-rs-chunks, commit
+  c2e46b7f1): bit-exact fwd+bwd there, but it summed M full-buffer gathers so HBM scaled with M.
+
+  FLAT-BUFFER FORWARD (the rung-9 change): ONE full-size expert-sorted buffer, threaded through
+  the chunk loop; each chunk writes its OWN rows via ``jnp.where(mask_c, gathered, buf)`` and a
+  per-iteration ``optimization_barrier`` chains the writes. Every buffer row's source token
+  lives in exactly ONE input chunk (``chunk_of_row``), so the per-chunk writes are provably
+  DISJOINT -- no real accumulation, just disjoint fills -- and the barrier chain both prevents
+  cross-chunk fusion (rung-6b lesson) and serializes the SparseCore gathers so at most ~2
+  gather scratches are live (vs the source's M live). See the memory NOTE below: this does NOT
+  by itself collapse the per-chunk ``ragged_gather`` output scratch (that needs an in-place
+  aliasing kernel; deferred) -- HBM is MEASURED at AOT, not assumed flat.
+
+  NEVER SLICE A KERNEL OPERAND (this week's bug class, x3): the only sliced thing is
+  ``x_chunks[c]`` fed to ``jax.lax.all_gather`` (a JAX collective, not an SC kernel). The
+  ``ragged_gather`` sees FULL-shape ``idx_c`` (``[buffer_size]``, masked) and FULL
+  ``[shard_output_start, shard_output_end)`` bounds -- byte-identical shapes to the un-chunked
+  ``ring_ragged_sort`` call. Its source operand ``xg_c`` is only RANDOM-ACCESSED by index value
+  (the kernel derives its row/partition counts from the INDEX/OUTPUT axis, not from ``xg_c``),
+  and every ``chunk_local_row`` value is ``< per*ep_size == xg_c.shape[0]`` by construction, so
+  there is no chunk-vs-full shape asymmetry at the kernel -- unlike the combine side.
+
+  Buffer order is preserved EXACTLY (GLOBAL shard-major expert argsort, UNPERMUTED): the
+  chunk-major reindex applies ONLY to which input rows each all-gather grabs, never to the
+  buffer layout, so the GMM / downstream combine contract is unchanged (no vLLM token-permute).
+
+  SINGLE custom_vjp, un-chunked backward (rung-6 Step-1 pattern, N-independent HBM): the M
+  chunks are a partition of the un-chunked ``ring_ragged_sort``, so the backward is its
+  un-chunked backward applied ONCE to the full cotangent -- one ``ragged_gather_reduce`` over
+  ``topk_argsort_revert_indices`` (grad wrt the GLOBAL all-gathered x) then one ``psum_scatter``
+  (the all-gather transpose -> grad wrt LOCAL x). Bit-exact vs the un-chunked dispatch backward.
+
+  Args:
+    hidden_states_local: 2D ``[num_tokens_local, hidden]`` PRE-all-gather local activations.
+    topk_indices_global: 2D ``[num_tokens_global, topk]`` GLOBAL routed expert ids (routing is
+      replicated: logits are all-gathered upstream, exactly as the un-chunked path).
+    n_chunks: number of input-token chunks (M); must divide ``num_tokens_local``.
+
+  Returns:
+    ``(buffer, group_sizes_local, topk_argsort_revert_indices)`` matching ``ring_ragged_sort``
+    (buffer is ``[num_tokens_global*topk, hidden]``, expert-sorted, masked to this shard's
+    expert range).
+  """
+  num_tokens_local = hidden_states_local.shape[0]
+  num_tokens_global = topk_indices_global.shape[0]
+  hidden = hidden_states_local.shape[-1]
+  assert num_tokens_global == num_tokens_local * ep_size, (
+      f"chunked_ring_dispatch expects pre-AG local x: num_tokens_local={num_tokens_local}, "
+      f"ep_size={ep_size}, num_tokens_global={num_tokens_global} (need global == local*ep)."
+  )
+  per = num_tokens_local // n_chunks  # local tokens per chunk (per-shard AG payload per chunk)
+  assert per * n_chunks == num_tokens_local, (
+      f"decouple_dispatch_chunks={n_chunks} must divide num_tokens_local={num_tokens_local}."
+  )
+  buffer_size = num_tokens_global * topk
+
+  # --- Routing (index-only, replicated across shards): mirror ring_ragged_sort's forward. ---
+  topk_indices_flat = topk_indices_global.flatten()  # [num_tokens_global * topk]
+  topk_argsort_indices = jnp.argsort(topk_indices_flat)
+  token_indices = jnp.arange(num_tokens_global, dtype=jnp.int32).repeat(topk)
+  # buffer pos -> GLOBAL (shard-major) token id (UNPERMUTED -- preserves un-chunked buffer order).
+  token_indices_sorted = token_indices[topk_argsort_indices]
+  group_sizes_local = jax.nn.one_hot(topk_indices_flat, num_experts, dtype=jnp.int32).sum(axis=0)
+  topk_argsort_revert_indices = jnp.argsort(topk_argsort_indices)
+
+  shard_idx = jax.lax.axis_index(ep_name)
+  local_num_experts = num_experts // ep_size
+  experts_start = shard_idx * local_num_experts
+  experts_end = experts_start + local_num_experts
+  group_offsets = jnp.cumulative_sum(group_sizes_local, include_initial=True)
+  shard_output_start = group_offsets[experts_start]
+  shard_output_end = group_offsets[experts_end]
+
+  # Per buffer row, decompose its source GLOBAL token into (origin shard, local idx, chunk,
+  # in-chunk row). chunk c's all-gather array is shard-major within the chunk:
+  #   xg_c row(g) = origin_shard * per + (local_idx - c*per)
+  origin_shard = token_indices_sorted // num_tokens_local
+  local_idx = token_indices_sorted % num_tokens_local
+  chunk_of_row = local_idx // per  # which chunk owns this buffer row's token
+  in_chunk_pos = local_idx - chunk_of_row * per
+  chunk_local_row = origin_shard * per + in_chunk_pos  # row within the chunk's all-gathered array
+
+  # The tracer-derived index arrays are passed as EXPLICIT custom_vjp inputs, NOT closed over: a
+  # custom_vjp closing over scan-carried TRACERS hits "No constant handler for DynamicJaxprTracer"
+  # inside the per-layer scan (they become constvars). Mirrors chunked_ring_combine_reduce_scatter.
+  # All are non-differentiable index/int arrays -> None cotangents; only x carries a gradient.
+  @jax.custom_vjp
+  def _chunked_dispatch(hidden_states_local, chunk_of_row, chunk_local_row, s_start, s_end, revert):
+    return _chunked_dispatch_fwd(hidden_states_local, chunk_of_row, chunk_local_row, s_start, s_end, revert)[0]
+
+  @jax.named_scope("chunked-dispatch-fwd")
+  def _chunked_dispatch_fwd(hidden_states_local, chunk_of_row, chunk_local_row, s_start, s_end, revert):
+    # FORWARD: unrolled per-chunk all-gather + ragged-sort, DISJOINT writes into ONE buffer with
+    # a barrier chain. Identical math to the un-chunked forward so the AG-under-previous-sort
+    # overlap is preserved; the barrier chain serializes the SC gathers (flat-ish liveness) and
+    # blocks cross-chunk fusion.
+    x_chunks = hidden_states_local.reshape(n_chunks, per, hidden)
+    buf = jnp.zeros((buffer_size, hidden), hidden_states_local.dtype)
+    for c in range(n_chunks):
+      # All-gather ONLY chunk c's local slice -> [per*ep_size, hidden] (shard-major, tiled).
+      xg_c = jax.lax.all_gather(x_chunks[c], ep_name, axis=0, tiled=True)
+      mask = chunk_of_row == c  # [buffer_size] bool: rows whose source token is in chunk c
+      idx_c = jnp.where(mask, chunk_local_row, 0)  # FULL-shape masked index into the kernel
+      gathered = ragged_gather(
+          xg_c,
+          idx_c,
+          s_start[None],
+          s_end[None],
+          enforce_fallback=enforce_gather_fallback,
+          flops_override=gather_flops_override,
+          bytes_accessed_override=gather_bytes_accessed_override,
+      )
+      # Disjoint fill: each buffer row is written by exactly one chunk (unique chunk_of_row).
+      # Rows outside [start,end) get 0 (their chunk's gathered is 0 there), matching
+      # ring_ragged_sort's "zeros elsewhere". buf threads through -> single logical buffer.
+      buf = jnp.where(mask[:, None], gathered.astype(hidden_states_local.dtype), buf)
+      # Barrier chain (rung-6b): fence buf[c] so XLA cannot fuse/parallelize the per-chunk
+      # gathers (keeps liveness ~2 buffers) nor merge the writes across chunks.
+      (buf,) = jax.lax.optimization_barrier((buf,))
+    # Residual: index-only tracers + local shape. NOTHING heavy (no buffer), mirroring
+    # ring_ragged_sort's bwd which recomputes grad from g_out + indices alone.
+    return buf, (s_start, s_end, revert, hidden_states_local.shape)
+
+  @jax.named_scope("chunked-dispatch-bwd")
+  def _chunked_dispatch_bwd(res, g_out):
+    # BACKWARD: the M chunks partition the un-chunked ring_ragged_sort, so its backward applied
+    # ONCE to the full g_out -> grad wrt GLOBAL x, then the all-gather transpose (psum_scatter)
+    # -> grad wrt LOCAL x. One gather-reduce + one RS, FLAT in n_chunks, bit-exact vs un-chunked.
+    s_start, s_end, revert, local_shape = res
+    n = revert.shape[0]
+    valid_rows_mask = (revert >= s_start) & (revert < s_end)
+    grad_global = ragged_gather_reduce(
+        g_out,
+        revert,
+        topk_weights=jnp.ones((n,), dtype=jnp.float32),
+        valid_rows_mask=valid_rows_mask,
+        reduce_group_size=topk,
+        enforce_fallback=enforce_gather_reduce_fallback,
+        flops_override=gather_reduce_flops_override,
+        bytes_accessed_override=gather_reduce_bytes_accessed_override,
+    )  # [num_tokens_global, hidden] -- grad wrt the ALL-GATHERED x
+    # Transpose of the forward all_gather(tiled) is a tiled psum_scatter over the same axis.
+    grad_local = jax.lax.psum_scatter(grad_global, ep_name, scatter_dimension=0, tiled=True)
+    grad_local = grad_local.reshape(local_shape).astype(g_out.dtype)
+    return (grad_local, None, None, None, None, None)
+
+  _chunked_dispatch.defvjp(_chunked_dispatch_fwd, _chunked_dispatch_bwd)
+
+  buffer = _chunked_dispatch(
+      hidden_states_local,
+      chunk_of_row,
+      chunk_local_row,
+      shard_output_start,
+      shard_output_end,
+      topk_argsort_revert_indices,
+  )
+  return buffer, group_sizes_local, topk_argsort_revert_indices
+
+
 def a2a_ragged_sort(inputs, sort_indices, valid_end, enforce_gather_fallback=False, enforce_gather_reduce_fallback=False):
   """Ragged-gather variant for ``local_permute``.
 
