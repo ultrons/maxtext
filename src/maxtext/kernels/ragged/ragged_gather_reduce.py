@@ -18,6 +18,9 @@
 import functools
 import math
 import jax
+from jax._src import core as jax_core
+from jax._src import tree_util as _tree_util
+from jax._src.pallas import core as pl_core
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
@@ -617,3 +620,142 @@ def ragged_gather_reduce(
       out.astype(x.dtype),
       jnp.zeros_like(out, dtype=x.dtype),
   )[: (input_size // reduce_group_size), :hidden_size]
+
+
+def sc_accumulate_dims(input_size: int, hidden_size: int, reduce_group_size: int = 1):
+  """Padded (rows, cols) of the ACCUMULATE buffer for ``ragged_gather_reduce_accumulate``.
+
+  SparseCore-only (reads ``get_tpu_info``). The accumulate buffer must be pre-shaped to these
+  padded dims and threaded through the chunk loop so the padding is paid ONCE (not per chunk).
+  Mirrors the padding math in ``ragged_gather_reduce`` exactly.
+  """
+  sc_info = pltpu.get_tpu_info().sparse_core
+  assert sc_info is not None, "sc_accumulate_dims requires SparseCore"
+  num_column_partitions = 8
+  num_cores = sc_info.num_cores * sc_info.num_subcores
+  num_rows_partitions = num_cores // num_column_partitions
+  aligned_hidden_size = _align_to(hidden_size, 128 * num_column_partitions)
+  padded_input_size = _align_to(
+      input_size, math.lcm(num_rows_partitions * sc_info.num_lanes, reduce_group_size)
+  )
+  return padded_input_size // reduce_group_size, aligned_hidden_size
+
+
+def ragged_gather_reduce_accumulate(
+    accum,
+    x,
+    indices,
+    topk_weights,
+    valid_rows_mask,
+    reduce_group_size,
+    flops_override: int = -1,
+    bytes_accessed_override: int = -1,
+):
+  """In-place accumulate variant of :func:`ragged_gather_reduce` (SparseCore only).
+
+  Identical gather/reduce math, but the kernel's output ref is INITIALIZED to ``accum`` (an
+  ``sc_accumulate_dims``-shaped float32 buffer) and DONATED, so the kernel writes ONLY the valid
+  (this-call's) destination rows in place and leaves every other row at its prior ``accum`` value.
+  There is NO final ``where``-zeroing. Threaded across the decouple_dispatch_chunks loop this gives
+  O(chunk_rows) HBM write + O(chunk_rows) SC compute per chunk (the compaction only processes the
+  valid rows), replacing the rung-9 per-chunk full-buffer ``jnp.where`` merge (N x ~14GB traffic).
+
+  Because ``main_kernel`` OVERWRITES ``out[dst]`` (no read-accumulate) and each buffer row is
+  written by exactly one chunk (disjoint ``chunk_of_row``), the overwrite-in-place reproduces the
+  full-buffer gather bit-exactly. Validated standalone on v5p (num_lanes=8); SC numerics are
+  otherwise cluster-gated (CPU has no SparseCore).
+
+  Args:
+    accum: float32 ``[sc_accumulate_dims(input_size, hidden)]`` accumulate buffer (donated).
+    x, indices, topk_weights, valid_rows_mask, reduce_group_size: as in ``ragged_gather_reduce``.
+
+  Returns:
+    The updated accumulate buffer (same padded float32 shape as ``accum``).
+  """
+  assert x.ndim == 2 and indices.ndim == 1
+  sc_info = pltpu.get_tpu_info().sparse_core
+  assert sc_info is not None, "ragged_gather_reduce_accumulate requires SparseCore"
+
+  dtype = x.dtype
+  dtype_bytes = jax.dtypes.itemsize_bits(dtype) // 8
+  hidden_size = x.shape[-1]
+  input_size = indices.size
+  num_simd_lanes = sc_info.num_lanes
+  num_cores = sc_info.num_cores * sc_info.num_subcores
+  num_column_partitions = 8
+  assert num_cores % num_column_partitions == 0
+  num_rows_partitions = num_cores // num_column_partitions
+
+  aligned_hidden_size = _align_to(hidden_size, 128 * num_column_partitions)
+  col_size = aligned_hidden_size // num_column_partitions
+  padded_input_size = _align_to(
+      input_size, math.lcm(num_rows_partitions * num_simd_lanes, reduce_group_size)
+  )
+  pad_input_size = padded_input_size - input_size
+
+  input_packing = 32 // (dtype_bytes * 8)
+  pad_x_rows = max(padded_input_size - x.shape[0], 0)
+  pad_x_rows += -(x.shape[0] + pad_x_rows) % input_packing
+  x = jnp.pad(x, ((0, pad_x_rows), (0, aligned_hidden_size - hidden_size)), constant_values=0)
+  indices = jnp.pad(indices, (0, pad_input_size), constant_values=0)
+  topk_weights = jnp.pad(topk_weights, (0, pad_input_size), constant_values=0)
+  valid_rows_mask = jnp.pad(valid_rows_mask, (0, pad_input_size), constant_values=False)
+
+  src_indices, dst_indices, topk_weights, num_src_rows_per_row_partition, _mask = _preprocess(
+      indices, topk_weights, valid_rows_mask, reduce_group_size, num_rows_partitions, num_simd_lanes
+  )
+
+  vector_mesh = plsc.VectorSubcoreMesh(
+      num_cores=sc_info.num_cores,
+      num_subcores=sc_info.num_subcores,
+      core_axis_name="core",
+      subcore_axis_name="subcore",
+  )
+  scratch = dict(  # pylint: disable=use-dict-literal
+      num_rows_per_row_partition_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+      out_vmem_ref=pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
+      prev_iter_last_row_vmem_ref=pltpu.VMEM((1, col_size), jnp.uint32),
+      src_indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+      dst_indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+      topk_weights_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.float32),
+      sem_ref=pltpu.SemaphoreType.DMA((2,)),
+  )
+  body = functools.partial(
+      main_kernel,
+      core_axis_name=vector_mesh.core_axis_name,
+      subcore_axis_name=vector_mesh.subcore_axis_name,
+      num_row_partitions=num_rows_partitions,
+      num_column_partitions=num_column_partitions,
+  )
+  cost = get_cost_estimate(
+      padded_input_size=padded_input_size,
+      aligned_hidden_size=aligned_hidden_size,
+      reduce_group_size=reduce_group_size,
+      input_dtype_bytes=dtype_bytes,
+      flops_override=flops_override,
+      bytes_accessed_override=bytes_accessed_override,
+  )
+
+  # Custom wrapper mirroring pl.kernel's own (`@jax.jit` core_map + run_scoped) EXCEPT the single
+  # output ref is initialized to `accum` (donated -> aliased) instead of `lax.empty`, so the kernel
+  # accumulates in place. pl.kernel already emits an internal jit inside the MoE shard_map, so this
+  # is consistent with the existing ragged kernels (no extra shard_map-jit penalty).
+  @functools.partial(jax.jit, donate_argnums=(0,))
+  def _run(accum, num_src, xp, src_idx, dst_idx, w):
+    operands = (num_src, xp, src_idx, dst_idx, w)
+    arg_refs = _tree_util.tree_map(jax_core.new_ref, operands)
+    out_ref = jax_core.new_ref(accum)  # init to accum (NOT lax.empty) -> in-place accumulate
+
+    @pl_core.core_map(
+        vector_mesh,
+        scratch_shapes=scratch,
+        compiler_params=pltpu.CompilerParams(**_COMPILER_PARAMS),
+        cost_estimate=cost,
+        name="sc_ragged_gather_reduce_accumulate",
+    )
+    def _(**scratch_kwrefs):
+      return body(*arg_refs, out_ref, **scratch_kwrefs)
+
+    return out_ref[...]
+
+  return _run(accum, num_src_rows_per_row_partition, x, src_indices, dst_indices, topk_weights)
