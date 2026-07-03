@@ -1037,7 +1037,26 @@ class NNXDecoder(nnx.Module):
         return new_carry, (new_current_state, updated_kv)
       return new_carry, new_current_state
 
-    layer_fn_wrapped = jax.checkpoint(layer_fn, policy=policy, prevent_cse=prevent_cse)
+    # moe_splash_host_offload: do NOT jax.checkpoint the DeepSeek MoE layer scan body. The layer owns
+    # its backward via jax.custom_vjp (moe_handwritten_bwd) and its residuals now include the
+    # host-offloaded splash (context, lse): under jax.checkpoint those residuals are REMATERIALIZED in
+    # the backward (the splash forward re-runs and the device->host copy happens per-layer inside the
+    # bwd, defeating the offload -- observed as host_temp == ONE layer's staging buffer instead of the
+    # [num_layers, ...] pinned_host accumulation). Without the wrap, autodiff stores exactly the
+    # custom_vjp's declared residuals across the scan: {inputs, params} + the pinned_host (out, lse) --
+    # nothing else, since the whole layer body is inside the custom_vjp (this is the nnx equivalent of
+    # the linen bypass in decoders.py set_remat_policy). Gated on moe_splash_host_offload (not bare
+    # moe_handwritten_bwd) so existing flag-off programs stay byte-identical; with flag off the
+    # residuals are inputs-only and the checkpoint wrap is a harmless no-op either way.
+    _handwritten_owns_remat = (
+        self.config.moe_handwritten_bwd
+        and getattr(self.config, "moe_splash_host_offload", False)
+        and layers.__class__ is deepseek.DeepSeekMoELayer
+    )
+    if _handwritten_owns_remat:
+      layer_fn_wrapped = layer_fn
+    else:
+      layer_fn_wrapped = jax.checkpoint(layer_fn, policy=policy, prevent_cse=prevent_cse)
 
     if use_kv:
       # If kv_caches is provided (e.g., from vLLM), we CANNOT use jax.lax.scan
