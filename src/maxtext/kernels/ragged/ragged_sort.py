@@ -461,13 +461,15 @@ def ring_ragged_unsort(
     elif full_num_slots is not None and full_num_slots != n:
       # Truncated (packed) buffer + chunked indices under autodiff: the packed-mode bwd below
       # assumes idx_inv is indexed by buffer position, which only holds for the FULL revert
-      # permutation. Supporting this needs a dedicated bwd (see the memory-flat single-custom_vjp
-      # design) -- fail loudly instead of silently mis-routing gradients.
+      # permutation. The chunked combine no longer reaches this branch (its OUTER memory-flat
+      # custom_vjp in chunked_ring_combine_reduce_scatter owns the gradient and handles the
+      # packed mode with the full permutation) -- fail loudly for any other direct caller
+      # instead of silently mis-routing gradients.
       raise NotImplementedError(
           "ring_ragged_unsort backward does not support chunked indices with a truncated "
-          "(packed) buffer (decouple_combine_rs_chunks with ragged_buffer_factor > 0 under "
-          "autodiff). Use the un-chunked combine, a full-size buffer, or the hand-written "
-          "layer backward (moe_handwritten_bwd), whose recompute uses the un-chunked combine."
+          "(packed) buffer. Use the un-chunked combine, a full-size buffer, or "
+          "chunked_ring_combine_reduce_scatter (whose single memory-flat custom_vjp backward "
+          "handles the packed mode over the full permutation)."
       )
     else:
       # Slice the inverse permutation to match the packed local buffer.
@@ -547,9 +549,30 @@ def chunked_ring_combine_reduce_scatter(
       ``psum_scatter`` + ``concat`` reassembles the correct GLOBAL token order. Without it the
       concat would interleave (shard's slice of chunk 0, then chunk 1, ...) -- wrong order.
 
-  No new custom_vjp: per chunk we reuse the existing ``ring_ragged_unsort`` (its hand-written
-  combine bwd, incl. the chunked-input grad scatter-back for buffer_size > n) +
-  ``jax.lax.psum_scatter`` (auto all_gather-transpose bwd), so the gradient map is unchanged.
+  SINGLE custom_vjp for N-independent backward memory (rung 8, memory-flat backward):
+    The naive per-chunk backward (each chunk's ``ring_ragged_unsort`` custom_vjp under
+    autodiff -- rung 7) runs N full-buffer SC ragged_gathers and materializes + SUMS N
+    separate ``buffer_size`` grad buffers (measured 22.5 s/step vs 15.6 baseline). But the
+    N chunks together ARE one big permuted combine, so the WHOLE chunked loop is wrapped
+    in ONE custom_vjp whose backward is exactly the un-chunked ``ring_ragged_unsort`` bwd
+    applied to the FULL permuted ``ridx``/``w``:
+      (1) per chunk, all_gather its ``g_out`` slice (the transpose of BOTH psum_scatter
+          and the direct-RS Pallas kernel, see ``_drs_bwd``) and concat in chunk order ->
+          the full combine cotangent in the SAME permuted token order the forward sliced;
+      (2) ONE full-buffer ``ragged_gather`` fan-out with ``idx_inv = argsort(ridx)`` +
+          per-slot weights, masked to the shard's [shard_output_start, shard_output_end)
+          expert range.
+    This is the un-chunked-STYLE call: the index array is the full permutation
+    (n == num_slots), so output row j IS buffer position j and the shard's
+    buffer-position range is the gather's OUTPUT-ROW [start, end) AS-IS -- no rank-space
+    searchsorted conversion and no per-chunk scatter-back (those are only needed for
+    chunk-sized index arrays; see ``_ring_ragged_unsort_bwd``). One ``buffer_size``
+    output -> backward HBM and SC gather work are N-independent. The FORWARD below is
+    byte-for-byte the cluster-proven per-chunk loop (sliced operands, barrier chain,
+    RS-under-next-combine overlap intact). ``sorted_tokens_local`` is NOT saved as a
+    residual (the bwd needs only g_out + indices), keeping the ~15GB buffer out of the
+    remat-scan residuals. No gradient flows to the routing weights through the combine
+    (None cotangents), matching the un-chunked path.
 
   Returns ``[num_tokens // ep_size, hidden]`` (this shard's reduce-scattered slice). With
   ``return_first_combine_token=True``, additionally returns a tiny ``[1, 1]`` SCHEDULING TOKEN
@@ -560,6 +583,12 @@ def chunked_ring_combine_reduce_scatter(
   """
   num_tokens = topk_argsort_revert_indices.shape[0] // topk
   full_num_slots = topk_argsort_revert_indices.shape[0]
+  buffer_size = sorted_tokens_local.shape[0]
+  # bwd gather kwargs: exactly what ring_ragged_unsort's own bwd would read from unsort_kwargs
+  # (.get, not .pop -- the per-chunk forward calls still forward the full unsort_kwargs).
+  enforce_gather_fallback = unsort_kwargs.get("enforce_gather_fallback", False)
+  gather_flops_override = unsort_kwargs.get("gather_flops_override", -1)
+  gather_bytes_accessed_override = unsort_kwargs.get("gather_bytes_accessed_override", -1)
 
   def _permute_tokens_for_chunked_rs(a):  # a: [num_tokens, topk] -> chunk-major token reorder
     per = num_tokens // (n_chunks * ep_size)
@@ -572,60 +601,157 @@ def chunked_ring_combine_reduce_scatter(
     w = _permute_tokens_for_chunked_rs(w.reshape(num_tokens, topk)).reshape(-1)
 
   slots_per_chunk = (num_tokens // n_chunks) * topk
-  outs = []
-  prev_combined = None
-  for c in range(n_chunks):
-    s0, s1 = c * slots_per_chunk, (c + 1) * slots_per_chunk
-    ridx_c, w_c = ridx[s0:s1], w[s0:s1]
-    stl_c = sorted_tokens_local
-    if prev_combined is not None:
-      # UN-FUSE (profile forensics, v7x N=4): XLA horizontally fused the four per-chunk
-      # f32->bf16 convert+selects (inside ring_ragged_unsort's wrapper) into ONE multi-output
-      # fusion consuming all chunks' kernel outputs, so every chunk's reduce-scatter
-      # transitively depended on the LAST combine and all N RS starts batched after it --
-      # erasing the RS-under-next-combine overlap. Fence this chunk's INPUTS on the previous
-      # chunk's PRE-RS combined output: chunk c's convert then depends on chunk c-1's convert
-      # OUTPUT, so no single fusion can contain both, and the combines stay emission-ordered.
-      # Deliberately NOT fenced on any RS output (that would serialize the pipeline).
-      stl_c, ridx_c, w_c, _ = jax.lax.optimization_barrier((stl_c, ridx_c, w_c, prev_combined))
-    # combine: FULL expert-sorted buffer in (unsliced), sliced indices/weights -> O(T/N)
-    # per-chunk kernel preprocessing; token-ordered chunk out (existing custom_vjp).
-    # `combined` is already x.dtype: the f32->bf16 convert+select lives INSIDE
-    # ring_ragged_unsort (ragged_gather_reduce's wrapper), i.e. UPSTREAM of the barriers here.
-    combined = ring_ragged_unsort(
-        stl_c,
-        group_sizes_local,
-        ridx_c,
-        topk,
-        local_num_experts,
-        ep_name,
-        topk_weights=w_c,
-        full_num_slots=full_num_slots,
-        **unsort_kwargs,
-    )
-    # Barrier the (already-converted) per-chunk output so nothing downstream is fused across
-    # chunks, and hand it DIRECTLY to this chunk's psum_scatter (structural separation: the
-    # convert's only consumer is chunk c's RS). CAVEAT: the production flag set carries
-    # xla_tpu_aggressive_opt_barrier_removal=true, which has stripped optimization_barriers
-    # before -- if the fusion re-appears in profiles, the chain above is the first suspect
-    # and flipping that flag off for this config is the fallback lever.
-    combined = jax.lax.optimization_barrier(combined)
-    prev_combined = combined
-    if c == 0 and return_first_combine_token:
-      # [1, 1] scheduling token: depends (through the barrier / the combine's data) on chunk
-      # 0's PRE-RS combined output only -- deliberately NOT on any psum_scatter.
-      first_combine_token = jax.lax.slice(combined, (0, 0), (1, 1))
-    # reduce-scatter the TOKEN-ordered chunk over the expert axis (auto bwd = all_gather).
-    # reduce_scatter_fn (moe_direct_rs): drop-in psum_scatter replacement -- a (x, chunk_idx)
-    # callable (chunk_idx selects a distinct collective_id per concurrently-in-flight chunk RS).
-    if reduce_scatter_fn is None:
-      outs.append(jax.lax.psum_scatter(combined, ep_name, scatter_dimension=0, tiled=True))
+  rows_per_chunk_out = (num_tokens // n_chunks) // ep_size  # the RS shrinks the token axis by ep_size
+
+  # ridx / w are EXPLICIT custom_vjp inputs (not closed over): JAX forbids differentiating a
+  # custom_vjp wrt a closed-over differentiable value (``w``, the router weights, IS differentiable
+  # upstream), and a custom_vjp closing over scan-carried TRACERS hits "No constant handler for
+  # DynamicJaxprTracer" inside the per-layer scan (mirrors chunked_ring_dispatch).
+  @jax.custom_vjp
+  def _chunked_combine_rs(sorted_tokens_local, group_sizes_local, ridx, w):
+    return _chunked_combine_rs_fwd(sorted_tokens_local, group_sizes_local, ridx, w)[0]
+
+  @jax.named_scope("chunked-combine-rs-fwd")
+  def _chunked_combine_rs_fwd(sorted_tokens_local, group_sizes_local, ridx, w):
+    # FORWARD: byte-for-byte the cluster-proven per-chunk loop (rung 6-sliced) -- the custom_vjp
+    # wrapper changes only the gradient path.
+    outs = []
+    prev_combined = None
+    first_combine_token = None
+    for c in range(n_chunks):
+      s0, s1 = c * slots_per_chunk, (c + 1) * slots_per_chunk
+      ridx_c, w_c = ridx[s0:s1], w[s0:s1]
+      stl_c = sorted_tokens_local
+      if prev_combined is not None:
+        # UN-FUSE (profile forensics, v7x N=4): XLA horizontally fused the four per-chunk
+        # f32->bf16 convert+selects (inside ring_ragged_unsort's wrapper) into ONE multi-output
+        # fusion consuming all chunks' kernel outputs, so every chunk's reduce-scatter
+        # transitively depended on the LAST combine and all N RS starts batched after it --
+        # erasing the RS-under-next-combine overlap. Fence this chunk's INPUTS on the previous
+        # chunk's PRE-RS combined output: chunk c's convert then depends on chunk c-1's convert
+        # OUTPUT, so no single fusion can contain both, and the combines stay emission-ordered.
+        # Deliberately NOT fenced on any RS output (that would serialize the pipeline).
+        stl_c, ridx_c, w_c, _ = jax.lax.optimization_barrier((stl_c, ridx_c, w_c, prev_combined))
+      # combine: FULL expert-sorted buffer in (unsliced), sliced indices/weights -> O(T/N)
+      # per-chunk kernel preprocessing; token-ordered chunk out (existing custom_vjp -- its bwd
+      # is unreachable here: the outer custom_vjp owns the gradient).
+      # `combined` is already x.dtype: the f32->bf16 convert+select lives INSIDE
+      # ring_ragged_unsort (ragged_gather_reduce's wrapper), i.e. UPSTREAM of the barriers here.
+      combined = ring_ragged_unsort(
+          stl_c,
+          group_sizes_local,
+          ridx_c,
+          topk,
+          local_num_experts,
+          ep_name,
+          topk_weights=w_c,
+          full_num_slots=full_num_slots,
+          **unsort_kwargs,
+      )
+      # Barrier the (already-converted) per-chunk output so nothing downstream is fused across
+      # chunks, and hand it DIRECTLY to this chunk's psum_scatter (structural separation: the
+      # convert's only consumer is chunk c's RS). CAVEAT: the production flag set carries
+      # xla_tpu_aggressive_opt_barrier_removal=true, which has stripped optimization_barriers
+      # before -- if the fusion re-appears in profiles, the chain above is the first suspect
+      # and flipping that flag off for this config is the fallback lever.
+      combined = jax.lax.optimization_barrier(combined)
+      prev_combined = combined
+      if c == 0 and return_first_combine_token:
+        # [1, 1] scheduling token: depends (through the barrier / the combine's data) on chunk
+        # 0's PRE-RS combined output only -- deliberately NOT on any psum_scatter.
+        first_combine_token = jax.lax.slice(combined, (0, 0), (1, 1))
+      # reduce-scatter the TOKEN-ordered chunk over the expert axis.
+      # reduce_scatter_fn (moe_direct_rs): drop-in psum_scatter replacement -- a (x, chunk_idx)
+      # callable (chunk_idx selects a distinct collective_id per concurrently-in-flight chunk RS).
+      if reduce_scatter_fn is None:
+        outs.append(jax.lax.psum_scatter(combined, ep_name, scatter_dimension=0, tiled=True))
+      else:
+        outs.append(reduce_scatter_fn(combined, c))
+    out = jnp.concatenate(outs, axis=0)
+    result = (out, first_combine_token) if return_first_combine_token else out
+    # Residuals: group sizes (offsets) + the PERMUTED ridx / w (slot->buffer map + per-slot
+    # weights). NOT sorted_tokens_local -- the bwd recomputes grad from g_out + indices alone
+    # (mirroring ring_ragged_unsort), keeping the ~15GB buffer out of the remat-scan residuals.
+    return result, (group_sizes_local, ridx, w)
+
+  @jax.named_scope("chunked-combine-rs-bwd")
+  def _chunked_combine_rs_bwd(res, g):
+    # BACKWARD (memory-flat, rung 8): ONE buffer_size grad output regardless of N.
+    group_sizes_local, ridx, w = res
+    if return_first_combine_token:
+      # The [1, 1] scheduling token is consumed only through an optimization_barrier whose
+      # token output is discarded (the moe_shared_after_combine deadline fence in moe.py), so
+      # its cotangent is identically zero -- dropping it is exact (== stop_gradient on the token).
+      g_out, _g_token = g
     else:
-      outs.append(reduce_scatter_fn(combined, c))
-  out = jnp.concatenate(outs, axis=0)
-  if return_first_combine_token:
-    return out, first_combine_token
-  return out
+      g_out = g
+
+    group_offsets = jnp.cumulative_sum(group_sizes_local, include_initial=True)
+    shard_idx = jax.lax.axis_index(ep_name)
+    experts_start = shard_idx * local_num_experts
+    shard_output_start = group_offsets[experts_start]
+    shard_output_end = group_offsets[experts_start + local_num_experts]
+
+    # (1) all_gather each chunk's g_out slice -- the transpose of BOTH jax.lax.psum_scatter and
+    # the direct-RS Pallas kernel (same reduce-scatter math; see _drs_bwd in moe.py) -- and
+    # concat in chunk order: the full combine cotangent in the SAME permuted token order as the
+    # forward's sliced ridx/w.
+    g_chunks = [
+        jax.lax.all_gather(g_out[c * rows_per_chunk_out : (c + 1) * rows_per_chunk_out], ep_name, axis=0, tiled=True)
+        for c in range(n_chunks)
+    ]
+    g_combined_full = jnp.concatenate(g_chunks, axis=0)  # [num_tokens, hidden]
+
+    # (2) the un-chunked ring_ragged_unsort bwd applied to the FULL permuted revert. idx_inv is
+    # the full inverse permutation (n == full_num_slots), so the gather's output row j IS buffer
+    # position j and the shard's buffer-position range is the OUTPUT-ROW [start, end) AS-IS --
+    # the rank-space searchsorted conversion and per-chunk scatter-back in
+    # _ring_ragged_unsort_bwd are only needed for CHUNK-SIZED index arrays and never fire here.
+    idx_inv = jnp.argsort(ridx)
+    weight_for_sorted = w.astype(jnp.float32)[idx_inv]
+    if buffer_size >= full_num_slots:
+      grad_sorted_tokens = ragged_gather(
+          g_combined_full,
+          idx_inv // topk,
+          shard_output_start[None],
+          shard_output_end[None],
+          weights=weight_for_sorted,
+          has_weights=True,
+          enforce_fallback=enforce_gather_fallback,
+          flops_override=gather_flops_override,
+          bytes_accessed_override=gather_bytes_accessed_override,
+      )
+      if buffer_size > full_num_slots:
+        # Oversized buffer: rows >= full_num_slots are never referenced by ridx (a permutation
+        # of [0, full_num_slots)), so their grad is zero -- pad to the primal buffer shape.
+        grad_sorted_tokens = jnp.pad(grad_sorted_tokens, ((0, buffer_size - full_num_slots), (0, 0)))
+    else:
+      # TRUNCATED (packed, mode-2) buffer: identical math to _ring_ragged_unsort_bwd's packed
+      # branch. Valid here -- unlike the per-chunk bwd, which raises NotImplementedError --
+      # because idx_inv is the FULL inverse permutation, indexed by buffer position.
+      padded_idx_inv = jnp.pad(idx_inv, (0, buffer_size))
+      sliced_idx_inv = jax.lax.dynamic_slice_in_dim(padded_idx_inv, shard_output_start, buffer_size, axis=0)
+      gather_end = jnp.minimum(shard_output_end - shard_output_start, buffer_size)
+      padded_weights = jnp.pad(weight_for_sorted, (0, buffer_size))
+      sliced_weights = jax.lax.dynamic_slice_in_dim(padded_weights, shard_output_start, buffer_size, axis=0)
+      grad_sorted_tokens = ragged_gather(
+          g_combined_full,
+          sliced_idx_inv // topk,
+          jnp.int32(0)[None],
+          gather_end[None],
+          weights=sliced_weights,
+          has_weights=True,
+          enforce_fallback=enforce_gather_fallback,
+          flops_override=gather_flops_override,
+          bytes_accessed_override=gather_bytes_accessed_override,
+      )
+    # None cotangents for group_sizes / ridx / w: no gradient flows to the routing weights
+    # through the combine, matching the un-chunked ring_ragged_unsort path.
+    return grad_sorted_tokens, None, None, None
+
+  _chunked_combine_rs.defvjp(_chunked_combine_rs_fwd, _chunked_combine_rs_bwd)
+
+  return _chunked_combine_rs(sorted_tokens_local, group_sizes_local, ridx, w)
 
 
 def chunked_ring_dispatch(

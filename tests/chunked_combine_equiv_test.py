@@ -23,6 +23,12 @@ random group sizes across experts/shards, and GARBAGE values in the buffer posit
 OUTSIDE each shard's valid [shard_output_start, shard_output_end) range (in the real
 model those rows are uninitialized GMM output -- any mask/shard misalignment gathers
 them and blows up the output, which is exactly the observed step-0 NaN signature).
+
+Rung 8 additions: the chunked combine's SINGLE memory-flat custom_vjp backward is gated
+BIT-EXACT (diff == 0) against the un-chunked bwd for full AND truncated buffers, its one
+full-permutation ragged_gather's addressing is SC-emulated in-bounds per shard/N, and two
+composition smokes (return_first_combine_token under grad; lax.scan with carry-derived
+ridx/w custom_vjp inputs) guard the fence-cotangent drop and the scan-constvar trap.
 """
 
 import os
@@ -254,6 +260,58 @@ def _emulate_sc_gather_bwd(g, indices, weights, start, end, lanes, num_cores):
   return out, oob
 
 
+def sc_memory_flat_bwd_contract_checks(failures):
+  """Emulated-SC addressing check for the rung-8 MEMORY-FLAT single-gather backward.
+
+  The chunked combine's single custom_vjp bwd issues ONE ragged_gather whose index array is
+  the FULL inverse permutation (n == num_slots), so output row j IS buffer position j and the
+  shard's buffer-position [shard_output_start, shard_output_end) is the kernel's OUTPUT-ROW
+  range AS-IS (the un-chunked-style call -- no rank-space searchsorted conversion). Verify,
+  for every shard and every N (the chunk-major permute changes with N), that (a) the kernel's
+  block range never indexes the (full-length) index/weight/output arrays out of bounds and
+  (b) every row in [start, end) is written with the expected buffer-position grad
+  ``w[idx_inv[j]] * g[idx_inv[j] // topk]`` (no NaN = no uninitialized shard rows).
+  """
+  lanes, num_cores = 8, 4  # block_size 32: small vs n_slots so the block range has resolution
+  key = jax.random.PRNGKey(2)
+  revert, group_sizes = _make_routing(key, skew=3.0)
+  n_slots = NUM_TOKENS * TOPK
+  w = np.asarray(jax.random.uniform(jax.random.fold_in(key, 2), (n_slots,), dtype=jnp.float32))
+  rv = np.asarray(revert)
+
+  for ep_size in (8, 4):
+    starts, ends = _shard_ranges(group_sizes, ep_size)
+    for n_chunks in (1, 2, 4, 8):
+      # chunk-major token permute, exactly as the forward applies it (N>1, ep>1 only)
+      if n_chunks > 1 and ep_size > 1:
+        per = NUM_TOKENS // (n_chunks * ep_size)
+        perm = np.transpose(np.arange(NUM_TOKENS).reshape(ep_size, n_chunks, per), (1, 0, 2)).reshape(-1)
+      else:
+        perm = np.arange(NUM_TOKENS)
+      rv_p = rv.reshape(NUM_TOKENS, TOPK)[perm].reshape(-1)
+      w_p = w.reshape(NUM_TOKENS, TOPK)[perm].reshape(-1)
+      g_p = np.asarray(
+          jax.random.normal(jax.random.fold_in(key, 50 + n_chunks), (NUM_TOKENS, HIDDEN), dtype=jnp.float32)
+      )
+      idx_inv = np.argsort(rv_p, kind="stable")
+      w_sorted = w_p[idx_inv]
+      expected = w_sorted[:, None] * g_p[idx_inv // TOPK]  # grad at buffer position j (row j)
+      ok = True
+      oob_any = False
+      for s in range(ep_size):
+        st, en = int(starts[s]), int(ends[s])
+        out, oob = _emulate_sc_gather_bwd(g_p, idx_inv // TOPK, w_sorted, st, en, lanes, num_cores)
+        oob_any |= oob
+        if en > st:
+          seg = out[st:en]
+          ok &= (not np.isnan(seg).any()) and np.array_equal(seg, expected[st:en])
+      print(f"  SC-memflat-bwd EP={ep_size} N={n_chunks}: in-bounds={not oob_any}, shard-rows exact={ok}")
+      if oob_any:
+        failures.append(f"SC-memflat-bwd EP={ep_size} N={n_chunks}: single-gather block range OOB")
+      if not ok:
+        failures.append(f"SC-memflat-bwd EP={ep_size} N={n_chunks}: shard rows wrong or unwritten")
+
+
 def sc_bwd_kernel_contract_checks(failures):
   """Emulated-SC checks for the CHUNKED-input ring_ragged_unsort backward (rung 7).
 
@@ -328,6 +386,72 @@ def sc_bwd_kernel_contract_checks(failures):
       failures.append("SC-bwd-emulation N=1: un-chunked bounds must be correct")
 
 
+def _token_and_scan_smokes(mesh, ep_size, bufs, group_sizes, revert, w_flat, n_chunks, grads_ref, failures):
+  """Two rung-8 bwd composition smokes (one EP/N combo is enough; math is combo-independent).
+
+  1. return_first_combine_token=True under grad: the custom_vjp fwd returns (out, token); the
+     bwd drops the token cotangent (it is identically zero through the moe_shared_after_combine
+     optimization_barrier fence). Grad wrt the buffer must be bit-identical to the no-token run.
+  2. lax.scan-wrapped grad with ridx/w derived from the CARRY (scan-body tracers), mirroring the
+     per-layer scan in the model: the custom_vjp takes them as EXPLICIT inputs, so this must
+     trace without "No constant handler for DynamicJaxprTracer" and match 2x the single-call
+     grad (2 identical accumulation steps).
+  """
+  local_e = NUM_EXPERTS // ep_size
+  fb = dict(enforce_gather_fallback=True, enforce_gather_reduce_fallback=True)
+  ct = jax.random.normal(jax.random.PRNGKey(7), (NUM_TOKENS, HIDDEN), dtype=jnp.float32)
+
+  # --- 1. token-emitting path under grad ---
+  def body_tok(buf, gs, ridx, wf):
+    out, tok = chunked_ring_combine_reduce_scatter(
+        buf[0], gs, ridx, TOPK, local_e, "ep", wf, ep_size, n_chunks, return_first_combine_token=True, **fb
+    )
+    return out, tok
+
+  fn_tok = jax.shard_map(
+      body_tok,
+      mesh=mesh,
+      in_specs=(jax.P("ep"), jax.P(), jax.P(), jax.P()),
+      out_specs=(jax.P("ep"), jax.P("ep")),
+  )
+  loss_tok = lambda b: jnp.vdot(jax.jit(fn_tok)(b, group_sizes, revert, w_flat)[0], ct)
+  g_tok = np.asarray(jax.grad(loss_tok)(bufs))
+  tdiff = np.abs(g_tok - grads_ref).max()
+  print(f"  token-path   N={n_chunks} BWD (return_first_combine_token): max|grad diff|={tdiff:.3e}")
+  if tdiff > 0.0:
+    failures.append(f"EP={ep_size} token-path N={n_chunks} BWD not bit-exact vs no-token run: {tdiff:.3e}")
+
+  # --- 2. scan-wrapped grad (carry-derived ridx/w tracers) ---
+  def body_scan(buf, gs, ridx, wf, ct_l):
+    buf = buf[0]
+
+    def step(carry, _):
+      # indices/weights DERIVED FROM THE CARRY -> scan-body tracers into the custom_vjp inputs,
+      # like routing derived from the carried activations in the per-layer scan.
+      ridx_t = ridx + (carry * 0.0).astype(jnp.int32)
+      wf_t = wf * carry
+      out = chunked_ring_combine_reduce_scatter(
+          buf, gs, ridx_t, TOPK, local_e, "ep", wf_t, ep_size, n_chunks, **fb
+      )
+      return carry, jnp.vdot(out, ct_l)
+
+    _, ys = jax.lax.scan(step, jnp.float32(1.0), None, length=2)
+    return jnp.sum(ys)[None]
+
+  fn_scan = jax.shard_map(
+      body_scan,
+      mesh=mesh,
+      in_specs=(jax.P("ep"), jax.P(), jax.P(), jax.P(), jax.P("ep")),
+      out_specs=jax.P("ep"),
+  )
+  loss_scan = lambda b: jnp.sum(jax.jit(fn_scan)(b, group_sizes, revert, w_flat, ct))
+  g_scan = np.asarray(jax.grad(loss_scan)(bufs))
+  sdiff = np.abs(g_scan - 2.0 * grads_ref).max()
+  print(f"  scan-wrapped N={n_chunks} BWD (carry-derived ridx/w): max|grad diff vs 2x single|={sdiff:.3e}")
+  if sdiff > 0.0:
+    failures.append(f"EP={ep_size} scan-wrapped N={n_chunks} BWD: max|grad diff vs 2x single|={sdiff:.3e}")
+
+
 def main():
   devices = np.array(jax.devices())
   assert len(devices) >= 8, f"need 8 CPU devices, got {len(devices)}"
@@ -338,6 +462,9 @@ def main():
 
   print("SC ragged_gather BWD kernel-contract emulation (rank-space [start,end) bounds):")
   sc_bwd_kernel_contract_checks(failures)
+
+  print("SC ragged_gather MEMORY-FLAT single-vjp BWD emulation (full-permutation output rows):")
+  sc_memory_flat_bwd_contract_checks(failures)
 
   for ep_size in (8, 4):
     mesh = jax.sharding.Mesh(devices[:ep_size], ("ep",))
@@ -369,10 +496,11 @@ def main():
           failures.append(f"EP={ep_size} {case} full-buffer N={n}: max|diff|={max_all:.3e}")
 
       # ---- autodiff backward (grad wrt the expert-sorted buffer), full-buffer mode ----
-      # Rung 6 exercises the chunked path under plain autodiff too (manbwd recomputes with the
-      # un-chunked combine, but the flag must be safe without manbwd). The per-chunk
-      # ring_ragged_unsort bwd emits an n-row grad scattered back to the buffer positions the
-      # chunk's slice read; chunks are disjoint, so the summed grads must equal the un-chunked bwd.
+      # Rung 8: the chunked combine carries ONE memory-flat custom_vjp (per-chunk all_gather
+      # transposes concatenated into a single full-buffer ragged_gather over the FULL permuted
+      # inverse permutation). Every multiply in that bwd has bit-identical operands to the
+      # un-chunked ring_ragged_unsort bwd (pure relabeling of slots/tokens), so the grad must be
+      # BIT-EXACT (== 0 diff), not just close.
       ct = jax.random.normal(jax.random.PRNGKey(7), (NUM_TOKENS, HIDDEN), dtype=jnp.float32)
       grads = {}
       for n in (0, 1, 2, 4, 8):
@@ -381,8 +509,11 @@ def main():
       for n in (1, 2, 4, 8):
         gdiff = np.abs(grads[n] - grads[0]).max()
         print(f"  full-buffer  N={n} BWD: max|grad diff|={gdiff:.3e}")
-        if gdiff > 1e-6:
-          failures.append(f"EP={ep_size} {case} full-buffer N={n} BWD: max|grad diff|={gdiff:.3e}")
+        if gdiff > 0.0:
+          failures.append(f"EP={ep_size} {case} full-buffer N={n} BWD not bit-exact: max|grad diff|={gdiff:.3e}")
+
+      if ep_size == 8 and case == "non-uniform":
+        _token_and_scan_smokes(mesh, ep_size, bufs, group_sizes, revert, w_flat, 4, grads[4], failures)
 
       # ---- truncated packed buffer (mode 2 un-chunked; exercises the mode boundary) ----
       buffer_size = 96 if ep_size == 8 else 192  # < T*topk/N for small N, >= for large N
@@ -393,6 +524,20 @@ def main():
         max_all, _, _ = _report(f"trunc-buffer N={n} (B={buffer_size})", ref_t, out_t, ep_size, n)
         if max_all > 1e-6:
           failures.append(f"EP={ep_size} {case} trunc-buffer N={n}: max|diff|={max_all:.3e}")
+
+      # ---- truncated packed buffer BACKWARD (NEW capability of the rung-8 single vjp: the
+      # per-chunk bwd raised NotImplementedError here; the memory-flat bwd handles the packed
+      # mode because its idx_inv is the FULL inverse permutation, indexed by buffer position) ----
+      ct_t = jax.random.normal(jax.random.PRNGKey(11), (NUM_TOKENS, HIDDEN), dtype=jnp.float32)
+      grads_t = {}
+      for n in (0, 1, 2, 4, 8):
+        loss_fn_t = lambda b, _n=n: jnp.vdot(_run(mesh, ep_size, b, group_sizes, revert, w_flat, _n), ct_t)
+        grads_t[n] = np.asarray(jax.grad(loss_fn_t)(bufs_t))
+      for n in (1, 2, 4, 8):
+        gdiff = np.abs(grads_t[n] - grads_t[0]).max()
+        print(f"  trunc-buffer N={n} BWD: max|grad diff|={gdiff:.3e}")
+        if gdiff > 0.0:
+          failures.append(f"EP={ep_size} {case} trunc-buffer N={n} BWD not bit-exact: max|grad diff|={gdiff:.3e}")
 
   print()
   if failures:

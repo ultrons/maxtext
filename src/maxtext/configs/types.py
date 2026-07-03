@@ -796,9 +796,10 @@ class MoEGeneral(BaseModel):
   moe_chunked_combine_in_remat: bool = Field(
       False,
       description=(
-          "RUNG 7 of decouple_combine_rs_chunks: use the CHUNKED combine+RS in the moe_handwritten_bwd "
-          "RECOMPUTE as well (fused_bwd re-trace), chunking the backward's combine/RS (per-chunk "
-          "ring_ragged_unsort custom_vjp bwd + all_gather transposes). Default False = rung-6 behavior "
+          "RUNGS 7/8 of decouple_combine_rs_chunks: use the CHUNKED combine+RS in the moe_handwritten_bwd "
+          "RECOMPUTE as well (fused_bwd re-trace), chunking the backward's combine/RS. Gradient = the "
+          "rung-8 SINGLE memory-flat custom_vjp bwd (per-chunk all_gather transposes -> ONE full-buffer "
+          "ragged_gather; N-independent backward memory). Default False = rung-6 behavior "
           "(recompute uses the un-chunked combine). Needs moe_handwritten_bwd + decouple_combine_rs_chunks>1."
       ),
   )

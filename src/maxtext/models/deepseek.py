@@ -725,10 +725,11 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       # decouple_combine_rs_chunks>1: the chunked combine is numerically the same function, so
       # its VJP through the un-chunked form is the correct gradient, and the backward keeps the
       # proven un-chunked combine bwd (rung 6, forward-only chunking). With
-      # moe_chunked_combine_in_remat=True (rung 7) the recompute uses the CHUNKED combine with
-      # the same N: jax.vjp of this re-trace then invokes the per-chunk ring_ragged_unsort
-      # custom_vjp bwd (chunked-input grad scatter-back) + the psum_scatter all_gather
-      # transposes, chunking the backward's combine/RS as well.
+      # moe_chunked_combine_in_remat=True (rungs 7/8) the recompute uses the CHUNKED combine
+      # with the same N: jax.vjp of this re-trace then invokes the chunked combine's SINGLE
+      # memory-flat custom_vjp bwd (rung 8: per-chunk all_gather transposes concatenated into
+      # ONE full-buffer ragged_gather -- N-independent backward HBM and SC work; see
+      # chunked_ring_combine_reduce_scatter).
       m = _merge(p, rest_)
       mlp_lnx, load_balance_loss, moe_bias_updates = m.mlp_op(
           hidden_states,
