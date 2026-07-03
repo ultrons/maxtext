@@ -720,14 +720,21 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       return _merge(p, rest_).self_attention_with_norm_op(x_in, seg, pos, det)  # (hidden, intermediate)
 
     def _moe(p, hidden_states, intermediate_inputs, weights, rest_):
-      # BACKWARD RECOMPUTE ONLY (called from fused_bwd below): recompute the MoE forward with the
-      # UN-chunked combine (use_chunked_combine=False) even when decouple_combine_rs_chunks>1 --
-      # the chunked combine is numerically the same function, so its VJP through the un-chunked
-      # form is the correct gradient, and the backward keeps the proven un-chunked combine bwd
-      # (forward-only chunking; the chunked-combine backward lands in a later rung).
+      # BACKWARD RECOMPUTE ONLY (called from fused_bwd below). By default
+      # (moe_chunked_combine_in_remat=False) the recompute uses the UN-chunked combine even when
+      # decouple_combine_rs_chunks>1: the chunked combine is numerically the same function, so
+      # its VJP through the un-chunked form is the correct gradient, and the backward keeps the
+      # proven un-chunked combine bwd (rung 6, forward-only chunking). With
+      # moe_chunked_combine_in_remat=True (rung 7) the recompute uses the CHUNKED combine with
+      # the same N: jax.vjp of this re-trace then invokes the per-chunk ring_ragged_unsort
+      # custom_vjp bwd (chunked-input grad scatter-back) + the psum_scatter all_gather
+      # transposes, chunking the backward's combine/RS as well.
       m = _merge(p, rest_)
       mlp_lnx, load_balance_loss, moe_bias_updates = m.mlp_op(
-          hidden_states, det, pregathered_weights=weights, use_chunked_combine=False
+          hidden_states,
+          det,
+          pregathered_weights=weights,
+          use_chunked_combine=self.config.moe_chunked_combine_in_remat,
       )
       layer_output = m.dropout_op(mlp_lnx + intermediate_inputs, deterministic=det)
       return layer_output, load_balance_loss, moe_bias_updates

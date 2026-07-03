@@ -793,6 +793,15 @@ class MoEGeneral(BaseModel):
           "Identity on values (bit-exact). No-op when the chunked-combine path is inactive."
       ),
   )
+  moe_chunked_combine_in_remat: bool = Field(
+      False,
+      description=(
+          "RUNG 7 of decouple_combine_rs_chunks: use the CHUNKED combine+RS in the moe_handwritten_bwd "
+          "RECOMPUTE as well (fused_bwd re-trace), chunking the backward's combine/RS (per-chunk "
+          "ring_ragged_unsort custom_vjp bwd + all_gather transposes). Default False = rung-6 behavior "
+          "(recompute uses the un-chunked combine). Needs moe_handwritten_bwd + decouple_combine_rs_chunks>1."
+      ),
+  )
   moe_expert_input_dim: int = Field(
       -1,
       description="Dimension of tokens entering the MoE layer. If < 0, defaults to emb_dim.",
