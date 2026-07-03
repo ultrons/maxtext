@@ -653,10 +653,26 @@ def ragged_gather_reduce_accumulate(
 ):
   """In-place accumulate variant of :func:`ragged_gather_reduce` (SparseCore only).
 
-  Identical gather/reduce math, but the kernel's output ref is INITIALIZED to ``accum`` (an
-  ``sc_accumulate_dims``-shaped float32 buffer) and DONATED, so the kernel writes ONLY the valid
-  (this-call's) destination rows in place and leaves every other row at its prior ``accum`` value.
-  There is NO final ``where``-zeroing. Threaded across the decouple_dispatch_chunks loop this gives
+  BLOCKED / NOT WIRED (kept as a validated reference for the eventual infra fix). Correctness and
+  in-place aliasing are proven STANDALONE on v5p (chunked accumulate fill == un-chunked
+  ``ragged_gather``, max|diff|=0; 0 full-accum-buffer copies; temp flat in n_chunks). BUT it cannot
+  be used inside the model's ``lax.scan`` + ``custom_vjp``: initializing the core_map output ref to
+  an INPUT value (``jax_core.new_ref(accum)``) makes JAX treat that Ref as a jit output, and
+  "mutable array references cannot be returned" across the jit / custom_vjp boundary -- reproduced
+  for EVERY wrapper structure tried (jit+donate_argnums, jit without donation, and inline in the
+  ambient trace). ``pl.kernel`` avoids the leak only because its output ref comes from
+  ``new_ref(lax.empty(...))`` (an internal value, not an input), which cannot be initialized to
+  ``accum``; and ``pl.kernel`` exposes no ``input_output_aliases`` (only ``pl.pallas_call`` does, and
+  it has no SparseCore subcore mesh). Unblocking needs either ``input_output_aliases`` plumbed
+  through ``pl.kernel``, or a native SC scatter-write/accumulate primitive. Until then
+  ``chunked_ring_dispatch`` uses the full-buffer ``jnp.where`` merge (correct, cluster-validated,
+  N x traffic).
+
+  Identical gather/reduce math to ``ragged_gather_reduce``, but the kernel's output ref is
+  INITIALIZED to ``accum`` (an ``sc_accumulate_dims``-shaped float32 buffer), so the kernel writes
+  ONLY the valid (this-call's) destination rows in place and leaves every other row at its prior
+  ``accum`` value. There is NO final ``where``-zeroing. Threaded across the decouple_dispatch_chunks
+  loop this gives
   O(chunk_rows) HBM write + O(chunk_rows) SC compute per chunk (the compaction only processes the
   valid rows), replacing the rung-9 per-chunk full-buffer ``jnp.where`` merge (N x ~14GB traffic).
 
@@ -736,27 +752,33 @@ def ragged_gather_reduce_accumulate(
       bytes_accessed_override=bytes_accessed_override,
   )
 
-  # Mirror pl.kernel's own core_map body EXCEPT the single output ref is initialized to `accum`
-  # (NOT lax.empty) so the kernel accumulates in place, leaving unwritten rows at their prior value.
-  # INLINE (no nested @jax.jit): a jax.jit(donate_argnums) wrapper leaks the donated accum Ref across
-  # the jit boundary ("mutable array references cannot be returned"); inlining keeps the Ref inside
-  # the ambient (outer MoE) trace, and `out_ref[...]` returns a plain value. Aliasing (accum buffer ->
-  # output, no copy) then comes from the outer jit's buffer reuse: accum is dead after this call (the
-  # barrier chain in chunked_ring_dispatch), so XLA reuses its storage in place -- the SAME mechanism
-  # that kept the rung-9 jnp.where flat. (Verified on v5p that the write is in-place, not a copy.)
-  arg_refs = _tree_util.tree_map(
-      jax_core.new_ref, (num_src_rows_per_row_partition, x, src_indices, dst_indices, topk_weights)
-  )
-  out_ref = jax_core.new_ref(accum)  # init to accum -> in-place accumulate (unwritten rows preserved)
+  # Mirror pl.kernel's OWN wrapper -- a plain `@jax.jit` around new_ref + core_map that returns
+  # `out_ref[...]` (a value) -- EXCEPT the single output ref is initialized to `accum` (NOT lax.empty)
+  # so the kernel accumulates in place, leaving unwritten rows at their prior value.
+  #
+  # The jit boundary is LOAD-BEARING: it fully scopes the new_ref Refs so none escapes. pl.kernel is
+  # exactly this shape and composes cleanly with the model's custom_vjp + lax.scan (it already runs
+  # inside ring_ragged_unsort's custom_vjp inside the per-layer scan). WITHOUT the jit (inlined in the
+  # ambient trace) the Ref leaks out of the enclosing custom_vjp ("mutable array references cannot be
+  # returned", rung9c); WITH `donate_argnums` the donated accum Ref leaks across the jit boundary
+  # itself (rung9b). So: jit, NO donation. Aliasing (accum buffer -> output, no full-buffer copy)
+  # comes from XLA's in-place buffer reuse -- accum is dead after each call (the barrier chain in
+  # chunked_ring_dispatch) -- verified on v5p (0 full-accum-buffer copies, temp flat in n_chunks).
+  @jax.jit
+  def _run(accum, num_src, xp, src_idx, dst_idx, w):
+    arg_refs = _tree_util.tree_map(jax_core.new_ref, (num_src, xp, src_idx, dst_idx, w))
+    out_ref = jax_core.new_ref(accum)  # init to accum -> in-place accumulate (unwritten rows kept)
 
-  @pl_core.core_map(
-      vector_mesh,
-      scratch_shapes=scratch,
-      compiler_params=pltpu.CompilerParams(**_COMPILER_PARAMS),
-      cost_estimate=cost,
-      name="sc_ragged_gather_reduce_accumulate",
-  )
-  def _(**scratch_kwrefs):
-    return body(*arg_refs, out_ref, **scratch_kwrefs)
+    @pl_core.core_map(
+        vector_mesh,
+        scratch_shapes=scratch,
+        compiler_params=pltpu.CompilerParams(**_COMPILER_PARAMS),
+        cost_estimate=cost,
+        name="sc_ragged_gather_reduce_accumulate",
+    )
+    def _(**scratch_kwrefs):
+      return body(*arg_refs, out_ref, **scratch_kwrefs)
 
-  return out_ref[...]
+    return out_ref[...]
+
+  return _run(accum, num_src_rows_per_row_partition, x, src_indices, dst_indices, topk_weights)

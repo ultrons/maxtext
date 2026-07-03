@@ -18,8 +18,6 @@ import jax
 import jax.numpy as jnp
 from maxtext.kernels.ragged.ragged_gather import ragged_gather
 from maxtext.kernels.ragged.ragged_gather_reduce import ragged_gather_reduce
-from maxtext.kernels.ragged.ragged_gather_reduce import ragged_gather_reduce_accumulate
-from maxtext.kernels.ragged.ragged_gather_reduce import sc_accumulate_dims
 
 
 def ring_ragged_sort(
@@ -868,61 +866,37 @@ def chunked_ring_dispatch(
     # a barrier chain. Identical math to the un-chunked forward so the AG-under-previous-sort
     # overlap is preserved; the barrier chain serializes the SC gathers (flat-ish liveness) and
     # blocks cross-chunk fusion.
+    # Per-chunk all-gather + full-buffer ragged_gather + jnp.where merge, DISJOINT writes into ONE
+    # buffer with a barrier chain. Bit-exact to the un-chunked forward and cluster-validated (rung 9:
+    # loss 12.270 step-1 / 9.324 step-19). This is CORRECT but pays N x full-buffer traffic (the
+    # rung-9b/c/d in-place SC accumulate that would make it O(chunk_rows) is BLOCKED -- see the
+    # ragged_gather_reduce_accumulate docstring: a core_map output ref initialized to an input value
+    # via new_ref(accum) leaks the Ref across jit/custom_vjp, and pl.kernel exposes no
+    # input_output_aliases. Kept off the hot path until that infra lands.)
     x_chunks = hidden_states_local.reshape(n_chunks, per, hidden)
-    pos = jax.lax.iota(jnp.int32, buffer_size)
-    if enforce_gather_fallback:
-      # FALLBACK / CPU path (no SparseCore): per-chunk full-buffer gather + jnp.where merge. Correct
-      # but N x full-buffer traffic; this is the CPU-testable reference path (the SC path below is
-      # bit-exact to it, validated standalone on v5p).
-      buf = jnp.zeros((buffer_size, hidden), hidden_states_local.dtype)
-      for c in range(n_chunks):
-        xg_c = jax.lax.all_gather(x_chunks[c], ep_name, axis=0, tiled=True)
-        mask = chunk_of_row == c
-        idx_c = jnp.where(mask, chunk_local_row, 0)
-        gathered = ragged_gather(
-            xg_c,
-            idx_c,
-            s_start[None],
-            s_end[None],
-            enforce_fallback=enforce_gather_fallback,
-            flops_override=gather_flops_override,
-            bytes_accessed_override=gather_bytes_accessed_override,
-        )
-        buf = jnp.where(mask[:, None], gathered.astype(hidden_states_local.dtype), buf)
-        (buf,) = jax.lax.optimization_barrier((buf,))
-      out_buf = buf
-    else:
-      # SparseCore path: per-chunk ragged_gather_reduce_accumulate writes ONLY this chunk's valid
-      # rows in place into ONE aliased buffer -> O(chunk_rows) SC compute + HBM write per chunk (no
-      # per-chunk full-buffer jnp.where). valid_rows_mask folds BOTH the chunk selector
-      # (chunk_of_row==c) AND the shard expert-range [s_start, s_end) restriction (which the fallback
-      # gets from ragged_gather's start/end block range instead). rows outside every chunk's valid
-      # set stay 0 (matching ring_ragged_sort's "zeros elsewhere"). Bit-exact to the fallback above.
-      acc_rows, acc_cols = sc_accumulate_dims(buffer_size, hidden, 1)
-      acc = jnp.zeros((acc_rows, acc_cols), jnp.float32)
-      in_range = (pos >= s_start) & (pos < s_end)
-      for c in range(n_chunks):
-        xg_c = jax.lax.all_gather(x_chunks[c], ep_name, axis=0, tiled=True)
-        valid = (chunk_of_row == c) & in_range  # [buffer_size] position-based validity
-        idx_c = jnp.where(valid, chunk_local_row, 0)  # FULL-shape masked index
-        ones = jnp.ones((buffer_size,), jnp.float32)
-        acc = ragged_gather_reduce_accumulate(
-            acc,
-            xg_c,
-            idx_c,
-            ones,
-            valid,
-            1,
-            flops_override=gather_reduce_flops_override,
-            bytes_accessed_override=gather_reduce_bytes_accessed_override,
-        )
-        # Barrier chain: fence acc[c] so XLA keeps the per-chunk accumulates emission-ordered
-        # (serialized SC writes into the aliased buffer) and cannot fuse across chunks.
-        (acc,) = jax.lax.optimization_barrier((acc,))
-      out_buf = acc[:buffer_size, :hidden].astype(hidden_states_local.dtype)
+    buf = jnp.zeros((buffer_size, hidden), hidden_states_local.dtype)
+    for c in range(n_chunks):
+      xg_c = jax.lax.all_gather(x_chunks[c], ep_name, axis=0, tiled=True)
+      mask = chunk_of_row == c  # [buffer_size] bool: rows whose source token is in chunk c
+      idx_c = jnp.where(mask, chunk_local_row, 0)  # FULL-shape masked index into the kernel
+      gathered = ragged_gather(
+          xg_c,
+          idx_c,
+          s_start[None],
+          s_end[None],
+          enforce_fallback=enforce_gather_fallback,
+          flops_override=gather_flops_override,
+          bytes_accessed_override=gather_bytes_accessed_override,
+      )
+      # Disjoint fill: each buffer row is written by exactly one chunk (unique chunk_of_row). Rows
+      # outside [start,end) get 0 (their chunk's gathered is 0 there), matching ring_ragged_sort's
+      # "zeros elsewhere". buf threads through -> single logical buffer; barrier chain (rung-6b)
+      # fences buf[c] so XLA cannot fuse/parallelize the per-chunk gathers nor merge across chunks.
+      buf = jnp.where(mask[:, None], gathered.astype(hidden_states_local.dtype), buf)
+      (buf,) = jax.lax.optimization_barrier((buf,))
     # Residual: index-only tracers + local shape. NOTHING heavy (no buffer), mirroring
     # ring_ragged_sort's bwd which recomputes grad from g_out + indices alone.
-    return out_buf, (s_start, s_end, revert, hidden_states_local.shape)
+    return buf, (s_start, s_end, revert, hidden_states_local.shape)
 
   @jax.named_scope("chunked-dispatch-bwd")
   def _chunked_dispatch_bwd(res, g_out):
