@@ -413,11 +413,29 @@ def ring_ragged_unsort(
       # multiple times when idx_inv // topk maps multiple positions to it.
       # Per-slot routing weights are applied inside the kernel.
       weight_for_sorted = topk_weights_flat[idx_inv]
+      gather_start, gather_end = shard_output_start, shard_output_end
+      if buffer_size > n:
+        # CHUNKED-INPUT bwd (decouple_combine_rs_chunks / moe_chunked_combine_in_remat):
+        # ragged_gather's [start, end) bound ranges over its OUTPUT/INDEX-ROW axis (its kernel
+        # derives the processed block range as start // block_size .. cdiv(end, block_size) and
+        # indexes indices/weights/out rows with it). Un-chunked, output row j IS buffer position
+        # j (n == buffer_size), so passing the shard's BUFFER-POSITION range is correct. For a
+        # chunk (n < buffer_size) the output rows are the RANKS of the chunk's slots in
+        # buffer-position order (idx_inv sorts them), so the buffer-position range must be
+        # converted to RANK space: passing raw buffer positions makes the kernel's block range
+        # index the chunk-sized arrays OUT OF BOUNDS (silent -- bounds checks off) or select
+        # the wrong rank rows. This was the step-1 NaN under moe_chunked_combine_in_remat: the
+        # exact backward mirror of the forward row-partition-stride bug. sorted_revert is
+        # ascending, so ranks with position in [start, end) form the contiguous range
+        # [searchsorted(start), searchsorted(end)).
+        sorted_revert_positions = topk_argsort_revert_indices[idx_inv]
+        gather_start = jnp.searchsorted(sorted_revert_positions, shard_output_start).astype(jnp.int32)
+        gather_end = jnp.searchsorted(sorted_revert_positions, shard_output_end).astype(jnp.int32)
       grad_sorted_tokens = ragged_gather(
           g_hidden_states_local,
           idx_inv // topk,
-          shard_output_start[None],
-          shard_output_end[None],
+          gather_start[None],
+          gather_end[None],
           weights=weight_for_sorted,
           has_weights=True,
           enforce_fallback=enforce_gather_fallback,
@@ -433,10 +451,9 @@ def ring_ragged_unsort(
         # DISJOINT set of buffer positions, so the N chunks' grads (summed by autodiff over the
         # shared sorted_tokens_local input) form the complete buffer gradient. No-op when
         # buffer_size == n (un-chunked path is untouched).
-        sorted_revert = topk_argsort_revert_indices[idx_inv]
         grad_sorted_tokens = (
             jnp.zeros((buffer_size,) + grad_sorted_tokens.shape[1:], dtype=grad_sorted_tokens.dtype)
-            .at[sorted_revert]
+            .at[sorted_revert_positions]
             .set(grad_sorted_tokens)
         )
     elif full_num_slots is not None and full_num_slots != n:

@@ -229,6 +229,105 @@ def sc_kernel_contract_checks(failures):
       failures.append("SC-emulation N=1: un-chunked call must not go OOB with either stride")
 
 
+def _emulate_sc_gather_bwd(g, indices, weights, start, end, lanes, num_cores):
+  """Numpy emulation of the SC ragged_gather wrapper + main_kernel ADDRESSING (backward use).
+
+  Mirrors: wrapper padding of indices/weights to a block multiple, and main_kernel's
+  block-range derivation ``block_start = start // block_size``, ``block_end = cdiv(end,
+  block_size)``, ``row_tile_start = aligned_start + ...`` which indexes the INDEX/WEIGHT/OUTPUT
+  row axis. Returns (out, oob): ``out`` has one row per index (NaN sentinel where the kernel
+  never wrote -- uninitialized HBM on hardware), ``oob`` is True when the block range indexes
+  the (possibly chunk-sized) arrays out of bounds (silent on SC: bounds checks off).
+  """
+  n = indices.shape[0]
+  bs = lanes * num_cores
+  padded_n = -(-n // bs) * bs
+  block_start = int(start) // bs
+  block_end = -(-int(end) // bs)
+  if int(end) == int(start):
+    block_end = block_start
+  lo_row, hi_row = block_start * bs, block_end * bs
+  oob = hi_row > padded_n or lo_row > padded_n
+  out = np.full((n, g.shape[1]), np.nan, np.float32)
+  for r in range(max(lo_row, 0), min(hi_row, n)):
+    out[r] = weights[r] * g[indices[r]]
+  return out, oob
+
+
+def sc_bwd_kernel_contract_checks(failures):
+  """Emulated-SC checks for the CHUNKED-input ring_ragged_unsort backward (rung 7).
+
+  ragged_gather's [start, end) ranges over its OUTPUT/INDEX-ROW axis. The chunked bwd used to
+  pass the shard's BUFFER-POSITION range (correct only un-chunked, where row j == position j):
+  with chunk-sized arrays this reads/writes out of bounds or selects the wrong rank rows --
+  the step-1 NaN under moe_chunked_combine_in_remat. The fix converts the range to RANK space
+  (searchsorted over the chunk's sorted buffer positions). Buggy bounds must fail for every
+  chunk at every N > 1 and never at N = 1; fixed bounds must be exact everywhere.
+  """
+  # block_size = 32 (lanes=8 x 4 cores): SMALL relative to the chunk length so the block
+  # range has resolution -- with block_size ~ chunk length everything rounds to whole blocks
+  # and the toy scale can't expose the addressing bug (at production scale the shard's
+  # buffer-position offsets exceed the chunk-sized arrays outright). Checked over ALL shards.
+  lanes, num_cores = 8, 4
+  key = jax.random.PRNGKey(1)
+  revert, group_sizes = _make_routing(key, skew=3.0)
+  n_slots = NUM_TOKENS * TOPK
+  w = np.asarray(jax.random.uniform(jax.random.fold_in(key, 2), (n_slots,), dtype=jnp.float32))
+  starts, ends = _shard_ranges(group_sizes, 8)
+  rv = np.asarray(revert)
+
+  for n_chunks in (1, 2, 4, 8):
+    spc = n_slots // n_chunks
+    bad_buggy = 0
+    total = 0
+    ok_fixed = True
+    for s in range(8):
+      start_s, end_s = int(starts[s]), int(ends[s])
+      if end_s == start_s:
+        continue  # empty shard: nothing to check
+      for c in range(n_chunks):
+        total += 1
+        sl = slice(c * spc, (c + 1) * spc)
+        rv_c, w_c = rv[sl], w[sl]
+        g_c = np.asarray(
+            jax.random.normal(jax.random.fold_in(key, 100 + c), (spc // TOPK, HIDDEN), dtype=jnp.float32)
+        )
+        idx_inv = np.argsort(rv_c, kind="stable")
+        sorted_pos = rv_c[idx_inv]
+        w_sorted = w_c[idx_inv]
+        # expected grad on THIS SHARD'S buffer rows: grad[rv_c[i]] = w_c[i] * g_c[i // TOPK]
+        expected = np.zeros((n_slots, HIDDEN), np.float32)
+        hit = (rv_c >= start_s) & (rv_c < end_s)
+        expected[rv_c[hit]] = w_c[hit, None] * g_c[np.nonzero(hit)[0] // TOPK]
+
+        def run(lo, hi):
+          out, oob = _emulate_sc_gather_bwd(g_c, idx_inv // TOPK, w_sorted, lo, hi, lanes, num_cores)
+          buf = np.zeros((n_slots, HIDDEN), np.float32)
+          buf[sorted_pos] = out  # the chunked-input grad scatter-back
+          match = (not np.isnan(buf[start_s:end_s]).any()) and np.array_equal(
+              buf[start_s:end_s], expected[start_s:end_s]
+          )
+          return oob, match
+
+        oob_b, match_b = run(start_s, end_s)  # BUGGY: buffer-position bounds
+        lo = int(np.searchsorted(sorted_pos, start_s))
+        hi = int(np.searchsorted(sorted_pos, end_s))
+        oob_f, match_f = run(lo, hi)  # FIXED: rank-space bounds
+        if oob_b or not match_b:
+          bad_buggy += 1
+        ok_fixed &= (not oob_f) and match_f
+    print(
+        f"  SC-bwd-emulation N={n_chunks}: fixed exact+in-bounds={ok_fixed}, "
+        f"buggy OOB-or-wrong shard-chunks={bad_buggy}/{total}"
+    )
+    if not ok_fixed:
+      failures.append(f"SC-bwd-emulation N={n_chunks}: fixed rank-space bounds wrong")
+    if n_chunks > 1 and bad_buggy == 0:
+      failures.append(f"SC-bwd-emulation N={n_chunks}: buggy bounds unexpectedly OK (0/{total})")
+    if n_chunks == 1 and bad_buggy:
+      failures.append("SC-bwd-emulation N=1: un-chunked bounds must be correct")
+
+
 def main():
   devices = np.array(jax.devices())
   assert len(devices) >= 8, f"need 8 CPU devices, got {len(devices)}"
@@ -236,6 +335,9 @@ def main():
 
   print("SC ragged_gather_reduce kernel-contract emulation (row-partition stride):")
   sc_kernel_contract_checks(failures)
+
+  print("SC ragged_gather BWD kernel-contract emulation (rank-space [start,end) bounds):")
+  sc_bwd_kernel_contract_checks(failures)
 
   for ep_size in (8, 4):
     mesh = jax.sharding.Mesh(devices[:ep_size], ("ep",))
