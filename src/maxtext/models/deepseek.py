@@ -778,18 +778,18 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       # splash_out/lse are None unless moe_splash_host_offload captured them above (extras, NOT part of
       # the differentiated output -- consumed only as host-offloaded residuals by fused_fwd/fused_bwd).
       # splash_out_spec/lse_spec are STATIC PartitionSpecs (the sharded specs for the host offload).
+      # hidden_states is returned so fused_fwd can DEVICE-SAVE it (moe_save_block_input) as a residual.
       return (layer_output, load_balance_loss, moe_bias_updates,
-              splash_out, splash_lse, splash_out_spec, splash_lse_spec)
+              splash_out, splash_lse, splash_out_spec, splash_lse_spec, hidden_states)
 
     @jax.custom_vjp
     def fused(p, x_in):
-      layer_output, lbl, mbu, _so, _sl, _sos, _sls = _forward_once(p, x_in, rest_other)
+      layer_output, lbl, mbu, _so, _sl, _sos, _sls, _hs = _forward_once(p, x_in, rest_other)
       return layer_output, lbl, mbu
 
     def fused_fwd(p, x_in):
-      layer_output, lbl, mbu, splash_out, splash_lse, splash_out_spec, splash_lse_spec = _forward_once(
-          p, x_in, rest_other
-      )
+      (layer_output, lbl, mbu, splash_out, splash_lse, splash_out_spec, splash_lse_spec,
+       hidden_fwd) = _forward_once(p, x_in, rest_other)
       out = (layer_output, lbl, mbu)
       # moe_splash_host_offload: OFFLOAD the captured splash (out=context, lse) to pinned_host so the
       # backward LOADS them instead of recomputing the splash forward (_attn). jax.device_put with a
@@ -813,10 +813,15 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
             _to_host(splash_out, splash_out_spec),
             _to_host(splash_lse, splash_lse_spec),
         )
-      # Residuals: sharded params + decoder_layer_input + (seg, pos, rest_other) + host_splash. seg/pos
-      # are closed over in the primal/fwd and read from residuals in the bwd (no tracer leak).
-      # host_splash (None unless host-offload) carries the pinned_host context+lse.
-      return out, (p, x_in, seg0, pos0, rest_other, host_splash)
+      # moe_save_block_input: DEVICE-SAVE the MoE block input (post-attention-norm hidden state) as a
+      # residual, so fused_bwd's MoE recompute consumes the SAVED forward tensor instead of the one the
+      # attention replay produces -- the MoE recompute stops serially depending on the replayed
+      # o-proj/norm chain. Plain device residual (like x_in): the scan stacks [layers, ...] on device.
+      saved_hidden = hidden_fwd if self.config.moe_save_block_input else None
+      # Residuals: sharded params + decoder_layer_input + (seg, pos, rest_other) + host_splash +
+      # saved_hidden. seg/pos are closed over in the primal/fwd and read from residuals in the bwd (no
+      # tracer leak). host_splash (None unless host-offload) carries the pinned_host context+lse.
+      return out, (p, x_in, seg0, pos0, rest_other, host_splash, saved_hidden)
 
     def _attn_host(p, x_in, seg, pos, rest_, host_out, host_lse):
       host_out_spec, host_lse_spec = _host_specs[0], _host_specs[1]
@@ -860,7 +865,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       return m.self_attention_with_norm_op(x_in, seg, pos, det, wag_cell=wag_cell)
 
     def fused_bwd(res, cotangents):
-      p, x_in, seg, pos, rest_, host_splash = res
+      p, x_in, seg, pos, rest_, host_splash, saved_hidden = res
       # Re-tracing the bridged layer methods happens OUTSIDE the linen forward, so detach the
       # linen module stack to avoid the qwix-fixup None.path crash (see helper docstring).
       with _detached_linen_module_stack():
@@ -875,8 +880,12 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
           (hidden_states, intermediate_inputs), vjp_attn = jax.vjp(
               lambda pp, xx: _attn_host(pp, xx, seg, pos, rest_, host_out, host_lse), p, x_in
           )
+          # moe_save_block_input: feed the SAVED forward hidden state into the MoE recompute (bit-equal
+          # to the replayed one, so grads are unchanged); the heavy MoE recompute ops then have no data
+          # dependency on the attention replay (only the final +intermediate_inputs add does).
+          hidden_for_moe = saved_hidden if saved_hidden is not None else hidden_states
           _out, vjp_moe = jax.vjp(
-              lambda pp, hh, ii, ww: _moe(pp, hh, ii, ww, rest_), p, hidden_states, intermediate_inputs, weights
+              lambda pp, hh, ii, ww: _moe(pp, hh, ii, ww, rest_), p, hidden_for_moe, intermediate_inputs, weights
           )
           dp_moe, d_hidden, d_inter, d_weights = vjp_moe(cotangents)
           (dp_gather,) = vjp_gather(d_weights)
@@ -895,9 +904,12 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
         (hidden_states, intermediate_inputs), vjp_attn = jax.vjp(
             lambda pp, xx: _attn(pp, xx, seg, pos, rest_), p, x_in
         )
-        # 3) recompute MoE forward (routing key recomputed in-scope, no nnx Rngs) + build its VJP
+        # 3) recompute MoE forward (routing key recomputed in-scope, no nnx Rngs) + build its VJP.
+        # moe_save_block_input: consume the SAVED forward hidden state (== the replayed value bit-exactly)
+        # so the MoE recompute does not serially wait on the attention replay.
+        hidden_for_moe = saved_hidden if saved_hidden is not None else hidden_states
         _out, vjp_moe = jax.vjp(
-            lambda pp, hh, ii, ww: _moe(pp, hh, ii, ww, rest_), p, hidden_states, intermediate_inputs, weights
+            lambda pp, hh, ii, ww: _moe(pp, hh, ii, ww, rest_), p, hidden_for_moe, intermediate_inputs, weights
         )
         dp_moe, d_hidden, d_inter, d_weights = vjp_moe(cotangents)
         (dp_gather,) = vjp_gather(d_weights)

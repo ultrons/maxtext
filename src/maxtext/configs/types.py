@@ -937,6 +937,20 @@ class MoEGeneral(BaseModel):
           "forward) => loss BIT-EXACT vs flag-off. Default False; flag OFF => byte-identical."
       ),
   )
+  moe_save_block_input: bool = Field(
+      False,
+      description=(
+          "DeepSeek MoE hand-written backward (requires moe_handwritten_bwd=True): DEVICE-SAVE the MoE "
+          "block's input hidden state (the post-attention-norm output, [batch, seq, emb] bf16 per layer) "
+          "in the fused forward's custom_vjp residuals, so the backward's MoE recompute consumes the SAVED "
+          "tensor instead of the one produced by the attention replay. The attention replay still runs "
+          "(vjp_attn needs it for dq/dk/dv and the o-proj/norm grads), but the MoE recompute no longer "
+          "serially depends on it -- the ~o-proj+norm recompute leaves the MoE critical path. Saved value "
+          "== replayed value exactly (deterministic replay) => loss AND grads BIT-EXACT vs flag-off. "
+          "Costs ~[batch*seq*emb] bf16 x num MoE layers of device HBM (residuals stacked by the layer "
+          "scan). Default False = byte-identical."
+      ),
+  )
   moe_splash_offload_scheduling_group: bool = Field(
       False,
       description=(
@@ -2700,6 +2714,12 @@ class MaxTextConfig(
           "moe_splash_host_offload requires moe_handwritten_bwd=True: it host-offloads the splash output + "
           "lse in the hand-written fused forward and loads them in the hand-written fused backward (replacing "
           "the splash-fwd recompute). It has no effect on the autodiff path."
+      )
+    if self.moe_save_block_input and not self.moe_handwritten_bwd:
+      raise ValueError(
+          "moe_save_block_input requires moe_handwritten_bwd=True: it saves the MoE block input through the "
+          "hand-written fused forward's custom_vjp residuals and consumes it in the hand-written fused "
+          "backward. It has no effect on the autodiff path."
       )
     if self.custom_mesh_and_rule is not CustomRule.DEFAULT:
       custom_mesh_path = os.path.join(

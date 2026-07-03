@@ -1045,13 +1045,22 @@ class NNXDecoder(nnx.Module):
     # [num_layers, ...] pinned_host accumulation). Without the wrap, autodiff stores exactly the
     # custom_vjp's declared residuals across the scan: {inputs, params} + the pinned_host (out, lse) --
     # nothing else, since the whole layer body is inside the custom_vjp (this is the nnx equivalent of
-    # the linen bypass in decoders.py set_remat_policy). Gated on moe_splash_host_offload (not bare
-    # moe_handwritten_bwd) so existing flag-off programs stay byte-identical; with flag off the
-    # residuals are inputs-only and the checkpoint wrap is a harmless no-op either way.
+    # the linen bypass in decoders.py set_remat_policy). Gated on moe_splash_host_offload /
+    # moe_save_block_input (not bare moe_handwritten_bwd) so existing
+    # flag-off programs stay byte-identical; with both off the residuals are inputs-only and
+    # the checkpoint wrap is a harmless no-op either way. The device-save flag needs the skip
+    # for the same reason as the splash offload: under jax.checkpoint its captured residual
+    # (the block input) is REMATERIALIZED in the backward instead of loaded.
     _handwritten_owns_remat = (
         self.config.moe_handwritten_bwd
-        and getattr(self.config, "moe_splash_host_offload", False)
-        and layers.__class__ is deepseek.DeepSeekMoELayer
+        and (
+            getattr(self.config, "moe_splash_host_offload", False)
+            or getattr(self.config, "moe_save_block_input", False)
+        )
+        # isinstance, not `is`: the linen<->nnx bridge builds the scanned layer as a dynamically
+        # created SUBCLASS of DeepSeekMoELayer, so class identity fails on that path and the
+        # checkpoint wrap silently re-materializes the custom_vjp's saved residuals in the bwd.
+        and isinstance(layers, deepseek.DeepSeekMoELayer)
     )
     if _handwritten_owns_remat:
       layer_fn_wrapped = layer_fn
