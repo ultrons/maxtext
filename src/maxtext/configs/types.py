@@ -937,6 +937,20 @@ class MoEGeneral(BaseModel):
           "forward) => loss BIT-EXACT vs flag-off. Default False; flag OFF => byte-identical."
       ),
   )
+  moe_splash_offload_scheduling_group: bool = Field(
+      False,
+      description=(
+          "Splash host-offload recovery (requires moe_splash_host_offload=True). Pure SCHEDULING (no "
+          "dataflow change, loss BIT-EXACT): tag BOTH the combine-backward cotangent all-gather (the "
+          "transpose of the direct/psum reduce-scatter -- profile op all-gather.626, ~2GB/layer, whose "
+          "overlap cover was the now-deleted splash-fwd recompute) AND the per-layer host->device splash "
+          "(context, lse) RESTORE copies with a shared XLA _scheduling_group_id. The AG (ICI) consumes "
+          "only the incoming layer-output cotangent, and the restore (Host-DMA) is independent of the MoE "
+          "backward, so the two engines' work becomes an overlap candidate for the latency-hiding "
+          "scheduler -- re-covering the exposure that made the host-offload win invert on hardware. "
+          "Default False = no tag (byte-identical schedule of the host-offload path)."
+      ),
+  )
   interleave_moe_layer_step: int = Field(1, description="Frequency of MoE layers, e.g., 2 means every 2nd layer is MoE.")
   moe_fsdp_use_two_stage_all_gather: bool = Field(
       False,

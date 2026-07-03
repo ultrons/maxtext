@@ -1,0 +1,31 @@
+jax 0.10.1 devs 8
+### FCR STEP0 BENCH ###
+/tmp/bench_fcr.py:46: DeprecationWarning: jax.experimental.shard_map is deprecated in v0.8.0. Used jax.shard_map instead.
+  from jax.experimental.shard_map import shard_map
+devices: 8 kind=TPU7x
+sc_info: SparseCoreInfo(num_cores=2, num_subcores=16, num_lanes=16, vmem_capacity_bytes=524288, dma_granule_size_bytes=64)
+grid coords: [['[0, 0, 0]/0', '[0, 0, 0]/1'], ['[1, 0, 0]/0', '[1, 0, 0]/1'], ['[1, 1, 0]/0', '[1, 1, 0]/1'], ['[0, 1, 0]/0', '[0, 1, 0]/1']]
+==== SHAPE NTOK=8192 S=65536 H=7168 K=8 EP=4 CH=2048 (buf f32 1.88 GB/device)
+CORRECTNESS fused(scatter=True) vs jnp ref: rel_maxabs=1.470e-07
+TIMING fused_TEC_only: 117.385 ms/iter
+TIMING fused_FULL: 122.950 ms/iter
+TIMING rgr_f32_allvalid: 5.135 ms/iter
+TIMING rgr_f32_quartervalid: 1.544 ms/iter
+TIMING rgr_bf16_allvalid: 5.436 ms/iter
+TIMING rgr_bf16_quartervalid: 1.601 ms/iter
+TIMING psum_scatter_f32: 1.972 ms/iter
+TIMING psum_scatter_bf16: 1.141 ms/iter
+DERIVED NTOK=8192: gather 1.88 GB f32; fused_TEC BW=16 GB/s; RS_exposure=5.565 ms; fused_TEC/rgr_f32_all=22.86x; fused_FULL vs (rgr_bf16_qv + ps_bf16)=122.95 vs 2.74 ms
+==== SHAPE NTOK=16384 S=131072 H=7168 K=8 EP=4 CH=4096 (buf f32 3.76 GB/device)
+CORRECTNESS fused(scatter=True) vs jnp ref: rel_maxabs=9.285e-01
+TIMING fused_TEC_only: 234.817 ms/iter
+TIMING fused_FULL: 245.896 ms/iter
+TIMING rgr_f32_allvalid: 10.306 ms/iter
+TIMING rgr_f32_quartervalid: 2.991 ms/iter
+TIMING rgr_bf16_allvalid: 10.832 ms/iter
+TIMING rgr_bf16_quartervalid: 3.085 ms/iter
+TIMING psum_scatter_f32: 3.864 ms/iter
+TIMING psum_scatter_bf16: 2.198 ms/iter
+DERIVED NTOK=16384: gather 3.76 GB f32; fused_TEC BW=16 GB/s; RS_exposure=11.079 ms; fused_TEC/rgr_f32_all=22.78x; fused_FULL vs (rgr_bf16_qv + ps_bf16)=245.90 vs 5.28 ms
+ALLDONE
+EXITCODE=0

@@ -828,9 +828,30 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       # re-traced (their grad is exact); only the expensive splash forward compute is eliminated.
       m = _merge(p, rest_)
 
+      # moe_splash_offload_scheduling_group (pure scheduling, gated): tag the host->device RESTORE
+      # with the SAME _scheduling_group_id as the combine cotangent all-gather (_drs_bwd ==
+      # all-gather.626) so the latency-hiding scheduler treats the two as an overlap candidate. The
+      # restore executes on the generic async host-DMA path (NOT the SparseCore offload queue that
+      # carries the combine AG + weight AGs -- AOT-verified: the restore lowers to an async
+      # dynamic-slice from the [layers,...]S(5) pinned-host buffer with no async_execution_thread=
+      # "sparsecore"), so restore || SC-AG is queue-feasible.
+      # CAVEAT (AOT A/B receipt, this branch): the frontend attribute on device_put does NOT survive
+      # onto the MSA-generated dynamic-slice-start restore copy, so this tag alone does not yet move
+      # the restore -- the restore's prefetch distance is an MSA cost-model lever, not a frontend
+      # scheduling group. Kept gated + byte-identical-off; the effective restore-prefetch lever is a
+      # follow-up. Only a frontend attribute is added; dataflow/numerics are unchanged.
+      _restore_sg = (
+          moe._SPLASH_OFFLOAD_SCHED_GROUP
+          if getattr(self.config, "moe_splash_offload_scheduling_group", False)
+          else None
+      )
+
       def _back(a, spec):
         sh = jax.sharding.NamedSharding(self.mesh, spec).with_memory_kind("device")
-        return jax.device_put(a, sh)
+        if _restore_sg is None:
+          return jax.device_put(a, sh)
+        with moe._scheduling_group(_restore_sg):
+          return jax.device_put(a, sh)
 
       wag_cell = {
           "host_out": _back(host_out, host_out_spec),

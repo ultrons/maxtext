@@ -57,8 +57,8 @@ import tokamax
 set_xla_metadata = xla_metadata.set_xla_metadata
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3))
-def _direct_reduce_scatter(output, mesh, ep_name, collective_id):
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4))
+def _direct_reduce_scatter(output, mesh, ep_name, collective_id, sched_group=None):
   """Direct-to-owner Pallas reduce-scatter over the EP axis -- a drop-in for
   `jax.lax.psum_scatter(output, ep_name, scatter_dimension=0, tiled=True)`.
 
@@ -73,6 +73,12 @@ def _direct_reduce_scatter(output, mesh, ep_name, collective_id):
   `lax.axis_index`. `collective_id` selects the barrier semaphore: concurrent in-flight
   instances (the per-chunk RSs of decouple_combine_rs_chunks may overlap in the schedule)
   must each use a DISTINCT id or their entry barriers would count each other's signals.
+
+  `sched_group` (None by default) is a pure-scheduling hint applied ONLY in the BACKWARD: when
+  not None the transpose all-gather (`_drs_bwd`) is tagged with that XLA `_scheduling_group_id`
+  so the latency-hiding scheduler treats the (exposed) combine cotangent all-gather as an overlap
+  candidate with other same-group ops (the splash host-offload restore copies -- see
+  moe_splash_offload_scheduling_group). The forward is unaffected; None => byte-identical.
   """
   ep_size = mesh.shape[ep_name]
   axis_names = mesh.axis_names
@@ -135,12 +141,19 @@ def _direct_reduce_scatter(output, mesh, ep_name, collective_id):
 # The Pallas kernel is opaque to autodiff (no jvp). Give it the SAME differentiation as the
 # `psum_scatter` it replaces: the transpose of a tiled reduce-scatter over EP (scatter_dim=0)
 # is a tiled all-gather over EP. Forward values are verified == psum_scatter, so fwd+bwd match.
-def _drs_fwd(output, mesh, ep_name, collective_id):
-  return _direct_reduce_scatter(output, mesh, ep_name, collective_id), None
+def _drs_fwd(output, mesh, ep_name, collective_id, sched_group=None):
+  return _direct_reduce_scatter(output, mesh, ep_name, collective_id, sched_group), None
 
 
-def _drs_bwd(mesh, ep_name, collective_id, _res, ct):
-  return (jax.lax.all_gather(ct, ep_name, axis=0, tiled=True),)
+def _drs_bwd(mesh, ep_name, collective_id, sched_group, _res, ct):
+  # sched_group (moe_splash_offload_scheduling_group): tag this combine cotangent all-gather
+  # (== all-gather.626, the transpose of the direct RS) so the scheduler can overlap the ICI AG
+  # with the host->device splash restore copies tagged into the same group. None => untagged
+  # (byte-identical; only a frontend attribute is added, dataflow/numerics are unchanged).
+  if sched_group is None:
+    return (jax.lax.all_gather(ct, ep_name, axis=0, tiled=True),)
+  with _scheduling_group(sched_group):
+    return (jax.lax.all_gather(ct, ep_name, axis=0, tiled=True),)
 
 
 _direct_reduce_scatter.defvjp(_drs_fwd, _drs_bwd)
@@ -161,6 +174,14 @@ def _scheduling_group(group_id):
 # attention earlier in the same (scanned) decoder layer. Under
 # scan_layers=true the body is traced once, so a fixed id scopes to one layer.
 _WEIGHT_AG_SCHED_GROUP = 1
+
+# Scheduling-group id shared, in the BACKWARD only, by the combine cotangent all-gather
+# (_drs_bwd, == all-gather.626) and the splash host-offload (context, lse) restore copies
+# (deepseek._attn_host), so the latency-hiding scheduler overlaps the exposed ICI AG with the
+# otherwise-idle Host-DMA restore lane. Gated on moe_splash_offload_scheduling_group. Distinct
+# from the forward weight-AG groups (1..3) and the observed splash/attention groups so the
+# all-gather-combiner cannot fuse it into an un-hideable monolith with them.
+_SPLASH_OFFLOAD_SCHED_GROUP = 30
 
 
 DISPATCH = "dispatch"
@@ -2017,10 +2038,14 @@ class RoutedMoE(nnx.Module):
         if self.config.moe_direct_rs and self._expert_parallelism_name == "expert":
           _mesh = self.mesh
 
+          _splash_off_sg = self._splash_offload_sched_group()
+
           def drs_fn(x, chunk_idx):
             # Per-chunk DISTINCT collective_id: the chunk RSs can be concurrently in flight
             # (that overlap is the whole lever), so they must not share a barrier semaphore.
-            return _direct_reduce_scatter(x, _mesh, "expert", 7 + chunk_idx)
+            # sched_group tags the per-chunk transpose all-gathers for the splash-offload overlap
+            # (only relevant when moe_chunked_combine_in_remat differentiates the chunked combine).
+            return _direct_reduce_scatter(x, _mesh, "expert", 7 + chunk_idx, _splash_off_sg)
 
         output = chunked_ring_combine_reduce_scatter(
             intermediate_output,
@@ -2070,7 +2095,10 @@ class RoutedMoE(nnx.Module):
           # Direct-to-owner Pallas RS (TC) so XLA can overlap its ICI DMA under the SC combine,
           # instead of the psum_scatter parking behind the SC-offload queue. == psum_scatter
           # (rel 0.004 bf16 reduce-order). Same gating as the old-branch wiring (plain axis).
-          output = _direct_reduce_scatter(output, self.mesh, "expert", 7)
+          # sched_group (moe_splash_offload_scheduling_group): this un-chunked combine runs in the
+          # manbwd RECOMPUTE; tagging its transpose all-gather (_drs_bwd == all-gather.626) lets the
+          # scheduler overlap it with the co-tagged splash host restore copies. None otherwise.
+          output = _direct_reduce_scatter(output, self.mesh, "expert", 7, self._splash_offload_sched_group())
         else:
           output = jax.lax.psum_scatter(output, self._expert_parallelism_name, scatter_dimension=0, tiled=True)
         return output, routing.lb_loss, routing.bias_updates
@@ -2891,6 +2919,18 @@ class RoutedMoE(nnx.Module):
     w1_kernel = max_utils.unbox_logicallypartioned(w1_kernel)
     wo_kernel = max_utils.unbox_logicallypartioned(wo_kernel)
     return w0_kernel, w1_kernel, wo_kernel
+
+  def _splash_offload_sched_group(self):
+    """Scheduling-group id for the combine cotangent all-gather (backward), or None.
+
+    Returns _SPLASH_OFFLOAD_SCHED_GROUP only when BOTH moe_splash_host_offload and
+    moe_splash_offload_scheduling_group are set -- so the tag exists only on the host-offload
+    recovery path and every other config keeps a byte-identical schedule.
+    """
+    cfg = self.config
+    if getattr(cfg, "moe_splash_host_offload", False) and getattr(cfg, "moe_splash_offload_scheduling_group", False):
+      return _SPLASH_OFFLOAD_SCHED_GROUP
+    return None
 
   def gather_weights(self):
     """FSDP-all-gather the routed expert weights (wi_0/wi_1/wo) early, so the
