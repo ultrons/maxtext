@@ -507,6 +507,7 @@ def chunked_ring_combine_reduce_scatter(
     ep_size,
     n_chunks,
     return_first_combine_token=False,
+    reduce_scatter_fn=None,
     **unsort_kwargs,
 ):
   """Decoupled chunked combine -> reduce-scatter (ring-of-experts).
@@ -612,8 +613,13 @@ def chunked_ring_combine_reduce_scatter(
       # [1, 1] scheduling token: depends (through the barrier / the combine's data) on chunk
       # 0's PRE-RS combined output only -- deliberately NOT on any psum_scatter.
       first_combine_token = jax.lax.slice(combined, (0, 0), (1, 1))
-    # reduce-scatter the TOKEN-ordered chunk over the expert axis (auto bwd = all_gather)
-    outs.append(jax.lax.psum_scatter(combined, ep_name, scatter_dimension=0, tiled=True))
+    # reduce-scatter the TOKEN-ordered chunk over the expert axis (auto bwd = all_gather).
+    # reduce_scatter_fn (moe_direct_rs): drop-in psum_scatter replacement -- a (x, chunk_idx)
+    # callable (chunk_idx selects a distinct collective_id per concurrently-in-flight chunk RS).
+    if reduce_scatter_fn is None:
+      outs.append(jax.lax.psum_scatter(combined, ep_name, scatter_dimension=0, tiled=True))
+    else:
+      outs.append(reduce_scatter_fn(combined, c))
   out = jnp.concatenate(outs, axis=0)
   if return_first_combine_token:
     return out, first_combine_token

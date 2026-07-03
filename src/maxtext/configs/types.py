@@ -802,6 +802,17 @@ class MoEGeneral(BaseModel):
           "(recompute uses the un-chunked combine). Needs moe_handwritten_bwd + decouple_combine_rs_chunks>1."
       ),
   )
+  moe_direct_rs: bool = Field(
+      False,
+      description=(
+          "Ring-of-experts only, plain 'expert' EP axis. When True, replace the EP `jax.lax.psum_scatter` "
+          "after the combine with a direct-to-owner Pallas reduce-scatter (TC, async ICI DMA) so it neither "
+          "queues behind the SparseCore-offload collectives nor hits the v7x async-RS continuation-fusion "
+          "prohibition. Applies to the un-chunked ring combine AND each per-chunk RS of "
+          "decouple_combine_rs_chunks (distinct collective_id per chunk). Numerically == psum_scatter "
+          "(bf16 reduce-order, rel ~0.004); custom_vjp bwd = tiled all-gather. Default False = psum_scatter."
+      ),
+  )
   moe_expert_input_dim: int = Field(
       -1,
       description="Dimension of tokens entering the MoE layer. If < 0, defaults to emb_dim.",

@@ -27,6 +27,8 @@ from flax import struct
 import jax
 from jax import ad_checkpoint as adc
 from jax.experimental import xla_metadata
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -52,6 +54,95 @@ import qwix.pallas as qpl
 import tokamax
 
 set_xla_metadata = xla_metadata.set_xla_metadata
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3))
+def _direct_reduce_scatter(output, mesh, ep_name, collective_id):
+  """Direct-to-owner Pallas reduce-scatter over the EP axis -- a drop-in for
+  `jax.lax.psum_scatter(output, ep_name, scatter_dimension=0, tiled=True)`.
+
+  Each device sends its chunk-c straight to owner c (pure async ICI DMA on the
+  TensorCore), then a local dense f32 sum reduces. Because it is a TC Pallas kernel firing
+  async ICI copies -- not an XLA collective -- it (a) does not conflict with the SparseCore
+  offload queue that serializes psum_scatter behind the SC combines, and (b) is immune to the
+  v7x prohibition on async-RS continuation fusion. Ported from the fused-combine-rs campaign
+  (commits b5bfd57b2 + a1a7f2179: verified == psum_scatter in isolation, rel 0.004 bf16;
+  prototype provenance perf-drills/gather/combine/{direct_rs,verify_combine_rs}.py, v5p).
+  MUST be called INSIDE the MoE shard_map so the ambient mesh axes are available to
+  `lax.axis_index`. `collective_id` selects the barrier semaphore: concurrent in-flight
+  instances (the per-chunk RSs of decouple_combine_rs_chunks may overlap in the schedule)
+  must each use a DISTINCT id or their entry barriers would count each other's signals.
+  """
+  ep_size = mesh.shape[ep_name]
+  axis_names = mesh.axis_names
+  mesh_shape = mesh.shape
+  n = output.shape[0]
+  chunk = n // ep_size
+  trailing = tuple(output.shape[1:])
+
+  def _mesh_device_id(ep_rank):
+    # Full mesh-coordinate tuple in mesh.axis_names ORDER (DeviceIdType.MESH resolves it
+    # against the device mesh): `ep_rank` in the expert slot, every other axis pinned to its
+    # current axis_index (0 for size-1 axes -- avoid a needless axis_index call). The order
+    # MUST match the mesh or the DMA targets the wrong device.
+    return tuple(
+        ep_rank if nm == ep_name else (0 if mesh_shape[nm] == 1 else jax.lax.axis_index(nm)) for nm in axis_names
+    )
+
+  def _kern(y_ref, o_ref, send, recv):
+    my = jax.lax.axis_index(ep_name)
+    # Full EP-group barrier (collective_id on the pallas_call enables the barrier sem).
+    bsem = pltpu.get_barrier_semaphore()
+    for c in range(ep_size):
+      pltpu.semaphore_signal(bsem, inc=1, device_id=_mesh_device_id(c), device_id_type=pl.DeviceIdType.MESH)
+    pltpu.semaphore_wait(bsem, ep_size)
+    sends = []
+    for c in range(ep_size):  # scatter my chunk-c -> owner c's recv[my]
+      cp = pltpu.make_async_remote_copy(
+          y_ref.at[pl.ds(c * chunk, chunk)],
+          o_ref.at[my],
+          send.at[c],
+          recv.at[my],
+          device_id=_mesh_device_id(c),
+          device_id_type=pl.DeviceIdType.MESH,
+      )
+      cp.start()
+      sends.append(cp)
+    for d in range(ep_size):  # wait for chunk-(my) arriving from each device d -> recv[d]
+      pltpu.make_async_remote_copy(
+          y_ref.at[pl.ds(0, chunk)],
+          o_ref.at[d],
+          send.at[d],
+          recv.at[d],
+          device_id=_mesh_device_id(d),
+          device_id_type=pl.DeviceIdType.MESH,
+      ).wait_recv()
+    for cp in sends:
+      cp.wait_send()
+
+  recv = pl.pallas_call(
+      _kern,
+      out_shape=jax.ShapeDtypeStruct((ep_size, chunk) + trailing, output.dtype),
+      in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
+      out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+      scratch_shapes=[pltpu.SemaphoreType.DMA((ep_size,)), pltpu.SemaphoreType.DMA((ep_size,))],
+      compiler_params=pltpu.CompilerParams(collective_id=collective_id),
+  )(output)
+  return recv.astype(jnp.float32).sum(0).astype(output.dtype)
+
+
+# The Pallas kernel is opaque to autodiff (no jvp). Give it the SAME differentiation as the
+# `psum_scatter` it replaces: the transpose of a tiled reduce-scatter over EP (scatter_dim=0)
+# is a tiled all-gather over EP. Forward values are verified == psum_scatter, so fwd+bwd match.
+def _drs_fwd(output, mesh, ep_name, collective_id):
+  return _direct_reduce_scatter(output, mesh, ep_name, collective_id), None
+
+
+def _drs_bwd(mesh, ep_name, collective_id, _res, ct):
+  return (jax.lax.all_gather(ct, ep_name, axis=0, tiled=True),)
+
+
+_direct_reduce_scatter.defvjp(_drs_fwd, _drs_bwd)
 
 
 def _scheduling_group(group_id):
@@ -1866,6 +1957,15 @@ class RoutedMoE(nnx.Module):
         # See chunked_ring_combine_reduce_scatter for the expert->token handling + the permute trick.
         # `use_chunked_combine` is False on the moe_handwritten_bwd RECOMPUTE path (deepseek.py
         # fused_bwd), which differentiates the un-chunked combine instead (forward-only chunking).
+        drs_fn = None
+        if self.config.moe_direct_rs and self._expert_parallelism_name == "expert":
+          _mesh = self.mesh
+
+          def drs_fn(x, chunk_idx):
+            # Per-chunk DISTINCT collective_id: the chunk RSs can be concurrently in flight
+            # (that overlap is the whole lever), so they must not share a barrier semaphore.
+            return _direct_reduce_scatter(x, _mesh, "expert", 7 + chunk_idx)
+
         output = chunked_ring_combine_reduce_scatter(
             intermediate_output,
             routing.group_sizes,
@@ -1877,6 +1977,7 @@ class RoutedMoE(nnx.Module):
             self.get_expert_parallelism_size(),
             self.config.decouple_combine_rs_chunks,
             return_first_combine_token=emit_combine_token,
+            reduce_scatter_fn=drs_fn,
             enforce_gather_fallback=self.config.ragged_gather_fallback,
             enforce_gather_reduce_fallback=self.config.ragged_gather_reduce_fallback,
             gather_flops_override=self.config.ragged_gather_cost_estimate_flops,
@@ -1909,7 +2010,13 @@ class RoutedMoE(nnx.Module):
         output = jnp.reshape(
             output, (-1, sequence_length, self.moe_expert_input_dim // self.get_tensor_parallelism_size())
         )
-        output = jax.lax.psum_scatter(output, self._expert_parallelism_name, scatter_dimension=0, tiled=True)
+        if self.config.moe_direct_rs and self._expert_parallelism_name == "expert":
+          # Direct-to-owner Pallas RS (TC) so XLA can overlap its ICI DMA under the SC combine,
+          # instead of the psum_scatter parking behind the SC-offload queue. == psum_scatter
+          # (rel 0.004 bf16 reduce-order). Same gating as the old-branch wiring (plain axis).
+          output = _direct_reduce_scatter(output, self.mesh, "expert", 7)
+        else:
+          output = jax.lax.psum_scatter(output, self._expert_parallelism_name, scatter_dimension=0, tiled=True)
         return output, routing.lb_loss, routing.bias_updates
 
       if self.get_expert_parallelism_size() > 1:
