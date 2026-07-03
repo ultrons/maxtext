@@ -806,13 +806,14 @@ class MoEGeneral(BaseModel):
   decouple_dispatch_chunks: int = Field(
       0,
       description=(
-          "INPUT-side dispatch chunking (rung 9): chunk the token EP all-gather + ragged-sort over the "
-          "input-token axis so each chunk's all-gather hides under the previous chunk's ragged-sort. GMM "
-          "runs FULL downstream. ONE full-size expert-sorted buffer with disjoint per-chunk writes + a "
-          "barrier chain; single custom_vjp with the un-chunked (N-independent) backward. Bit-exact vs "
-          "un-chunked dispatch. Ring-of-experts + plain 'expert' axis + use_ragged_sort + "
-          "ragged_buffer_factor<=0 + non-Llama4; must divide num_tokens_local. 0/1 = disabled. Forward-only "
-          "under moe_handwritten_bwd. NOTE: HBM may scale with N (per-chunk ragged_gather scratch)."
+          "INPUT-side dispatch chunking (rung 9e Route B): chunk the token EP all-gather + ragged-sort over "
+          "the input-token axis so each chunk's all-gather hides under the previous chunk's SC compaction. "
+          "GMM runs FULL downstream. COMPACTION-FIRST: per chunk one COMPACTED gather into a buffer_size/N "
+          "piece (rank-space bounds), then ONE full-buffer placement gather (buffer-position bounds) -- "
+          "~2x the un-chunked dispatch SC pass, no N x full-buffer merge traffic or live scratches. Single "
+          "custom_vjp with the un-chunked (N-independent) backward. Bit-exact vs un-chunked dispatch. "
+          "Ring-of-experts + plain 'expert' axis + use_ragged_sort + ragged_buffer_factor<=0 + non-Llama4; "
+          "must divide num_tokens_local. 0/1 = disabled. Forward-only under moe_handwritten_bwd."
       ),
   )
   moe_direct_rs: bool = Field(
