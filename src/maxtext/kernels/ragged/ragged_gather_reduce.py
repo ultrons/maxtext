@@ -736,26 +736,27 @@ def ragged_gather_reduce_accumulate(
       bytes_accessed_override=bytes_accessed_override,
   )
 
-  # Custom wrapper mirroring pl.kernel's own (`@jax.jit` core_map + run_scoped) EXCEPT the single
-  # output ref is initialized to `accum` (donated -> aliased) instead of `lax.empty`, so the kernel
-  # accumulates in place. pl.kernel already emits an internal jit inside the MoE shard_map, so this
-  # is consistent with the existing ragged kernels (no extra shard_map-jit penalty).
-  @functools.partial(jax.jit, donate_argnums=(0,))
-  def _run(accum, num_src, xp, src_idx, dst_idx, w):
-    operands = (num_src, xp, src_idx, dst_idx, w)
-    arg_refs = _tree_util.tree_map(jax_core.new_ref, operands)
-    out_ref = jax_core.new_ref(accum)  # init to accum (NOT lax.empty) -> in-place accumulate
+  # Mirror pl.kernel's own core_map body EXCEPT the single output ref is initialized to `accum`
+  # (NOT lax.empty) so the kernel accumulates in place, leaving unwritten rows at their prior value.
+  # INLINE (no nested @jax.jit): a jax.jit(donate_argnums) wrapper leaks the donated accum Ref across
+  # the jit boundary ("mutable array references cannot be returned"); inlining keeps the Ref inside
+  # the ambient (outer MoE) trace, and `out_ref[...]` returns a plain value. Aliasing (accum buffer ->
+  # output, no copy) then comes from the outer jit's buffer reuse: accum is dead after this call (the
+  # barrier chain in chunked_ring_dispatch), so XLA reuses its storage in place -- the SAME mechanism
+  # that kept the rung-9 jnp.where flat. (Verified on v5p that the write is in-place, not a copy.)
+  arg_refs = _tree_util.tree_map(
+      jax_core.new_ref, (num_src_rows_per_row_partition, x, src_indices, dst_indices, topk_weights)
+  )
+  out_ref = jax_core.new_ref(accum)  # init to accum -> in-place accumulate (unwritten rows preserved)
 
-    @pl_core.core_map(
-        vector_mesh,
-        scratch_shapes=scratch,
-        compiler_params=pltpu.CompilerParams(**_COMPILER_PARAMS),
-        cost_estimate=cost,
-        name="sc_ragged_gather_reduce_accumulate",
-    )
-    def _(**scratch_kwrefs):
-      return body(*arg_refs, out_ref, **scratch_kwrefs)
+  @pl_core.core_map(
+      vector_mesh,
+      scratch_shapes=scratch,
+      compiler_params=pltpu.CompilerParams(**_COMPILER_PARAMS),
+      cost_estimate=cost,
+      name="sc_ragged_gather_reduce_accumulate",
+  )
+  def _(**scratch_kwrefs):
+    return body(*arg_refs, out_ref, **scratch_kwrefs)
 
-    return out_ref[...]
-
-  return _run(accum, num_src_rows_per_row_partition, x, src_indices, dst_indices, topk_weights)
+  return out_ref[...]
