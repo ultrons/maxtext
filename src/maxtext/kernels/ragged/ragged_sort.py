@@ -547,21 +547,44 @@ def chunked_ring_combine_reduce_scatter(
 
   slots_per_chunk = (num_tokens // n_chunks) * topk
   outs = []
+  prev_combined = None
   for c in range(n_chunks):
     s0, s1 = c * slots_per_chunk, (c + 1) * slots_per_chunk
+    ridx_c, w_c = ridx[s0:s1], w[s0:s1]
+    stl_c = sorted_tokens_local
+    if prev_combined is not None:
+      # UN-FUSE (profile forensics, v7x N=4): XLA horizontally fused the four per-chunk
+      # f32->bf16 convert+selects (inside ring_ragged_unsort's wrapper) into ONE multi-output
+      # fusion consuming all chunks' kernel outputs, so every chunk's reduce-scatter
+      # transitively depended on the LAST combine and all N RS starts batched after it --
+      # erasing the RS-under-next-combine overlap. Fence this chunk's INPUTS on the previous
+      # chunk's PRE-RS combined output: chunk c's convert then depends on chunk c-1's convert
+      # OUTPUT, so no single fusion can contain both, and the combines stay emission-ordered.
+      # Deliberately NOT fenced on any RS output (that would serialize the pipeline).
+      stl_c, ridx_c, w_c, _ = jax.lax.optimization_barrier((stl_c, ridx_c, w_c, prev_combined))
     # combine: FULL expert-sorted buffer in (unsliced), sliced indices/weights -> O(T/N)
-    # per-chunk kernel preprocessing; token-ordered chunk out (existing custom_vjp)
+    # per-chunk kernel preprocessing; token-ordered chunk out (existing custom_vjp).
+    # `combined` is already x.dtype: the f32->bf16 convert+select lives INSIDE
+    # ring_ragged_unsort (ragged_gather_reduce's wrapper), i.e. UPSTREAM of the barriers here.
     combined = ring_ragged_unsort(
-        sorted_tokens_local,
+        stl_c,
         group_sizes_local,
-        ridx[s0:s1],
+        ridx_c,
         topk,
         local_num_experts,
         ep_name,
-        topk_weights=w[s0:s1],
+        topk_weights=w_c,
         full_num_slots=full_num_slots,
         **unsort_kwargs,
     )
+    # Barrier the (already-converted) per-chunk output so nothing downstream is fused across
+    # chunks, and hand it DIRECTLY to this chunk's psum_scatter (structural separation: the
+    # convert's only consumer is chunk c's RS). CAVEAT: the production flag set carries
+    # xla_tpu_aggressive_opt_barrier_removal=true, which has stripped optimization_barriers
+    # before -- if the fusion re-appears in profiles, the chain above is the first suspect
+    # and flipping that flag off for this config is the fallback lever.
+    combined = jax.lax.optimization_barrier(combined)
+    prev_combined = combined
     # reduce-scatter the TOKEN-ordered chunk over the expert axis (auto bwd = all_gather)
     outs.append(jax.lax.psum_scatter(combined, ep_name, scatter_dimension=0, tiled=True))
   return jnp.concatenate(outs, axis=0)
