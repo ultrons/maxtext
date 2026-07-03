@@ -951,6 +951,21 @@ class MoEGeneral(BaseModel):
           "scan). Default False = byte-identical."
       ),
   )
+  moe_save_sort_indices: bool = Field(
+      False,
+      description=(
+          "DeepSeek MoE hand-written backward (requires moe_handwritten_bwd=True + use_ring_of_experts + "
+          "use_ragged_sort + sparse_matmul): DEVICE-SAVE the integer routing/sort tensors from the forward "
+          "(top-k expert indices, ragged-sort token order, per-expert group sizes, revert permutation; all "
+          "int32, replicated over the expert axis) through the custom_vjp residuals, so the backward's MoE "
+          "recompute SKIPS the top-k search and the two argsorts + one-hot group-size sum of the ragged "
+          "sort. The router weights (probs) are RE-DERIVED from the saved indices by a cheap take_along_axis "
+          "(kept differentiable, so the gate/router gradient path is unchanged -- saving the probs as "
+          "constants would zero it). Saved indices == recomputed indices exactly (deterministic routing) => "
+          "loss AND grads BIT-EXACT vs flag-off. Incompatible with decouple_dispatch_chunks>1 (the chunked "
+          "dispatch computes its sort internally). Default False = byte-identical."
+      ),
+  )
   moe_splash_offload_scheduling_group: bool = Field(
       False,
       description=(
@@ -2721,6 +2736,23 @@ class MaxTextConfig(
           "hand-written fused forward's custom_vjp residuals and consumes it in the hand-written fused "
           "backward. It has no effect on the autodiff path."
       )
+    if self.moe_save_sort_indices:
+      if not self.moe_handwritten_bwd:
+        raise ValueError(
+            "moe_save_sort_indices requires moe_handwritten_bwd=True: it saves the routing/sort index "
+            "tensors through the hand-written fused forward's custom_vjp residuals and consumes them in "
+            "the hand-written fused backward. It has no effect on the autodiff path."
+        )
+      if not (self.use_ring_of_experts and self.use_ragged_sort and self.sparse_matmul):
+        raise ValueError(
+            "moe_save_sort_indices requires use_ring_of_experts=True + use_ragged_sort=True + "
+            "sparse_matmul=True (the saved tensors are the ring ragged-sort's index bundle)."
+        )
+      if self.decouple_dispatch_chunks > 1:
+        raise ValueError(
+            "moe_save_sort_indices is incompatible with decouple_dispatch_chunks>1: the chunked dispatch "
+            "computes its sort indices internally, so the forward capture path is not wired for it."
+        )
     if self.custom_mesh_and_rule is not CustomRule.DEFAULT:
       custom_mesh_path = os.path.join(
           os.path.dirname(os.path.abspath(__file__)),

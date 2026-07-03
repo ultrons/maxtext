@@ -20,6 +20,26 @@ from maxtext.kernels.ragged.ragged_gather import ragged_gather
 from maxtext.kernels.ragged.ragged_gather_reduce import ragged_gather_reduce
 
 
+def compute_ring_sort_indices(topk_indices_local, num_experts, topk):
+  """The integer index bundle of ``ring_ragged_sort``'s forward, computed standalone.
+
+  Returns ``(token_indices_sorted, group_sizes_local, topk_argsort_revert_indices)`` --
+  exactly the tensors ``ring_ragged_sort`` derives internally from ``topk_indices_local``
+  (two argsorts + a one-hot group-size sum; all int32, data-independent of the hidden
+  states). Used by moe_save_sort_indices: the forward computes the bundle ONCE here,
+  feeds it to ``ring_ragged_sort(precomputed_sort=...)`` (bit-identical output), and
+  saves it so the hand-written backward's recompute skips these index computations.
+  """
+  num_tokens_local = topk_indices_local.shape[0]
+  topk_indices_flat = topk_indices_local.flatten()  # num_tokens_local x topk
+  topk_argsort_indices = jnp.argsort(topk_indices_flat)  # num_tokens_local x topk
+  token_indices = jnp.arange(num_tokens_local, dtype=jnp.int32).repeat(topk)  # num_tokens_local x topk
+  token_indices_sorted = token_indices[topk_argsort_indices]  # num_tokens_local x topk
+  group_sizes_local = jax.nn.one_hot(topk_indices_flat, num_experts, dtype=jnp.int32).sum(axis=0)  # GLOBAL_NUM_EXPERTS
+  topk_argsort_revert_indices = jnp.argsort(topk_argsort_indices)  # num_tokens_local x topk
+  return token_indices_sorted, group_sizes_local, topk_argsort_revert_indices
+
+
 def ring_ragged_sort(
     hidden_states_local,
     topk_indices_local,
@@ -34,6 +54,7 @@ def ring_ragged_sort(
     gather_reduce_flops_override=-1,
     gather_bytes_accessed_override=-1,
     gather_reduce_bytes_accessed_override=-1,
+    precomputed_sort=None,
 ):
   """Ragged-gather variant for AG-RS Expert Parallelism token routing.
 
@@ -72,26 +93,13 @@ def ring_ragged_sort(
       - 1D tensor ``topk_argsort_revert_indices`` for inverse routing.
   """
 
-  @jax.custom_vjp
-  def _ring_ragged_sort(hidden_states_local, topk_indices_local):
-    """Sort and gather activations to different EP shards."""
-    return _ring_ragged_sort_fwd(hidden_states_local, topk_indices_local)[0]
+  def _sorted_gather(hidden_states_local, token_indices_sorted, group_sizes_local):
+    """The data gather of the ring ragged sort, given the (int) sort bundle.
 
-  @jax.named_scope("ragged-sort-fwd")
-  def _ring_ragged_sort_fwd(hidden_states_local, topk_indices_local):
-    """Sort and gather activations forward pass."""
-
+    Returns ``(x, shard_output_start, shard_output_end, local_buffer_size)``; shared by the
+    stock forward (bundle computed in-line) and the precomputed_sort forward (bundle saved
+    from an earlier trace)."""
     num_tokens_local = hidden_states_local.shape[0]
-
-    topk_indices_flat = topk_indices_local.flatten()  # num_tokens_local x topk
-    topk_argsort_indices = jnp.argsort(topk_indices_flat)  # num_tokens_local x topk
-
-    token_indices = jnp.arange(num_tokens_local, dtype=jnp.int32).repeat(topk)  # num_tokens_local x topk
-    token_indices_sorted = token_indices[topk_argsort_indices]  # num_tokens_local x topk
-
-    group_sizes_local = jax.nn.one_hot(topk_indices_flat, num_experts, dtype=jnp.int32).sum(axis=0)  # GLOBAL_NUM_EXPERTS
-
-    topk_argsort_revert_indices = jnp.argsort(topk_argsort_indices)  # num_tokens_local x topk
     shard_idx = jax.lax.axis_index(ep_name)
 
     local_num_experts = num_experts // ep_size
@@ -135,6 +143,22 @@ def ring_ragged_sort(
           flops_override=gather_flops_override,
           bytes_accessed_override=gather_bytes_accessed_override,
       )
+    return x, shard_output_start, shard_output_end, local_buffer_size
+
+  @jax.custom_vjp
+  def _ring_ragged_sort(hidden_states_local, topk_indices_local):
+    """Sort and gather activations to different EP shards."""
+    return _ring_ragged_sort_fwd(hidden_states_local, topk_indices_local)[0]
+
+  @jax.named_scope("ragged-sort-fwd")
+  def _ring_ragged_sort_fwd(hidden_states_local, topk_indices_local):
+    """Sort and gather activations forward pass."""
+    token_indices_sorted, group_sizes_local, topk_argsort_revert_indices = compute_ring_sort_indices(
+        topk_indices_local, num_experts, topk
+    )
+    x, shard_output_start, shard_output_end, local_buffer_size = _sorted_gather(
+        hidden_states_local, token_indices_sorted, group_sizes_local
+    )
 
     out = (x, group_sizes_local, topk_argsort_revert_indices)
 
@@ -218,6 +242,45 @@ def ring_ragged_sort(
 
   _ring_ragged_sort.defvjp(_ring_ragged_sort_fwd, _ring_ragged_sort_bwd)
 
+  # precomputed_sort (moe_save_sort_indices): the int index bundle is an EXPLICIT custom_vjp
+  # input, never a closure -- in the hand-written backward it arrives as a residual-derived
+  # (scan-carried) tracer, and a custom_vjp closing over such a tracer hits the
+  # "No constant handler for DynamicJaxprTracer" constvar wall. Integer inputs get None
+  # cotangents; the hidden-states gradient is byte-for-byte the stock bwd (same residuals).
+  @jax.custom_vjp
+  def _ring_ragged_sort_pre(hidden_states_local, token_indices_sorted, group_sizes_local, topk_argsort_revert_indices):
+    return _ring_ragged_sort_pre_fwd(
+        hidden_states_local, token_indices_sorted, group_sizes_local, topk_argsort_revert_indices
+    )[0]
+
+  @jax.named_scope("ragged-sort-pre-fwd")
+  def _ring_ragged_sort_pre_fwd(
+      hidden_states_local, token_indices_sorted, group_sizes_local, topk_argsort_revert_indices
+  ):
+    x, shard_output_start, shard_output_end, local_buffer_size = _sorted_gather(
+        hidden_states_local, token_indices_sorted, group_sizes_local
+    )
+    out = (x, group_sizes_local, topk_argsort_revert_indices)
+    res = (
+        topk_argsort_revert_indices,
+        shard_output_start,
+        shard_output_end,
+        local_buffer_size,
+        hidden_states_local.shape,
+    )
+    return out, res
+
+  def _ring_ragged_sort_pre_bwd(res, g_out):
+    grad_hidden_states, _ = _ring_ragged_sort_bwd(res, g_out)
+    return grad_hidden_states, None, None, None
+
+  _ring_ragged_sort_pre.defvjp(_ring_ragged_sort_pre_fwd, _ring_ragged_sort_pre_bwd)
+
+  if precomputed_sort is not None:
+    token_indices_sorted, group_sizes_local, topk_argsort_revert_indices = precomputed_sort
+    return _ring_ragged_sort_pre(
+        hidden_states_local, token_indices_sorted, group_sizes_local, topk_argsort_revert_indices
+    )
   return _ring_ragged_sort(hidden_states_local, topk_indices_local)
 
 

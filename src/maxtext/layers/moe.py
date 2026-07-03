@@ -41,6 +41,7 @@ from maxtext.kernels.ragged.ragged_sort import a2a_ragged_sort
 from maxtext.kernels.ragged.ragged_sort import a2a_ragged_unsort
 from maxtext.kernels.ragged.ragged_sort import chunked_ring_combine_reduce_scatter
 from maxtext.kernels.ragged.ragged_sort import chunked_ring_dispatch
+from maxtext.kernels.ragged.ragged_sort import compute_ring_sort_indices
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_sort
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_unsort
 from maxtext.utils import max_logging
@@ -799,11 +800,23 @@ class RoutedMoE(nnx.Module):
     """
     return self.config.routed_bias and self.config.routed_bias_update_rate > 0.0 and not self.is_hash_routing
 
-  def get_topk(self, gate_logits, pre_bias_logits, rngs=None, input_ids=None):
-    """get topk."""
+  def get_topk(self, gate_logits, pre_bias_logits, rngs=None, input_ids=None, saved_indices=None):
+    """get topk.
+
+    ``saved_indices`` (moe_save_sort_indices): the FORWARD's top_k_indices, saved through the
+    hand-written backward's residuals. The index SEARCH (top_k / group masking / randint) is
+    skipped and the weights are RE-DERIVED from the live logits with the same take_along_axis
+    each routing mode uses -- identical values AND an identical (differentiable) gate-gradient
+    path, so loss and grads are bit-exact vs recomputing. (Saving the weights themselves as
+    constants would zero the gate/router gradient.)
+    """
     # shape of top_k_weights & top_k_indices:
     # (batch, sequence, num_experts_per_tok).
     if self.config.use_random_routing:
+      if saved_indices is not None:
+        # random_routing's weights are exactly take_along_axis(gate_logits, indices); mirror its
+        # early return (no scaling tail).
+        return jnp.take_along_axis(gate_logits, saved_indices, axis=-1), saved_indices
       if self.config.moe_routing_key_as_input:
         # Constant-seed key, derived in-scope (pure jax, no rng state): byte-identical when the MoE
         # is re-traced (e.g. a hand-written layer backward recomputing routing). Routing is frozen
@@ -817,7 +830,18 @@ class RoutedMoE(nnx.Module):
       top_k_weights, top_k_indices = random_routing(rng, gate_logits, self.num_experts_per_tok)
       return top_k_weights, top_k_indices
 
-    if self.is_hash_routing:
+    if saved_indices is not None:
+      top_k_indices = saved_indices
+      if self.is_hash_routing or self.config.model_name.startswith(("deepseek3", "deepseek4")):
+        # hash routing and deepseek_routing both weight via take_along_axis(pre_bias_logits, idx).
+        top_k_weights = jnp.take_along_axis(pre_bias_logits, top_k_indices, axis=-1)
+      elif self.config.decoder_block == ctypes.DecoderBlockType.GEMMA4:
+        router_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
+        top_k_weights = jnp.take_along_axis(router_probs, top_k_indices, axis=-1).astype(self.dtype)
+      else:
+        # jax.lax.top_k's values are gate_logits at the top-k indices, in index order.
+        top_k_weights = jnp.take_along_axis(gate_logits, top_k_indices, axis=-1)
+    elif self.is_hash_routing:
       if input_ids is None:
         raise ValueError("input_ids cannot be None when is_hash_routing is True")
       # Access the static routing table
@@ -951,6 +975,8 @@ class RoutedMoE(nnx.Module):
       roll_to_expert_id=None,
       input_ids=None,
       dispatch_x_is_local=False,
+      saved_sort=None,
+      sort_save_cell=None,
   ):
     """Permute tokens to group by expert to fit gmm call.
 
@@ -958,6 +984,13 @@ class RoutedMoE(nnx.Module):
     LOCAL x (routing tensors gate_logits/pre_bias_logits are still GLOBAL) and the ragged
     dispatch is done by `chunked_ring_dispatch`, which chunks the token AG internally. The GLOBAL
     token count then comes from gate_logits, not from the (local) inputs.
+
+    moe_save_sort_indices: `sort_save_cell` (a dict; forward CAPTURE) makes this compute the
+    ring-sort's int index bundle in-line, feed it to ring_ragged_sort(precomputed_sort=...)
+    (bit-identical output), and store `(top_k_indices, token_indices_sorted, group_sizes,
+    revert_indices)` in the cell. `saved_sort` (backward CONSUME) is that bundle: the top-k
+    search and the sort's argsorts/one-hot are skipped, weights are re-derived from the live
+    logits (differentiable; see get_topk). Only valid on the ring ragged-sort path.
     """
     # reshape inputs (batch, sequence, emb) to (batch * sequence, emb)
     inputs_shape = inputs.shape
@@ -969,7 +1002,9 @@ class RoutedMoE(nnx.Module):
       bsz_times_seq_len = gate_logits.shape[0] * gate_logits.shape[1]
     else:
       bsz_times_seq_len = inputs_shape[0] * inputs_shape[1]
-    weights, selected_experts = self.get_topk(gate_logits, pre_bias_logits, rngs, input_ids)
+    weights, selected_experts = self.get_topk(
+        gate_logits, pre_bias_logits, rngs, input_ids, saved_indices=None if saved_sort is None else saved_sort[0]
+    )
     lb_loss = None
     if self.config.load_balance_loss_weight > 0.0 and not self.is_hash_routing:
       softmax_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
@@ -1014,6 +1049,11 @@ class RoutedMoE(nnx.Module):
         buffer_size = None
 
       if dispatch_x_is_local:
+        if saved_sort is not None or sort_save_cell is not None:
+          raise ValueError(
+              "moe_save_sort_indices is not supported with the chunked dispatch "
+              "(decouple_dispatch_chunks>1): it computes its sort indices internally."
+          )
         # inputs_2d is the PRE-AG LOCAL x; chunk the token AG + ragged-sort (rung 9). buffer_size
         # is None here (gated to ragged_buffer_factor<=0), so the full-buffer path is used.
         sorted_inputs, group_size, sorted_selected_experts = chunked_ring_dispatch(
@@ -1032,6 +1072,17 @@ class RoutedMoE(nnx.Module):
             gather_reduce_bytes_accessed_override=self.config.ragged_gather_reduce_cost_estimate_bytes_accessed,
         )
       else:
+        precomputed_sort = None
+        if saved_sort is not None:
+          # BACKWARD CONSUME: the saved int bundle replaces the argsorts + one-hot group-size sum.
+          precomputed_sort = (saved_sort[1], saved_sort[2], saved_sort[3])
+        elif sort_save_cell is not None:
+          # FORWARD CAPTURE: compute the bundle in-line (bit-identical to the in-kernel
+          # computation) so it can be threaded out and saved as a residual.
+          precomputed_sort = compute_ring_sort_indices(
+              topk_indices_2d, self.config.num_experts, self.num_experts_per_tok
+          )
+          sort_save_cell["sort_bundle"] = (selected_experts,) + tuple(precomputed_sort)
         sorted_inputs, group_size, sorted_selected_experts = ring_ragged_sort(
             inputs_2d,
             topk_indices_2d,
@@ -1046,8 +1097,11 @@ class RoutedMoE(nnx.Module):
             gather_reduce_flops_override=self.config.ragged_gather_reduce_cost_estimate_flops,
             gather_bytes_accessed_override=self.config.ragged_gather_cost_estimate_bytes_accessed,
             gather_reduce_bytes_accessed_override=self.config.ragged_gather_reduce_cost_estimate_bytes_accessed,
+            precomputed_sort=precomputed_sort,
         )
     else:
+      if saved_sort is not None or sort_save_cell is not None:
+        raise ValueError("moe_save_sort_indices requires the ring ragged-sort path (use_ragged_sort + ring of experts).")
       flatten_selected_experts = jnp.ravel(selected_experts)
 
       if roll_to_expert_id is not None:
@@ -1406,6 +1460,8 @@ class RoutedMoE(nnx.Module):
       use_chunked_combine=True,
       use_chunked_dispatch=True,
       return_combine_token=False,
+      save_routing=False,
+      saved_routing=None,
   ):
     """Perform sparse matrix multiplication of inputs and Experts.
 
@@ -1418,6 +1474,16 @@ class RoutedMoE(nnx.Module):
     of the decoupled chunked combine, or None when the emitting path is inactive. Fencing a
     consumer (the shared-expert MLP input) on the token delays it until the combine phase has
     begun WITHOUT depending on any reduce-scatter.
+
+    moe_save_sort_indices: `save_routing` (static bool, forward) appends one more output -- a
+    tuple over moe_n_chunks of `(top_k_indices, token_indices_sorted, group_sizes, revert)`
+    int32 bundles (the ring ragged-sort's index computation, captured per chunk). All four are
+    REPLICATED over the expert axis (computed from the EP-all-gathered logits), so their
+    out_specs are the input batch spec MINUS the expert axis; group_sizes gets a leading
+    size-1 axis to carry its per-(data/fsdp)-shard values across the boundary. `saved_routing`
+    (backward recompute) feeds that bundle back in with the SAME specs: the recompute then
+    skips the top-k search and the sort's argsorts + one-hot group-size sum (weights are
+    re-derived differentiably; see get_topk/permute).
     """
     # Static gate for emitting the combine scheduling token: exactly the conditions under
     # which _moe_body takes the decoupled chunked-combine branch (plus moe_n_chunks <= 1:
@@ -1700,7 +1766,7 @@ class RoutedMoE(nnx.Module):
     ) = get_routed_moe_shardings(is_batch_sharded_by_expert, input_ids is not None)
     w0_pspec, w1_pspec, wo_pspec = maybe_aqt_partition(w0_kernel, w0_pspec, w1_kernel, w1_pspec, wo_kernel, wo_pspec)
 
-    def route(x, logits, pre_bias_logits, rngs, input_ids=None):
+    def route(x, logits, pre_bias_logits, rngs, input_ids=None, saved_sort=None, sort_save_cell=None):
       """Performs both across device and within device token routing/sorting"""
       num_ep = self.get_expert_parallelism_size()
       expert_shard_id = jax.lax.axis_index(self._expert_parallelism_name) if num_ep > 1 else 0
@@ -1760,9 +1826,13 @@ class RoutedMoE(nnx.Module):
             rngs=rngs,
             input_ids=input_ids,
             dispatch_x_is_local=chunk_dispatch,
+            saved_sort=saved_sort,
+            sort_save_cell=sort_save_cell,
         )
 
       else:
+        if saved_sort is not None or sort_save_cell is not None:
+          raise ValueError("moe_save_sort_indices requires use_ring_of_experts=True.")
         (
             x,
             sorted_selected_experts,
@@ -2016,9 +2086,15 @@ class RoutedMoE(nnx.Module):
           axis_name=self._expert_parallelism_name,
       )
 
-    def _moe_body(x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs):
+    def _moe_body(
+        x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs,
+        saved_sort=None, sort_save_cell=None,
+    ):
       batch_size, sequence_length, _ = x.shape
-      x, routing, route_metadata = route(x, logits, pre_bias_logits, rngs, input_ids=sharded_input_ids)
+      x, routing, route_metadata = route(
+          x, logits, pre_bias_logits, rngs, input_ids=sharded_input_ids,
+          saved_sort=saved_sort, sort_save_cell=sort_save_cell,
+      )
 
       if self.config.mlp_bias:
         w0_bias, w1_bias, wo_bias = self.transform_bias(routing.selected_experts, w0_bias, w1_bias, wo_bias)
@@ -2154,6 +2230,43 @@ class RoutedMoE(nnx.Module):
 
       return output, routing.lb_loss, routing.bias_updates
 
+    # moe_save_sort_indices: pspecs for the routing bundle crossing the shard_map boundary.
+    # All four tensors are computed from the EP-all-gathered logits -> REPLICATED over the
+    # expert axis, sharded over the remaining batch axes (so the fwd-out -> residual -> bwd-in
+    # round trip is a pure slice, no collectives). group_sizes ([num_experts] per shard, with
+    # per-(data/fsdp)-shard VALUES) crosses with a leading size-1 batch-carrier axis.
+    save_or_load_routing = save_routing or (saved_routing is not None)
+    routing_bundle_specs = None
+    if save_or_load_routing:
+      if not (self.config.use_ring_of_experts and self.config.use_ragged_sort):
+        raise ValueError("moe_save_sort_indices requires use_ring_of_experts=True and use_ragged_sort=True.")
+      _ep_axis = self._expert_parallelism_name
+
+      def _drop_ep(entry):
+        if isinstance(entry, (tuple, list)):
+          kept = tuple(a for a in entry if a != _ep_axis)
+          return kept if kept else None
+        return None if entry == _ep_axis else entry
+
+      _saved_batch = _drop_ep(gate_logits_pspec[0] if len(gate_logits_pspec) > 0 else None)
+      _saved_seq = gate_logits_pspec[1] if len(gate_logits_pspec) > 1 else None
+      routing_chunk_specs = (
+          P(_saved_batch, _saved_seq, None),  # top_k_indices [b, s_chunk, k]
+          P(_saved_batch),  # token_indices_sorted [b*s_chunk*k]
+          P(_saved_batch, None),  # group_sizes [1, num_experts] (leading batch-carrier axis)
+          P(_saved_batch),  # topk_argsort_revert_indices [b*s_chunk*k]
+      )
+      n_routing_chunks = self.config.moe_n_chunks if self.config.moe_n_chunks > 1 else 1
+      routing_bundle_specs = (routing_chunk_specs,) * n_routing_chunks
+
+    def _pack_routing_chunk(bundle):
+      sel, tis, gs, rev = bundle
+      return (sel, tis, gs[None], rev)
+
+    def _unpack_routing_chunk(bundle):
+      sel, tis, gs, rev = bundle
+      return (sel, tis, gs[0], rev)
+
     @functools.partial(
         jax.shard_map,
         mesh=self.mesh,
@@ -2169,6 +2282,7 @@ class RoutedMoE(nnx.Module):
             wo_bias_pspec,
             decoder_tokens_pspec,
             P(),  # Replicate the input key
+            routing_bundle_specs if saved_routing is not None else None,
         ),
         out_specs=(
             self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", "activation_embed")),
@@ -2180,11 +2294,13 @@ class RoutedMoE(nnx.Module):
         # never consumed (it only carries a scheduling dependency into an optimization_barrier)
         # and no resharding/collective is ever inserted on it. Requires check_vma=False, which
         # is forced anyway on the ring-of-experts path (see base.yml note on check_vma).
-        + ((P(),) if emit_combine_token else ()),
+        + ((P(),) if emit_combine_token else ())
+        # moe_save_sort_indices: per-chunk saved routing bundles (appended LAST).
+        + ((routing_bundle_specs,) if save_routing else ()),
         check_vma=self.config.check_vma,
     )
     def sparse_matmul_route_and_compute(
-        x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs
+        x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs, saved_routing_in
     ):
       # The expert weights (w0/w1/wo) are all-gathered over FSDP once at this
       # shard_map entry (implicitly, via the `embed_tensor_transpose` pspec which
@@ -2192,7 +2308,15 @@ class RoutedMoE(nnx.Module):
       # chunks of the ring-of-experts pipeline below.
       n_chunks = self.config.moe_n_chunks
       if n_chunks <= 1 or not self.config.use_ring_of_experts:
-        return _moe_body(x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs)
+        cell = {} if save_routing else None
+        saved_c = _unpack_routing_chunk(saved_routing_in[0]) if saved_routing_in is not None else None
+        result = _moe_body(
+            x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs,
+            saved_sort=saved_c, sort_save_cell=cell,
+        )
+        if save_routing:
+          return tuple(result) + ((_pack_routing_chunk(cell["sort_bundle"]),),)
+        return result
 
       # Chunked ring-of-experts pipeline: split the per-shard tokens along the
       # sequence dim into `n_chunks` data-independent chunks. Each chunk runs the
@@ -2205,7 +2329,7 @@ class RoutedMoE(nnx.Module):
       if seq_len % n_chunks != 0:
         raise ValueError(f"moe_n_chunks={n_chunks} must evenly divide the MoE sequence length {seq_len}.")
       chunk = seq_len // n_chunks
-      outs, lb_losses, bias_updates_list = [], [], []
+      outs, lb_losses, bias_updates_list, routing_bundles = [], [], [], []
       _prev = None
       for c in range(n_chunks):
         sl = slice(c * chunk, (c + 1) * chunk)
@@ -2215,6 +2339,8 @@ class RoutedMoE(nnx.Module):
         # unchanged (the barrier is identity), so loss stays bit-exact.
         if self.config.moe_chunk_barrier and _prev is not None:
           x_c, _prev = jax.lax.optimization_barrier((x_c, _prev))
+        cell = {} if save_routing else None
+        saved_c = _unpack_routing_chunk(saved_routing_in[c]) if saved_routing_in is not None else None
         out_c, lb_c, bu_c = _moe_body(
             x_c,
             logits[:, sl, :],
@@ -2227,15 +2353,21 @@ class RoutedMoE(nnx.Module):
             wo_bias,
             None if sharded_input_ids is None else sharded_input_ids[:, sl],
             rngs,
+            saved_sort=saved_c,
+            sort_save_cell=cell,
         )
         if self.config.moe_chunk_barrier:
           _prev = out_c
         outs.append(out_c)
         lb_losses.append(lb_c)
         bias_updates_list.append(bu_c)
+        if save_routing:
+          routing_bundles.append(_pack_routing_chunk(cell["sort_bundle"]))
       output = jnp.concatenate(outs, axis=1)
       lb_loss = None if lb_losses[0] is None else sum(lb_losses) / n_chunks
       bias_updates = None if bias_updates_list[0] is None else sum(bias_updates_list) / n_chunks
+      if save_routing:
+        return output, lb_loss, bias_updates, tuple(routing_bundles)
       return output, lb_loss, bias_updates
 
     if self.config.moe_fsdp_use_two_stage_all_gather:
@@ -2295,12 +2427,15 @@ class RoutedMoE(nnx.Module):
         wo_bias,
         input_ids,
         self.rngs,
+        saved_routing,
     )
-    if not return_combine_token:
-      return result
-    if emit_combine_token:
-      return result
-    return result + (None,)
+    if return_combine_token and not emit_combine_token:
+      # Insert the None combine token in its slot (before the routing bundle, if any).
+      if save_routing:
+        result = result[:-1] + (None,) + result[-1:]
+      else:
+        result = result + (None,)
+    return result
 
   def reshape_and_update_weights(self, weights, indices):
     """reshape and update weights."""
@@ -3040,6 +3175,8 @@ class RoutedMoE(nnx.Module):
       use_chunked_combine: bool = True,
       use_chunked_dispatch: bool = True,
       return_combine_token: bool = False,
+      save_routing: bool = False,
+      saved_routing=None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Executes the routed MoE block.
 
@@ -3105,6 +3242,8 @@ class RoutedMoE(nnx.Module):
     # The fused MoE kernel currently only supports standard Top-K routing with associated
     # weights. Hash routed layers bypass this kernel and fall back
     # to the sparse matmul implementation.
+    if (save_routing or saved_routing is not None) and not (cfg.attention != "vllm_rpa" and cfg.sparse_matmul):
+      raise ValueError("moe_save_sort_indices requires the sparse_matmul path (non-vllm_rpa).")
     if cfg.attention == "vllm_rpa" and not self.is_hash_routing:
       output, lb_loss, bias_updates = self.fused_moe_matmul(
           inputs, gate_logits, wo_kernel, w0_kernel=w0_kernel, w1_kernel=w1_kernel, fused_kernel=fused_kernel
@@ -3136,9 +3275,12 @@ class RoutedMoE(nnx.Module):
           use_chunked_combine=use_chunked_combine,
           use_chunked_dispatch=use_chunked_dispatch,
           return_combine_token=return_combine_token,
+          save_routing=save_routing,
+          saved_routing=saved_routing,
       )
-      # 3-tuple, or 4-tuple (with the combine scheduling token, possibly None) when
-      # return_combine_token=True (moe_shared_after_combine).
+      # 3-tuple, +combine scheduling token (possibly None) when return_combine_token=True
+      # (moe_shared_after_combine), +the per-chunk routing bundle LAST when save_routing=True
+      # (moe_save_sort_indices).
       return result
     else:
       output, lb_loss, bias_updates = self.dense_matmul(
@@ -3242,6 +3384,8 @@ class RoutedAndSharedMoE(nnx.Module):
       pregathered_weights: tuple | None = None,
       use_chunked_combine: bool = True,
       use_chunked_dispatch: bool = True,
+      save_routing: bool = False,
+      saved_routing=None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Executes both the routed experts and the shared expert block.
 
@@ -3259,27 +3403,26 @@ class RoutedAndSharedMoE(nnx.Module):
       the load balance loss, and any routed bias updates.
     """
     want_token = self.config.moe_shared_after_combine
+    result = self.routed_moe(
+        inputs,
+        gate_inputs=gate_inputs,
+        out_sharding=out_sharding,
+        input_ids=input_ids,
+        pregathered_weights=pregathered_weights,
+        use_chunked_combine=use_chunked_combine,
+        use_chunked_dispatch=use_chunked_dispatch,
+        return_combine_token=want_token,
+        save_routing=save_routing,
+        saved_routing=saved_routing,
+    )
+    # Unpack: (out, lb, bias) [+ combine_token if want_token] [+ routing bundle if save_routing].
+    routing_saved = None
+    if save_routing:
+      result, routing_saved = result[:-1], result[-1]
     if want_token:
-      routed_experts, load_balance_loss, moe_bias_updates, combine_token = self.routed_moe(
-          inputs,
-          gate_inputs=gate_inputs,
-          out_sharding=out_sharding,
-          input_ids=input_ids,
-          pregathered_weights=pregathered_weights,
-          use_chunked_combine=use_chunked_combine,
-          use_chunked_dispatch=use_chunked_dispatch,
-          return_combine_token=True,
-      )
+      routed_experts, load_balance_loss, moe_bias_updates, combine_token = result
     else:
-      routed_experts, load_balance_loss, moe_bias_updates = self.routed_moe(
-          inputs,
-          gate_inputs=gate_inputs,
-          out_sharding=out_sharding,
-          input_ids=input_ids,
-          pregathered_weights=pregathered_weights,
-          use_chunked_combine=use_chunked_combine,
-          use_chunked_dispatch=use_chunked_dispatch,
-      )
+      routed_experts, load_balance_loss, moe_bias_updates = result
       combine_token = None
     shared_input = inputs
     if combine_token is not None:
@@ -3295,6 +3438,8 @@ class RoutedAndSharedMoE(nnx.Module):
     shared_experts = self.shared_experts(
         shared_input, intermediate_sharding=intermediate_sharding, out_sharding=out_sharding
     )
+    if save_routing:
+      return routed_experts + shared_experts, load_balance_loss, moe_bias_updates, routing_saved
     return routed_experts + shared_experts, load_balance_loss, moe_bias_updates
 
 

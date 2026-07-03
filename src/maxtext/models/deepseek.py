@@ -729,7 +729,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
     def _attn(p, x_in, seg, pos, rest_):
       return _merge(p, rest_).self_attention_with_norm_op(x_in, seg, pos, det)  # (hidden, intermediate)
 
-    def _moe(p, hidden_states, intermediate_inputs, weights, rest_):
+    def _moe(p, hidden_states, intermediate_inputs, weights, rest_, saved_routing=None):
       # BACKWARD RECOMPUTE ONLY (called from fused_bwd below). By default
       # (moe_chunked_combine_in_remat=False) the recompute uses the UN-chunked combine even when
       # decouple_combine_rs_chunks>1: the chunked combine is numerically the same function, so
@@ -750,6 +750,9 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
           # numerically identical to the chunked dispatch's un-chunked backward, and unchunked keeps
           # the proven single ragged-sort). No in-remat flag yet (mirrors rung-6's hardcoded False).
           use_chunked_dispatch=False,
+          # moe_save_sort_indices: saved int routing bundle (from residuals) -> the recompute skips
+          # the top-k search + the ragged sort's argsorts/one-hot (weights re-derived, bit-exact).
+          saved_routing=saved_routing,
       )
       layer_output = m.dropout_op(mlp_lnx + intermediate_inputs, deterministic=det)
       return layer_output, load_balance_loss, moe_bias_updates
@@ -773,23 +776,32 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       splash_lse = wag_cell.get("splash_lse") if wag_cell is not None else None
       splash_out_spec = wag_cell.get("splash_out_spec") if wag_cell is not None else None
       splash_lse_spec = wag_cell.get("splash_lse_spec") if wag_cell is not None else None
-      mlp_lnx, load_balance_loss, moe_bias_updates = m.mlp_op(hidden_states, det, pregathered_weights=weights)
+      # moe_save_sort_indices (FORWARD capture): save_routing=True makes the MoE also return the
+      # per-chunk int routing/sort bundle, threaded out as a residual for the backward recompute.
+      if self.config.moe_save_sort_indices:
+        mlp_lnx, load_balance_loss, moe_bias_updates, routing_saved = m.mlp_op(
+            hidden_states, det, pregathered_weights=weights, save_routing=True
+        )
+      else:
+        mlp_lnx, load_balance_loss, moe_bias_updates = m.mlp_op(hidden_states, det, pregathered_weights=weights)
+        routing_saved = None
       layer_output = m.dropout_op(mlp_lnx + intermediate_inputs, deterministic=det)
       # splash_out/lse are None unless moe_splash_host_offload captured them above (extras, NOT part of
       # the differentiated output -- consumed only as host-offloaded residuals by fused_fwd/fused_bwd).
       # splash_out_spec/lse_spec are STATIC PartitionSpecs (the sharded specs for the host offload).
-      # hidden_states is returned so fused_fwd can DEVICE-SAVE it (moe_save_block_input) as a residual.
+      # hidden_states is returned so fused_fwd can DEVICE-SAVE it (moe_save_block_input) as a residual;
+      # routing_saved (None unless moe_save_sort_indices) is the int routing bundle to device-save.
       return (layer_output, load_balance_loss, moe_bias_updates,
-              splash_out, splash_lse, splash_out_spec, splash_lse_spec, hidden_states)
+              splash_out, splash_lse, splash_out_spec, splash_lse_spec, hidden_states, routing_saved)
 
     @jax.custom_vjp
     def fused(p, x_in):
-      layer_output, lbl, mbu, _so, _sl, _sos, _sls, _hs = _forward_once(p, x_in, rest_other)
+      layer_output, lbl, mbu, _so, _sl, _sos, _sls, _hs, _rs = _forward_once(p, x_in, rest_other)
       return layer_output, lbl, mbu
 
     def fused_fwd(p, x_in):
-      (layer_output, lbl, mbu, splash_out, splash_lse, splash_out_spec, splash_lse_spec,
-       hidden_fwd) = _forward_once(p, x_in, rest_other)
+      (layer_output, lbl, mbu, splash_out, splash_lse, splash_out_spec, splash_lse_spec, hidden_fwd,
+       routing_saved) = _forward_once(p, x_in, rest_other)
       out = (layer_output, lbl, mbu)
       # moe_splash_host_offload: OFFLOAD the captured splash (out=context, lse) to pinned_host so the
       # backward LOADS them instead of recomputing the splash forward (_attn). jax.device_put with a
@@ -819,9 +831,10 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       # o-proj/norm chain. Plain device residual (like x_in): the scan stacks [layers, ...] on device.
       saved_hidden = hidden_fwd if self.config.moe_save_block_input else None
       # Residuals: sharded params + decoder_layer_input + (seg, pos, rest_other) + host_splash +
-      # saved_hidden. seg/pos are closed over in the primal/fwd and read from residuals in the bwd (no
-      # tracer leak). host_splash (None unless host-offload) carries the pinned_host context+lse.
-      return out, (p, x_in, seg0, pos0, rest_other, host_splash, saved_hidden)
+      # saved_hidden + routing_saved. seg/pos are closed over in the primal/fwd and read from residuals
+      # in the bwd (no tracer leak). host_splash (None unless host-offload) carries the pinned_host
+      # context+lse; routing_saved (None unless moe_save_sort_indices) the int routing bundle.
+      return out, (p, x_in, seg0, pos0, rest_other, host_splash, saved_hidden, routing_saved)
 
     def _attn_host(p, x_in, seg, pos, rest_, host_out, host_lse):
       host_out_spec, host_lse_spec = _host_specs[0], _host_specs[1]
@@ -865,7 +878,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       return m.self_attention_with_norm_op(x_in, seg, pos, det, wag_cell=wag_cell)
 
     def fused_bwd(res, cotangents):
-      p, x_in, seg, pos, rest_, host_splash, saved_hidden = res
+      p, x_in, seg, pos, rest_, host_splash, saved_hidden, saved_routing = res
       # Re-tracing the bridged layer methods happens OUTSIDE the linen forward, so detach the
       # linen module stack to avoid the qwix-fixup None.path crash (see helper docstring).
       with _detached_linen_module_stack():
@@ -885,7 +898,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
           # dependency on the attention replay (only the final +intermediate_inputs add does).
           hidden_for_moe = saved_hidden if saved_hidden is not None else hidden_states
           _out, vjp_moe = jax.vjp(
-              lambda pp, hh, ii, ww: _moe(pp, hh, ii, ww, rest_), p, hidden_for_moe, intermediate_inputs, weights
+              lambda pp, hh, ii, ww: _moe(pp, hh, ii, ww, rest_, saved_routing), p, hidden_for_moe, intermediate_inputs, weights
           )
           dp_moe, d_hidden, d_inter, d_weights = vjp_moe(cotangents)
           (dp_gather,) = vjp_gather(d_weights)
@@ -909,7 +922,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
         # so the MoE recompute does not serially wait on the attention replay.
         hidden_for_moe = saved_hidden if saved_hidden is not None else hidden_states
         _out, vjp_moe = jax.vjp(
-            lambda pp, hh, ii, ww: _moe(pp, hh, ii, ww, rest_), p, hidden_for_moe, intermediate_inputs, weights
+            lambda pp, hh, ii, ww: _moe(pp, hh, ii, ww, rest_, saved_routing), p, hidden_for_moe, intermediate_inputs, weights
         )
         dp_moe, d_hidden, d_inter, d_weights = vjp_moe(cotangents)
         (dp_gather,) = vjp_gather(d_weights)
@@ -922,16 +935,32 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
     return fused(params, x)
 
   def mlp_op(
-      self, x, deterministic, *args, pregathered_weights=None, use_chunked_combine=True, use_chunked_dispatch=True, **kwargs
+      self,
+      x,
+      deterministic,
+      *args,
+      pregathered_weights=None,
+      use_chunked_combine=True,
+      use_chunked_dispatch=True,
+      save_routing=False,
+      saved_routing=None,
+      **kwargs,
   ):
-    mlp_lnx, load_balance_loss, moe_bias_updates = self.DeepSeekMoeBlock_0(
+    result = self.DeepSeekMoeBlock_0(
         x,
         intermediate_sharding=self.mlp_intermediate_sharding,
         out_sharding=self.out_sharding,
         pregathered_weights=pregathered_weights,
         use_chunked_combine=use_chunked_combine,
         use_chunked_dispatch=use_chunked_dispatch,
+        save_routing=save_routing,
+        saved_routing=saved_routing,
     )
+    if save_routing:
+      # moe_save_sort_indices: 4th element = the per-chunk int routing bundle (fwd capture).
+      mlp_lnx, load_balance_loss, moe_bias_updates, routing_saved = result
+      return self.with_logical_constraint(mlp_lnx), load_balance_loss, moe_bias_updates, routing_saved
+    mlp_lnx, load_balance_loss, moe_bias_updates = result
     return self.with_logical_constraint(mlp_lnx), load_balance_loss, moe_bias_updates
 
 

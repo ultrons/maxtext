@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU equivalence test: moe_save_block_input vs flag-off.
+"""CPU equivalence test: moe_save_block_input / moe_save_sort_indices vs flag-off.
 
 Loss must be BIT-EXACT everywhere, through the REAL model path: the DeepSeek MoE layer's
 fused custom_vjp (_handwritten_moe_layer) embedded in the decoder's nn.scan -- i.e. the
 exact scan(custom_vjp(...)) structure the flags' residual threading must survive (the
-"forward tracers via residuals, not closures" constvar wall). Grads: for moe_save_block_input within a ~1-ulp re-fusion
+"forward tracers via residuals, not closures" constvar wall). Grads: bit-exact for the
+int-only save (moe_save_sort_indices); for moe_save_block_input within a ~1-ulp re-fusion
 gate (see _BLOCK_INPUT_GRAD_ATOL -- the saved tensor itself is bit-identical to the
 replayed value; the wobble is XLA re-fusing the changed backward graph).
 
@@ -101,7 +102,11 @@ BASE = dict(
 # flags-off run in that mode; every flag-on run must match its mode's reference bit-exactly.
 CASES = {
     "random:save_block_input": dict(moe_save_block_input=True),
+    "random:save_sort_indices": dict(moe_save_sort_indices=True),
+    "random:both": dict(moe_save_block_input=True, moe_save_sort_indices=True),
     "real:save_block_input": dict(_real_routing=True, moe_save_block_input=True),
+    "real:save_sort_indices": dict(_real_routing=True, moe_save_sort_indices=True),
+    "real:both": dict(_real_routing=True, moe_save_block_input=True, moe_save_sort_indices=True),
 }
 
 _REAL_ROUTING_OVERRIDES = dict(use_random_routing=False, moe_routing_key_as_input=False)
@@ -170,7 +175,7 @@ def _loss_and_grads(cfg, variables, data, want_hlo=False):
 # recompute's input is a loop-carried residual instead of a locally computed value -> different
 # fusion/reduce orders for the same math) -- the same class as other fusion-affecting flags
 # (cf. moe_direct_rs's documented bf16 reduce-order equivalence). Cases that only save INT
-# routing tensors must be exactly bit-identical.
+# routing tensors (moe_save_sort_indices) must be exactly bit-identical, and are.
 _BLOCK_INPUT_GRAD_ATOL = 2e-9
 
 
