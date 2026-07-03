@@ -240,6 +240,7 @@ class DeepSeekGenericLayer(nnx.Module):
       deterministic,
       previous_chunk=None,
       slot: None | int = None,
+      wag_cell=None,
   ):
     """Executes the attention layer."""
     attention_result, _ = self.self_attention(
@@ -252,6 +253,7 @@ class DeepSeekGenericLayer(nnx.Module):
         out_sharding=self.out_sharding,
         previous_chunk=previous_chunk,
         slot=slot,
+        wag_cell=wag_cell,
     )
     return self.with_logical_constraint(attention_result)
 
@@ -299,6 +301,7 @@ class DeepSeekGenericLayer(nnx.Module):
       deterministic,
       previous_chunk=None,
       slot: None | int = None,
+      wag_cell=None,
   ):
     """self-attention with normalization"""
     if self.is_mhc_enabled:
@@ -324,6 +327,7 @@ class DeepSeekGenericLayer(nnx.Module):
           deterministic,
           previous_chunk,
           slot,
+          wag_cell=wag_cell,
       )
       intermediate_inputs = inputs + attention_lnx
     # Normalization
@@ -686,6 +690,12 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
     det = deterministic  # static python bool
     seg0, pos0 = decoder_segment_ids, decoder_positions
 
+    # moe_splash_host_offload: closure cell sharing the captured (static) splash out/lse PartitionSpecs
+    # from the forward to the backward (so the host->device load uses the same SHARDED spec, never
+    # replicated). PartitionSpecs are static (config-derived, identical every scan iteration) -> safe to
+    # close over; NOT threaded through residuals (a PartitionSpec is not a JAX array leaf).
+    _host_specs = [None, None]  # [out_spec, lse_spec]
+
     # Split the bridge nnx Rngs OUT (RngState filter) so the threaded `rest` carries NO rng key: an
     # rng key<urbg> in a custom_vjp residual escapes nn.scan (bridge OR a body-built dummy alike). We
     # capture only STATIC reconstruction specs (Variable types + metadata + treedef -- no bridge
@@ -753,26 +763,106 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       # attention) to preserve the hoist.
       m = _merge(p, rest_)
       weights = m.DeepSeekMoeBlock_0.gather_routed_weights()
-      hidden_states, intermediate_inputs = m.self_attention_with_norm_op(x_in, seg0, pos0, det)
+      # moe_splash_host_offload (FORWARD capture): pass a marked wag_cell so attention_op captures the
+      # splash (out, lse) into it (stock-splash save_residuals path). We read them back below and return
+      # them so fused_fwd can device_put them to pinned_host (the residuals the backward loads instead of
+      # recomputing the splash forward).
+      wag_cell = {"host_offload_fwd": True} if self.config.moe_splash_host_offload else None
+      hidden_states, intermediate_inputs = m.self_attention_with_norm_op(x_in, seg0, pos0, det, wag_cell=wag_cell)
+      splash_out = wag_cell.get("splash_out") if wag_cell is not None else None
+      splash_lse = wag_cell.get("splash_lse") if wag_cell is not None else None
+      splash_out_spec = wag_cell.get("splash_out_spec") if wag_cell is not None else None
+      splash_lse_spec = wag_cell.get("splash_lse_spec") if wag_cell is not None else None
       mlp_lnx, load_balance_loss, moe_bias_updates = m.mlp_op(hidden_states, det, pregathered_weights=weights)
       layer_output = m.dropout_op(mlp_lnx + intermediate_inputs, deterministic=det)
-      return layer_output, load_balance_loss, moe_bias_updates
+      # splash_out/lse are None unless moe_splash_host_offload captured them above (extras, NOT part of
+      # the differentiated output -- consumed only as host-offloaded residuals by fused_fwd/fused_bwd).
+      # splash_out_spec/lse_spec are STATIC PartitionSpecs (the sharded specs for the host offload).
+      return (layer_output, load_balance_loss, moe_bias_updates,
+              splash_out, splash_lse, splash_out_spec, splash_lse_spec)
 
     @jax.custom_vjp
     def fused(p, x_in):
-      return _forward_once(p, x_in, rest_other)
+      layer_output, lbl, mbu, _so, _sl, _sos, _sls = _forward_once(p, x_in, rest_other)
+      return layer_output, lbl, mbu
 
     def fused_fwd(p, x_in):
-      out = _forward_once(p, x_in, rest_other)
-      # Residuals: sharded params + decoder_layer_input + (seg, pos, rest_other). seg/pos are closed
-      # over in the primal/fwd and read from residuals in the bwd (no tracer leak).
-      return out, (p, x_in, seg0, pos0, rest_other)
+      layer_output, lbl, mbu, splash_out, splash_lse, splash_out_spec, splash_lse_spec = _forward_once(
+          p, x_in, rest_other
+      )
+      out = (layer_output, lbl, mbu)
+      # moe_splash_host_offload: OFFLOAD the captured splash (out=context, lse) to pinned_host so the
+      # backward LOADS them instead of recomputing the splash forward (_attn). jax.device_put with a
+      # pinned_host memory_kind on the array's OWN sharding => no reshard, just a device->host copy
+      # (HLO copy-start/copy-done). The scan accumulates one (out, lse) per layer on host. The host
+      # tensors are threaded through the custom_vjp residuals (NOT regular outputs -> not differentiated).
+      host_splash = None
+      if self.config.moe_splash_host_offload and splash_out is not None:
+        # Offload with the SHARDED NamedSharding (built from self.mesh + the captured pspec), NOT
+        # a.aval.sharding -- inside the scan/custom_vjp trace the aval sharding is REPLICATED, so a
+        # replicated device_put would put the full GLOBAL tensor on every device (HBM blowup). With the
+        # real sharded spec the host buffer is per-device-sharded; the scan accumulates [layers, <shard>]
+        # on pinned_host. memory_kind="pinned_host" => HLO copy-start/copy-done device->host.
+        _host_specs[0], _host_specs[1] = splash_out_spec, splash_lse_spec  # share to the bwd (static)
+
+        def _to_host(a, spec):
+          sh = jax.sharding.NamedSharding(self.mesh, spec).with_memory_kind("pinned_host")
+          return jax.device_put(a, sh)
+
+        host_splash = (
+            _to_host(splash_out, splash_out_spec),
+            _to_host(splash_lse, splash_lse_spec),
+        )
+      # Residuals: sharded params + decoder_layer_input + (seg, pos, rest_other) + host_splash. seg/pos
+      # are closed over in the primal/fwd and read from residuals in the bwd (no tracer leak).
+      # host_splash (None unless host-offload) carries the pinned_host context+lse.
+      return out, (p, x_in, seg0, pos0, rest_other, host_splash)
+
+    def _attn_host(p, x_in, seg, pos, rest_, host_out, host_lse):
+      host_out_spec, host_lse_spec = _host_specs[0], _host_specs[1]
+      # moe_splash_host_offload BACKWARD: re-trace the attention forward EXCEPT the splash kernel, whose
+      # output is the HOST-LOADED context. host_out/host_lse are device_put back to device (sharded, NOT
+      # replicated), then threaded into the attention via wag_cell["host_out"/"host_lse"]; attention_op's
+      # host-offload custom_vjp returns host_out as the splash output AND routes dq/dk/dv through the STOCK
+      # tokamax dkv fed host_lse (no splash forward rerun). The cheap QKV/out projections + norms ARE
+      # re-traced (their grad is exact); only the expensive splash forward compute is eliminated.
+      m = _merge(p, rest_)
+
+      def _back(a, spec):
+        sh = jax.sharding.NamedSharding(self.mesh, spec).with_memory_kind("device")
+        return jax.device_put(a, sh)
+
+      wag_cell = {
+          "host_out": _back(host_out, host_out_spec),
+          "host_lse": _back(host_lse, host_lse_spec),
+      }
+      return m.self_attention_with_norm_op(x_in, seg, pos, det, wag_cell=wag_cell)
 
     def fused_bwd(res, cotangents):
-      p, x_in, seg, pos, rest_ = res
+      p, x_in, seg, pos, rest_, host_splash = res
       # Re-tracing the bridged layer methods happens OUTSIDE the linen forward, so detach the
       # linen module stack to avoid the qwix-fixup None.path crash (see helper docstring).
       with _detached_linen_module_stack():
+        if self.config.moe_splash_host_offload and host_splash is not None:
+          # SPLASH HOST-OFFLOAD: NO splash-fwd recompute. _gather re-gathers w0/w1/wo (sole weight-grad
+          # path, unchanged). _attn_host replays attention with the LOADED context (host_out) + stock dkv
+          # (host_lse). MoE-bwd consumes the loaded hidden_states/intermediate_inputs (== forward values,
+          # since context was SAVED not recomputed -> bit-exact). Mirrors the hoist branch below but with
+          # the splash forward replaced by a host load.
+          host_out, host_lse = host_splash
+          weights, vjp_gather = jax.vjp(lambda pp: _gather(pp, rest_), p)
+          (hidden_states, intermediate_inputs), vjp_attn = jax.vjp(
+              lambda pp, xx: _attn_host(pp, xx, seg, pos, rest_, host_out, host_lse), p, x_in
+          )
+          _out, vjp_moe = jax.vjp(
+              lambda pp, hh, ii, ww: _moe(pp, hh, ii, ww, rest_), p, hidden_states, intermediate_inputs, weights
+          )
+          dp_moe, d_hidden, d_inter, d_weights = vjp_moe(cotangents)
+          (dp_gather,) = vjp_gather(d_weights)
+          dp_attn, dx = vjp_attn((d_hidden, d_inter))
+          # disjoint per-piece param cotangents (zeros elsewhere) -> sum reconstructs the full gradient.
+          dp = jax.tree.map(lambda a, b, c: a + b + c, dp_attn, dp_moe, dp_gather)
+          return dp, dx
         # 1) HOIST the weight re-gather to the attention INPUT (emit it BEFORE the attention
         # recompute), mirroring the forward's structural hoist that overlaps the gather with the QKV
         # matmuls. The re-gather depends only on p (independent of attention), so emitting it first

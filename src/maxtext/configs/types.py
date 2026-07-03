@@ -921,6 +921,22 @@ class MoEGeneral(BaseModel):
           "(reference)."
       ),
   )
+  moe_splash_host_offload: bool = Field(
+      False,
+      description=(
+          "DeepSeek MoE hand-written backward (requires moe_handwritten_bwd=True): ELIMINATE the splash "
+          "attention forward RECOMPUTE in the manual backward by HOST-OFFLOADING the splash output "
+          "(context, [batch,heads,seq,head_dim] bf16) + the log-sum-exp (lse) in the FORWARD and LOADING "
+          "them in the BACKWARD. fused_fwd captures the per-layer splash (out, lse) via the stock splash "
+          "save_residuals path, jax.device_put()s them to pinned_host, and threads them through the "
+          "custom_vjp residuals (the scan accumulates all layers on host). fused_bwd then does NOT rerun "
+          "the splash forward (_attn): it loads context for the MoE-backward input and computes the "
+          "attention grad (dq/dk/dv) via the STOCK tokamax dkv (_splash_attention_bwd_dkv) fed the loaded "
+          "lse + (Q,K,V). The cheap QKV/out projections + norms are still re-traced (only the expensive "
+          "splash kernel forward is skipped). Saving vs recomputing context is identity (deterministic "
+          "forward) => loss BIT-EXACT vs flag-off. Default False; flag OFF => byte-identical."
+      ),
+  )
   interleave_moe_layer_step: int = Field(1, description="Frequency of MoE layers, e.g., 2 means every 2nd layer is MoE.")
   moe_fsdp_use_two_stage_all_gather: bool = Field(
       False,
@@ -2665,6 +2681,12 @@ class MaxTextConfig(
     Computes all derived values and runs all cross-field validations after initial parsing.
     This logic is ported from the legacy pyconfig_deprecated.py system and adapted for Pydantic.
     """
+    if self.moe_splash_host_offload and not self.moe_handwritten_bwd:
+      raise ValueError(
+          "moe_splash_host_offload requires moe_handwritten_bwd=True: it host-offloads the splash output + "
+          "lse in the hand-written fused forward and loads them in the hand-written fused backward (replacing "
+          "the splash-fwd recompute). It has no effect on the autodiff path."
+      )
     if self.custom_mesh_and_rule is not CustomRule.DEFAULT:
       custom_mesh_path = os.path.join(
           os.path.dirname(os.path.abspath(__file__)),
