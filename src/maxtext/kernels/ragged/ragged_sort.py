@@ -489,6 +489,7 @@ def chunked_ring_combine_reduce_scatter(
     topk_weights,
     ep_size,
     n_chunks,
+    return_first_combine_token=False,
     **unsort_kwargs,
 ):
   """Decoupled chunked combine -> reduce-scatter (ring-of-experts).
@@ -530,7 +531,12 @@ def chunked_ring_combine_reduce_scatter(
   combine bwd, incl. the chunked-input grad scatter-back for buffer_size > n) +
   ``jax.lax.psum_scatter`` (auto all_gather-transpose bwd), so the gradient map is unchanged.
 
-  Returns ``[num_tokens // ep_size, hidden]`` (this shard's reduce-scattered slice).
+  Returns ``[num_tokens // ep_size, hidden]`` (this shard's reduce-scattered slice). With
+  ``return_first_combine_token=True``, additionally returns a tiny ``[1, 1]`` SCHEDULING TOKEN
+  sliced from the FIRST chunk's pre-RS combined output (moe_shared_after_combine): a consumer
+  fenced on the token cannot be scheduled before chunk 0's combine has produced its output,
+  but does NOT depend on any reduce-scatter -- used to push the shared-expert GMM into the
+  chunk-RS window instead of ahead of the combine phase.
   """
   num_tokens = topk_argsort_revert_indices.shape[0] // topk
   full_num_slots = topk_argsort_revert_indices.shape[0]
@@ -585,9 +591,16 @@ def chunked_ring_combine_reduce_scatter(
     # and flipping that flag off for this config is the fallback lever.
     combined = jax.lax.optimization_barrier(combined)
     prev_combined = combined
+    if c == 0 and return_first_combine_token:
+      # [1, 1] scheduling token: depends (through the barrier / the combine's data) on chunk
+      # 0's PRE-RS combined output only -- deliberately NOT on any psum_scatter.
+      first_combine_token = jax.lax.slice(combined, (0, 0), (1, 1))
     # reduce-scatter the TOKEN-ordered chunk over the expert axis (auto bwd = all_gather)
     outs.append(jax.lax.psum_scatter(combined, ep_name, scatter_dimension=0, tiled=True))
-  return jnp.concatenate(outs, axis=0)
+  out = jnp.concatenate(outs, axis=0)
+  if return_first_combine_token:
+    return out, first_combine_token
+  return out
 
 
 def a2a_ragged_sort(inputs, sort_indices, valid_end, enforce_gather_fallback=False, enforce_gather_reduce_fallback=False):

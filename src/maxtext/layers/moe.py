@@ -1259,13 +1259,31 @@ class RoutedMoE(nnx.Module):
       wo_bias,
       input_ids=None,
       use_chunked_combine=True,
+      return_combine_token=False,
   ):
     """Perform sparse matrix multiplication of inputs and Experts.
 
     `use_chunked_combine` (static bool) gates the decouple_combine_rs_chunks combine path; the
     moe_handwritten_bwd recompute passes False so the backward differentiates the un-chunked
     combine (forward-only chunking in rung 6).
+
+    `return_combine_token` (static bool, moe_shared_after_combine): when True, a 4th output is
+    returned -- a [1, 1] SCHEDULING TOKEN sliced from the first chunk's pre-RS combined output
+    of the decoupled chunked combine, or None when the emitting path is inactive. Fencing a
+    consumer (the shared-expert MLP input) on the token delays it until the combine phase has
+    begun WITHOUT depending on any reduce-scatter.
     """
+    # Static gate for emitting the combine scheduling token: exactly the conditions under
+    # which _moe_body takes the decoupled chunked-combine branch (plus moe_n_chunks <= 1:
+    # the chunked-body loop calls _moe_body once per sequence chunk and does not emit).
+    emit_combine_token = (
+        return_combine_token
+        and self.config.use_ring_of_experts
+        and self.config.decouple_combine_rs_chunks > 1
+        and use_chunked_combine
+        and isinstance(self._expert_parallelism_name, str)
+        and self.config.moe_n_chunks <= 1
+    )
 
     def jax_ragged_dot_gmm(inputs, kernel, tiling, group_sizes, expert_assignments, padding_amount):
       """Execute jax.lax.ragged_dot, with potential quantization"""
@@ -1858,6 +1876,7 @@ class RoutedMoE(nnx.Module):
             jnp.ravel(routing.weights).astype(jnp.float32),
             self.get_expert_parallelism_size(),
             self.config.decouple_combine_rs_chunks,
+            return_first_combine_token=emit_combine_token,
             enforce_gather_fallback=self.config.ragged_gather_fallback,
             enforce_gather_reduce_fallback=self.config.ragged_gather_reduce_fallback,
             gather_flops_override=self.config.ragged_gather_cost_estimate_flops,
@@ -1865,9 +1884,13 @@ class RoutedMoE(nnx.Module):
             gather_bytes_accessed_override=self.config.ragged_gather_cost_estimate_bytes_accessed,
             gather_reduce_bytes_accessed_override=self.config.ragged_gather_reduce_cost_estimate_bytes_accessed,
         )
+        if emit_combine_token:
+            output, combine_token = output
         output = output.reshape(
             -1, sequence_length, self.moe_expert_input_dim // self.get_tensor_parallelism_size()
         ).astype(self.dtype)
+        if emit_combine_token:
+          return output, routing.lb_loss, routing.bias_updates, combine_token
         return output, routing.lb_loss, routing.bias_updates
 
       if self.config.use_ring_of_experts:
@@ -1941,7 +1964,13 @@ class RoutedMoE(nnx.Module):
             self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", "activation_embed")),
             P(),  # Handle None or replicate the output
             P(),  # Handle None or replicate the output
-        ),
+        )
+        # [1, 1] combine SCHEDULING token (moe_shared_after_combine). P() types it replicated
+        # although each device holds its own shard's value -- safe because the token's VALUE is
+        # never consumed (it only carries a scheduling dependency into an optimization_barrier)
+        # and no resharding/collective is ever inserted on it. Requires check_vma=False, which
+        # is forced anyway on the ring-of-experts path (see base.yml note on check_vma).
+        + ((P(),) if emit_combine_token else ()),
         check_vma=self.config.check_vma,
     )
     def sparse_matmul_route_and_compute(
@@ -2044,7 +2073,7 @@ class RoutedMoE(nnx.Module):
     if wo_bias is not None:
       wo_bias = self._maybe_shard_with_pspec(wo_bias, wo_bias_pspec)
 
-    return sparse_matmul_route_and_compute(
+    result = sparse_matmul_route_and_compute(
         inputs,
         gate_logits,
         pre_bias_logits,
@@ -2057,6 +2086,11 @@ class RoutedMoE(nnx.Module):
         input_ids,
         self.rngs,
     )
+    if not return_combine_token:
+      return result
+    if emit_combine_token:
+      return result
+    return result + (None,)
 
   def reshape_and_update_weights(self, weights, indices):
     """reshape and update weights."""
@@ -2782,6 +2816,7 @@ class RoutedMoE(nnx.Module):
       out_sharding: NamedSharding | None = None,
       pregathered_weights: tuple | None = None,
       use_chunked_combine: bool = True,
+      return_combine_token: bool = False,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Executes the routed MoE block.
 
@@ -2864,7 +2899,7 @@ class RoutedMoE(nnx.Module):
             w1_bias,
             wo_bias,
         )
-      output, lb_loss, bias_updates = self.sparse_matmul(
+      result = self.sparse_matmul(
           inputs,
           gate_logits,
           pre_bias_logits,
@@ -2876,11 +2911,17 @@ class RoutedMoE(nnx.Module):
           wo_bias,
           input_ids,
           use_chunked_combine=use_chunked_combine,
+          return_combine_token=return_combine_token,
       )
+      # 3-tuple, or 4-tuple (with the combine scheduling token, possibly None) when
+      # return_combine_token=True (moe_shared_after_combine).
+      return result
     else:
       output, lb_loss, bias_updates = self.dense_matmul(
           inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias, input_ids
       )
+    if return_combine_token:
+      return output, lb_loss, bias_updates, None
     return output, lb_loss, bias_updates
 
 
@@ -2992,15 +3033,41 @@ class RoutedAndSharedMoE(nnx.Module):
       A tuple containing the combined MoE output (routed + shared),
       the load balance loss, and any routed bias updates.
     """
-    routed_experts, load_balance_loss, moe_bias_updates = self.routed_moe(
-        inputs,
-        gate_inputs=gate_inputs,
-        out_sharding=out_sharding,
-        input_ids=input_ids,
-        pregathered_weights=pregathered_weights,
-        use_chunked_combine=use_chunked_combine,
+    want_token = self.config.moe_shared_after_combine
+    if want_token:
+      routed_experts, load_balance_loss, moe_bias_updates, combine_token = self.routed_moe(
+          inputs,
+          gate_inputs=gate_inputs,
+          out_sharding=out_sharding,
+          input_ids=input_ids,
+          pregathered_weights=pregathered_weights,
+          use_chunked_combine=use_chunked_combine,
+          return_combine_token=True,
+      )
+    else:
+      routed_experts, load_balance_loss, moe_bias_updates = self.routed_moe(
+          inputs,
+          gate_inputs=gate_inputs,
+          out_sharding=out_sharding,
+          input_ids=input_ids,
+          pregathered_weights=pregathered_weights,
+          use_chunked_combine=use_chunked_combine,
+      )
+      combine_token = None
+    shared_input = inputs
+    if combine_token is not None:
+      # moe_shared_after_combine DEADLINE FENCE: tie the shared-expert MLP's input to the
+      # routed path's FIRST-chunk pre-RS combined output. The shared expert (dense TC GMM on
+      # every token, data-independent of the routed combine) is otherwise scheduled EARLY,
+      # leaving the chunk reduce-scatters exposed at layer-end with the TC idle; this fence
+      # forbids scheduling it before the combine phase begins, pushing it into the chunk-RS
+      # window. Deliberately NOT fenced on any RS output or on the routed output (either
+      # would serialize the pipeline). Identity on values -> bit-exact. Same caveat as the
+      # chunk barriers: xla_tpu_aggressive_opt_barrier_removal=true may strip this fence.
+      shared_input, _ = jax.lax.optimization_barrier((inputs, combine_token))
+    shared_experts = self.shared_experts(
+        shared_input, intermediate_sharding=intermediate_sharding, out_sharding=out_sharding
     )
-    shared_experts = self.shared_experts(inputs, intermediate_sharding=intermediate_sharding, out_sharding=out_sharding)
     return routed_experts + shared_experts, load_balance_loss, moe_bias_updates
 
 

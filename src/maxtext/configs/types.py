@@ -783,6 +783,16 @@ class MoEGeneral(BaseModel):
           "Single-axis `expert` only (skips when expert axis is a tuple). Requires use_ring_of_experts=True."
       ),
   )
+  moe_shared_after_combine: bool = Field(
+      False,
+      description=(
+          "Schedule the DeepSeek SHARED-expert MLP into the chunk reduce-scatter window (requires "
+          "decouple_combine_rs_chunks>1 + use_ring_of_experts, single-axis expert, moe_n_chunks<=1): fence the "
+          "shared-expert input on the routed path's FIRST-chunk pre-RS combined output via optimization_barrier, "
+          "so the data-independent shared GMM overlaps the exposed chunk reduce-scatters instead of running early. "
+          "Identity on values (bit-exact). No-op when the chunked-combine path is inactive."
+      ),
+  )
   moe_expert_input_dim: int = Field(
       -1,
       description="Dimension of tokens entering the MoE layer. If < 0, defaults to emb_dim.",
