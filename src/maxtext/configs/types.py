@@ -966,6 +966,26 @@ class MoEGeneral(BaseModel):
           "dispatch computes its sort internally). Default False = byte-identical."
       ),
   )
+  moe_direct_token_ag: bool = Field(
+      False,
+      description=(
+          "DeepSeek MoE hand-written backward (requires moe_handwritten_bwd=True + use_ring_of_experts + "
+          "sparse_matmul, single-axis expert parallelism): in the BACKWARD MoE recompute ONLY, run the EP "
+          "token/activation all-gather (the 'duplicate inputs to all expert shards' gather -- bf16"
+          "[tokens,embed], the big exposed one) with a direct-to-owner TensorCore Pallas all-gather "
+          "(_direct_all_gather, the symmetric counterpart of _direct_reduce_scatter) instead of the XLA "
+          "collective lax.all_gather. The XLA collective rides the SparseCore all-gather offload queue "
+          "(xla_tpu_use_single_sparse_core_for_all_gather_offload) and so SERIALIZES behind the SC-resident "
+          "backward weight re-gather; the Pallas kernel fires async ICI DMAs on the TensorCore, a different "
+          "engine, so XLA can OVERLAP the two. This is the cycle-SAFE placement lever (a prior "
+          "scheduling-group co-tag of the same two all-gathers hit a fundamental scheduling CYCLE). "
+          "Numerically == lax.all_gather (its custom_vjp gives the same psum_scatter transpose); the small "
+          "routing logits stay on the plain collective. Only the backward recompute is affected (forward "
+          "token-AG is untouched -- it is already hidden by the dispatch chunk pipeline). Default False => "
+          "byte-identical. RISK: on the TC the token-AG competes with the recompute GMMs rather than the SC "
+          "queue, so it can re-expose -- decide with a cluster A/B + xprof."
+      ),
+  )
   moe_bwd_xlayer_prefetch: bool = Field(
       False,
       description=(

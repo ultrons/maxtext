@@ -160,6 +160,105 @@ def _drs_bwd(mesh, ep_name, collective_id, sched_group, _res, ct):
 _direct_reduce_scatter.defvjp(_drs_fwd, _drs_bwd)
 
 
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3))
+def _direct_all_gather(x, mesh, ep_name, collective_id):
+  """Direct-to-owner Pallas all-gather over the EP axis -- a drop-in for
+  `jax.lax.all_gather(x, axis_name=ep_name, axis=0, tiled=True)`.
+
+  Symmetric counterpart of `_direct_reduce_scatter`: each device broadcasts its local shard to
+  slot `my` in every EP peer's output buffer (pure async ICI DMA on the TensorCore), and receives
+  every peer d's shard into slot d; the [ep_size, chunk, ...] receive buffer is then reshaped to
+  the [ep_size*chunk, ...] concatenation lax.all_gather(tiled=True, axis=0) produces. Because it is
+  a TC Pallas kernel firing async ICI copies -- NOT an XLA collective -- it (a) does NOT ride the
+  SparseCore offload queue that (with the single-SC-for-all-gather-offload path) serializes the EP
+  token all-gather behind the SC-resident weight re-gather in the backward MoE recompute, so XLA
+  can overlap its ICI DMAs with that SC work (different engines), and (b) is immune to the
+  async-collective continuation-fusion restrictions the psum_scatter/all_gather collectives hit.
+  Prototype provenance: perf-drills/gather/weight_ag.py (TC-AG ∥ SC-dispatch-gather MECHANISM
+  proof, v5p: correctness == lax.all_gather + measured overlap where the XLA collective did not).
+
+  MUST be called INSIDE the MoE shard_map so the ambient mesh axes are available to
+  `lax.axis_index`. `collective_id` selects the barrier semaphore: it must be DISTINCT from every
+  concurrently in-flight direct-RS id (the RS uses 7..7+chunks) so an in-flight RS and AG never
+  count each other's entry-barrier signals. Single-axis EP only (ep_name a str); the caller falls
+  back to lax.all_gather otherwise.
+  """
+  ep_size = mesh.shape[ep_name]
+  axis_names = mesh.axis_names
+  mesh_shape = mesh.shape
+  chunk = x.shape[0]
+  trailing = tuple(x.shape[1:])
+
+  def _mesh_device_id(ep_rank):
+    # Full mesh-coordinate tuple in mesh.axis_names ORDER (identical convention to the direct-RS):
+    # `ep_rank` in the expert slot, every other axis pinned to its current axis_index.
+    return tuple(
+        ep_rank if nm == ep_name else (0 if mesh_shape[nm] == 1 else jax.lax.axis_index(nm)) for nm in axis_names
+    )
+
+  def _kern(x_ref, o_ref, send, recv):
+    my = jax.lax.axis_index(ep_name)
+    # Full EP-group barrier (collective_id on the pallas_call enables the barrier sem).
+    bsem = pltpu.get_barrier_semaphore()
+    for c in range(ep_size):
+      pltpu.semaphore_signal(bsem, inc=1, device_id=_mesh_device_id(c), device_id_type=pl.DeviceIdType.MESH)
+    pltpu.semaphore_wait(bsem, ep_size)
+    sends = []
+    for c in range(ep_size):  # broadcast my shard -> slot `my` in every peer c's buffer
+      cp = pltpu.make_async_remote_copy(
+          x_ref,
+          o_ref.at[my],
+          send.at[c],
+          recv.at[my],
+          device_id=_mesh_device_id(c),
+          device_id_type=pl.DeviceIdType.MESH,
+      )
+      cp.start()
+      sends.append(cp)
+    for d in range(ep_size):  # receive peer d's shard into slot d
+      pltpu.make_async_remote_copy(
+          x_ref,
+          o_ref.at[d],
+          send.at[d],
+          recv.at[d],
+          device_id=_mesh_device_id(d),
+          device_id_type=pl.DeviceIdType.MESH,
+      ).wait_recv()
+    for cp in sends:
+      cp.wait_send()
+
+  recv = pl.pallas_call(
+      _kern,
+      out_shape=jax.ShapeDtypeStruct((ep_size, chunk) + trailing, x.dtype),
+      in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
+      out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+      scratch_shapes=[pltpu.SemaphoreType.DMA((ep_size,)), pltpu.SemaphoreType.DMA((ep_size,))],
+      compiler_params=pltpu.CompilerParams(collective_id=collective_id),
+  )(x)
+  return recv.reshape((ep_size * chunk,) + trailing)
+
+
+# The Pallas kernel is opaque to autodiff. Give it the SAME differentiation as the `lax.all_gather`
+# it replaces: the transpose of a tiled all-gather over EP (scatter/gather dim 0) is a tiled
+# reduce-scatter over EP. Forward values are verified == lax.all_gather, so fwd+bwd match. The bwd
+# is PURE XLA (psum_scatter) -- no SC Pallas in the custom_vjp bwd, so no "No constant handler" wall.
+def _dag_fwd(x, mesh, ep_name, collective_id):
+  return _direct_all_gather(x, mesh, ep_name, collective_id), None
+
+
+def _dag_bwd(mesh, ep_name, collective_id, _res, ct):
+  return (jax.lax.psum_scatter(ct, ep_name, scatter_dimension=0, tiled=True),)
+
+
+_direct_all_gather.defvjp(_dag_fwd, _dag_bwd)
+
+# Barrier-semaphore collective_id for the backward-recompute direct token all-gather. Held clear of
+# the direct-RS ids (7..7+decouple_combine_rs_chunks, realistically <=~23) so an in-flight RS and AG
+# never share an entry barrier. (The token-AG is dispatch-phase and the RS is combine-phase, so they
+# are not concurrently in flight anyway; this is belt-and-suspenders.)
+_DIRECT_TOKEN_AG_COLLECTIVE_ID = 40
+
+
 def _scheduling_group(group_id):
   """Tag enclosed ops with an XLA `_scheduling_group_id`.
 
@@ -1462,6 +1561,7 @@ class RoutedMoE(nnx.Module):
       return_combine_token=False,
       save_routing=False,
       saved_routing=None,
+      bwd_direct_token_ag=False,
   ):
     """Perform sparse matrix multiplication of inputs and Experts.
 
@@ -1795,6 +1895,21 @@ class RoutedMoE(nnx.Module):
         )
         if chunk_dispatch:
           # Gather ONLY the routing tensors; keep x LOCAL (its AG is chunked in permute).
+          logits, pre_bias_logits = tuple(
+              jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True)
+              for z in (logits, pre_bias_logits)
+          )
+        elif bwd_direct_token_ag and isinstance(self._expert_parallelism_name, str):
+          # moe_direct_token_ag (BACKWARD RECOMPUTE only, gated): all-gather the EP token/activation
+          # `x` (bf16[tokens,embed], the big exposed gather) with the direct-to-owner TC Pallas
+          # kernel instead of the XLA collective, so it rides the TensorCore ICI DMAs -- NOT the
+          # SparseCore offload queue that serializes lax.all_gather behind the SC-resident weight
+          # re-gather -- letting XLA overlap the two (different engines). Numerically ==
+          # lax.all_gather (verified in isolation); its custom_vjp gives the same psum_scatter
+          # transpose the collective would. The small routing logits stay on the plain collective.
+          # Flag-off (bwd_direct_token_ag=False, and the whole forward) takes the tuple gather below
+          # => byte-identical.
+          x = _direct_all_gather(x, self.mesh, self._expert_parallelism_name, _DIRECT_TOKEN_AG_COLLECTIVE_ID)
           logits, pre_bias_logits = tuple(
               jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True)
               for z in (logits, pre_bias_logits)
@@ -3236,6 +3351,7 @@ class RoutedMoE(nnx.Module):
       return_combine_token: bool = False,
       save_routing: bool = False,
       saved_routing=None,
+      bwd_direct_token_ag: bool = False,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Executes the routed MoE block.
 
@@ -3336,6 +3452,7 @@ class RoutedMoE(nnx.Module):
           return_combine_token=return_combine_token,
           save_routing=save_routing,
           saved_routing=saved_routing,
+          bwd_direct_token_ag=bwd_direct_token_ag,
       )
       # 3-tuple, +combine scheduling token (possibly None) when return_combine_token=True
       # (moe_shared_after_combine), +the per-chunk routing bundle LAST when save_routing=True
@@ -3450,6 +3567,7 @@ class RoutedAndSharedMoE(nnx.Module):
       use_chunked_dispatch: bool = True,
       save_routing: bool = False,
       saved_routing=None,
+      bwd_direct_token_ag: bool = False,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Executes both the routed experts and the shared expert block.
 
@@ -3478,6 +3596,7 @@ class RoutedAndSharedMoE(nnx.Module):
         return_combine_token=want_token,
         save_routing=save_routing,
         saved_routing=saved_routing,
+        bwd_direct_token_ag=bwd_direct_token_ag,
     )
     # Unpack: (out, lb, bias) [+ combine_token if want_token] [+ routing bundle if save_routing].
     routing_saved = None

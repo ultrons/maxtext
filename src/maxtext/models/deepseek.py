@@ -783,6 +783,10 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
           # moe_save_sort_indices: saved int routing bundle (from residuals) -> the recompute skips
           # the top-k search + the ragged sort's argsorts/one-hot (weights re-derived, bit-exact).
           saved_routing=saved_routing,
+          # moe_direct_token_ag: run THIS recompute's EP token all-gather on the TensorCore (direct-AG
+          # Pallas kernel) instead of the SC-offloaded XLA collective, so it overlaps the SC weight
+          # re-gather. BACKWARD RECOMPUTE ONLY. False (flag-off) => byte-identical.
+          bwd_direct_token_ag=getattr(self.config, "moe_direct_token_ag", False),
       )
       layer_output = m.dropout_op(mlp_lnx + intermediate_inputs, deterministic=det)
       return layer_output, load_balance_loss, moe_bias_updates
@@ -1005,6 +1009,8 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
         mlp_lnx, load_balance_loss, moe_bias_updates = m.mlp_op(
             hidden_states, det, pregathered_weights=weights,
             use_chunked_combine=self.config.moe_chunked_combine_in_remat, use_chunked_dispatch=False,
+            # moe_direct_token_ag: TC direct-AG for this recompute's EP token gather (see _moe). Bwd only.
+            bwd_direct_token_ag=getattr(self.config, "moe_direct_token_ag", False),
         )
         layer_output = m.dropout_op(mlp_lnx + intermediate_inputs, deterministic=det)
         return layer_output, load_balance_loss, moe_bias_updates
@@ -1105,6 +1111,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       use_chunked_dispatch=True,
       save_routing=False,
       saved_routing=None,
+      bwd_direct_token_ag=False,
       **kwargs,
   ):
     result = self.DeepSeekMoeBlock_0(
@@ -1116,6 +1123,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
         use_chunked_dispatch=use_chunked_dispatch,
         save_routing=save_routing,
         saved_routing=saved_routing,
+        bwd_direct_token_ag=bwd_direct_token_ag,
     )
     if save_routing:
       # moe_save_sort_indices: 4th element = the per-chunk int routing bundle (fwd capture).
