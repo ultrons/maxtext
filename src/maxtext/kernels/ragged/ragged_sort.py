@@ -573,6 +573,7 @@ def chunked_ring_combine_reduce_scatter(
     n_chunks,
     return_first_combine_token=False,
     reduce_scatter_fn=None,
+    all_gather_fn=None,
     **unsort_kwargs,
 ):
   """Decoupled chunked combine -> reduce-scatter (ring-of-experts).
@@ -771,7 +772,17 @@ def chunked_ring_combine_reduce_scatter(
     # (shard, chunk) row map into the bwd gather's token indices: pure int arithmetic on the
     # index array, zero extra HBM buffers. The gather reads the IDENTICAL rows it read from
     # the per-chunk concat -- bit-identical grads at single-large-AG cost.
-    g_full = jax.lax.all_gather(g_out, ep_name, axis=0, tiled=True)  # [num_tokens, hidden]
+    #
+    # all_gather_fn (moe_direct_combine_ag): drop-in replacement for the tiled EP all_gather -- a
+    # single-arg callable that runs the direct-to-owner TC Pallas all-gather (_direct_all_gather in
+    # moe.py) instead of the XLA collective, so this big exposed combine-cotangent AG (== .626)
+    # rides the TensorCore ICI DMAs rather than the SparseCore all-gather-offload queue and XLA can
+    # overlap it with the SC combine work. Numerically == lax.all_gather (bf16). None (flag-off) =>
+    # the plain collective, byte-identical.
+    if all_gather_fn is None:
+      g_full = jax.lax.all_gather(g_out, ep_name, axis=0, tiled=True)  # [num_tokens, hidden]
+    else:
+      g_full = all_gather_fn(g_out)  # [num_tokens, hidden]
 
     def _bwd_ag_row(tok):  # permuted-order token t -> its row in the SHARD-major AG output
       if n_chunks == 1 or ep_size == 1:

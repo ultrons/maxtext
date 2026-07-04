@@ -171,11 +171,15 @@ def _direct_all_gather(x, mesh, ep_name, collective_id):
   the [ep_size*chunk, ...] concatenation lax.all_gather(tiled=True, axis=0) produces. Because it is
   a TC Pallas kernel firing async ICI copies -- NOT an XLA collective -- it (a) does NOT ride the
   SparseCore offload queue that (with the single-SC-for-all-gather-offload path) serializes the EP
-  token all-gather behind the SC-resident weight re-gather in the backward MoE recompute, so XLA
-  can overlap its ICI DMAs with that SC work (different engines), and (b) is immune to the
-  async-collective continuation-fusion restrictions the psum_scatter/all_gather collectives hit.
-  Prototype provenance: perf-drills/gather/weight_ag.py (TC-AG ∥ SC-dispatch-gather MECHANISM
-  proof, v5p: correctness == lax.all_gather + measured overlap where the XLA collective did not).
+  backward EP all-gather (either the token/activation gather -- moe_direct_token_ag -- or the
+  combine-cotangent all-gather == all-gather.626, the transpose of the direct-RS -- moe_direct_combine_ag)
+  behind the SC-resident weight re-gather / combines in the backward, so XLA can overlap its ICI DMAs
+  with that SC work (different engines), and (b) is immune to the async-collective continuation-fusion
+  restrictions the psum_scatter/all_gather collectives hit. Prototype provenance:
+  perf-drills/gather/weight_ag.py (TC-AG ∥ SC-gather MECHANISM proof, v5p: correctness ==
+  lax.all_gather + measured overlap where the XLA collective did not). Shared by both direct-AG
+  call sites; each passes its own DISTINCT collective_id (40 token / 50 combine) so two in-flight
+  instances never share an entry-barrier semaphore.
 
   MUST be called INSIDE the MoE shard_map so the ambient mesh axes are available to
   `lax.axis_index`. `collective_id` selects the barrier semaphore: it must be DISTINCT from every
@@ -252,11 +256,14 @@ def _dag_bwd(mesh, ep_name, collective_id, _res, ct):
 
 _direct_all_gather.defvjp(_dag_fwd, _dag_bwd)
 
-# Barrier-semaphore collective_id for the backward-recompute direct token all-gather. Held clear of
-# the direct-RS ids (7..7+decouple_combine_rs_chunks, realistically <=~23) so an in-flight RS and AG
-# never share an entry barrier. (The token-AG is dispatch-phase and the RS is combine-phase, so they
-# are not concurrently in flight anyway; this is belt-and-suspenders.)
-_DIRECT_TOKEN_AG_COLLECTIVE_ID = 40
+# Barrier-semaphore collective_ids for the two BACKWARD direct all-gather call sites. Both are held
+# clear of the direct-RS ids (7..7+decouple_combine_rs_chunks, realistically <=~23) so an in-flight
+# RS and either AG never share an entry barrier, and they are DISTINCT from EACH OTHER (40 vs 50) so
+# a token-AG and a combine-AG that happen to be in flight together never count each other's barrier
+# signals. (In practice token-AG is dispatch-phase and combine-AG is combine-phase, so they are not
+# concurrently in flight anyway; distinct ids are belt-and-suspenders.)
+_DIRECT_TOKEN_AG_COLLECTIVE_ID = 40  # moe_direct_token_ag: backward-recompute EP token all-gather
+_DIRECT_COMBINE_AG_COLLECTIVE_ID = 50  # moe_direct_combine_ag: backward combine-cotangent all-gather (== .626)
 
 
 def _scheduling_group(group_id):
@@ -2257,6 +2264,20 @@ class RoutedMoE(nnx.Module):
             # (only relevant when moe_chunked_combine_in_remat differentiates the chunked combine).
             return _direct_reduce_scatter(x, _mesh, "expert", 7 + chunk_idx, _splash_off_sg)
 
+        ag_fn = None
+        if self.config.moe_direct_combine_ag and self._expert_parallelism_name == "expert":
+          _mesh_ag = self.mesh
+
+          def ag_fn(g_out):
+            # moe_direct_combine_ag (BACKWARD combine-cotangent only, gated): all-gather the whole
+            # contiguous g_out (bf16[num_tokens, hidden], == all-gather.626, the big exposed backward
+            # gather) with the direct-to-owner TC Pallas kernel instead of the XLA collective, so it
+            # rides the TensorCore ICI DMAs -- NOT the SparseCore all-gather-offload queue that
+            # serializes lax.all_gather behind the SC combines -- letting XLA overlap the two
+            # (different engines). Numerically == lax.all_gather (verified in isolation); its
+            # custom_vjp gives the same psum_scatter transpose the collective would.
+            return _direct_all_gather(g_out, _mesh_ag, "expert", _DIRECT_COMBINE_AG_COLLECTIVE_ID)
+
         output = chunked_ring_combine_reduce_scatter(
             intermediate_output,
             routing.group_sizes,
@@ -2269,6 +2290,7 @@ class RoutedMoE(nnx.Module):
             self.config.decouple_combine_rs_chunks,
             return_first_combine_token=emit_combine_token,
             reduce_scatter_fn=drs_fn,
+            all_gather_fn=ag_fn,
             enforce_gather_fallback=self.config.ragged_gather_fallback,
             enforce_gather_reduce_fallback=self.config.ragged_gather_reduce_fallback,
             gather_flops_override=self.config.ragged_gather_cost_estimate_flops,

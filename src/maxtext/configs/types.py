@@ -827,6 +827,19 @@ class MoEGeneral(BaseModel):
           "(bf16 reduce-order, rel ~0.004); custom_vjp bwd = tiled all-gather. Default False = psum_scatter."
       ),
   )
+  moe_direct_combine_ag: bool = Field(
+      False,
+      description=(
+          "Ring-of-experts only, plain 'expert' EP axis. When True, replace the BACKWARD combine-cotangent "
+          "`jax.lax.all_gather` (the transpose of the combine reduce-scatter, == all-gather.626 in "
+          "chunked-combine-rs-bwd) with a direct-to-owner Pallas all-gather (_direct_all_gather, TC async "
+          "ICI DMA -- the symmetric counterpart of moe_direct_rs) so it neither queues behind the "
+          "SparseCore all-gather-offload collectives (xla_tpu_use_single_sparse_core_for_all_gather_offload) "
+          "nor hits the async-collective continuation-fusion restrictions. Numerically == lax.all_gather "
+          "(bf16, verified in isolation); custom_vjp bwd = psum_scatter (all_gather's transpose). Applies "
+          "to the decouple_combine_rs_chunks memory-flat backward. Default False = unchanged lax.all_gather."
+      ),
+  )
   moe_expert_input_dim: int = Field(
       -1,
       description="Dimension of tokens entering the MoE layer. If < 0, defaults to emb_dim.",
