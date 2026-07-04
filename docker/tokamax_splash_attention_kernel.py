@@ -428,9 +428,41 @@ def flash_attention_kernel(
       k = k_ref[:, slice_k]
       qk_dims = NN_DIM_NUMBERS
 
-    qk_flat = lax.dot_general(
-        q_flat, k, qk_dims, preferred_element_type=float32
-    )
+    _g = config.qk_diag_grid
+    if (
+        config.qk_diag_skip
+        and has_partial_mask
+        and num_stacked_q_heads == 1
+        and config.k_layout == HEAD_DIM_MINOR
+        and bq % _g == 0
+        and bkv_compute % _g == 0
+    ):
+      # FORWARD diagonal skip: qk tile is [q, kv]. On an aligned square diagonal
+      # block, sub-tile (q-band qi, kv-band kj) with kj > qi is fully above the
+      # causal boundary (kv > q) -> masked to mask_value anyway -> skip its matmul.
+      # Writing the mask_value CONSTANT (not a runtime jnp.where) lets Mosaic
+      # constant-fold exp(mask_value - m) -> 0 and delete the softmax/exp on the
+      # masked triangle (the forward is VPU/softmax-bound, so this is the bigger win).
+      sq = bq // _g
+      sk = bkv_compute // _g
+      q_parts = [q_flat[i * sq:(i + 1) * sq, :] for i in range(_g)]
+      k_parts = [k[j * sk:(j + 1) * sk, :] for j in range(_g)]
+      rows = []
+      for qi in range(_g):  # q row-band
+        cols = []
+        for kj in range(_g):  # kv col-band
+          if kj > qi:  # fully masked -> skip matmul
+            cols.append(jnp.full((sq, sk), mask_value, dtype=float32))
+          else:
+            cols.append(lax.dot_general(
+                q_parts[qi], k_parts[kj], qk_dims, preferred_element_type=float32
+            ))
+        rows.append(jnp.concatenate(cols, axis=1))
+      qk_flat = jnp.concatenate(rows, axis=0)
+    else:
+      qk_flat = lax.dot_general(
+          q_flat, k, qk_dims, preferred_element_type=float32
+      )
     qk = qk_flat.reshape((num_stacked_q_heads, bq, bkv_compute))
 
     apply_mask_and_soft_cap = functools.partial(
