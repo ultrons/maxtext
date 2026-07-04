@@ -708,6 +708,17 @@ class SplashAttention(BaseModel):
   use_splash_scheduler: bool = Field(False, description="Use experimental splash attention scheduler.")
   sa_fuse_reciprocal: bool = Field(True, description="Maps to fuse_reciprocal in SplashConfig.")
   sa_use_base2_exp: bool = Field(True, description="Maps to use_base2_exp in SplashConfig.")
+  qk_diag_skip: bool = Field(
+      False,
+      description=(
+          "Skip fully-masked causal-diagonal QK sub-tiles in the fused dkv backward kernel"
+          " (tokamax SplashConfig.qk_diag_skip). Bit-exact; only valid for pure causal +"
+          " aligned square blocks + bf16 + fused bwd."
+      ),
+  )
+  qk_diag_grid: int = Field(
+      4, description="Sub-grid granularity for qk_diag_skip (tokamax SplashConfig.qk_diag_grid)."
+  )
   # If None, each local_sa_* flag inherits from the corresponding sa_* flag.
   local_sa_block_q: int | None = Field(None, description="Block size for Q in local splash attention.")
   local_sa_block_kv: int | None = Field(None, description="Block size for KV in local splash attention.")

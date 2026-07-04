@@ -1126,6 +1126,8 @@ sa_v_layout: "HEAD_DIM_MINOR"
 use_splash_scheduler: false # to use tokamax splash attention scheduler.
 sa_fuse_reciprocal: true # defaults to true in Tokamax
 sa_use_base2_exp: true # defaults to true in Tokamax
+qk_diag_skip: false # skip fully-masked causal-diagonal QK sub-tiles in fused dkv bwd (bit-exact; causal+square-blocks only)
+qk_diag_grid: 4 # sub-grid granularity for qk_diag_skip (2->skip 1/4, 4->skip 6/16)
 # local_sa_* variants apply to local (sliding window) attention layers;
 # if None, each inherits from the corresponding global sa_* flag.
 local_sa_block_q: None  # inherits from sa_block_q if None

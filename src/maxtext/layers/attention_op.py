@@ -497,6 +497,8 @@ class AttentionOp(nnx.Module):
         self.use_splash_scheduler = self.config.local_use_splash_scheduler
         self.fuse_reciprocal = self.config.local_sa_fuse_reciprocal
         self.use_base2_exp = self.config.local_sa_use_base2_exp
+        self.qk_diag_skip = self.config.qk_diag_skip
+        self.qk_diag_grid = self.config.qk_diag_grid
       else:
         self.block_q = self.config.sa_block_q
         self.block_kv = self.config.sa_block_kv
@@ -513,6 +515,8 @@ class AttentionOp(nnx.Module):
         self.use_splash_scheduler = self.config.use_splash_scheduler
         self.fuse_reciprocal = self.config.sa_fuse_reciprocal
         self.use_base2_exp = self.config.sa_use_base2_exp
+        self.qk_diag_skip = self.config.qk_diag_skip
+        self.qk_diag_grid = self.config.qk_diag_grid
     self.attn_logits_soft_cap = attn_logits_soft_cap
     self.sliding_window_size = sliding_window_size
     self.chunk_attn_window_size = chunk_attn_window_size
@@ -1221,6 +1225,13 @@ class AttentionOp(nnx.Module):
     # create_splash_attention config
     def create_sa_config(config, query, key, attn_logits_soft_cap):
       if config.use_tokamax_splash:
+        # qk_diag_skip/qk_diag_grid are only accepted by the patched tokamax
+        # SplashConfig. Guard on the field's presence so an unpatched base image
+        # (the flag-off A/B control) still builds without a TypeError. With
+        # qk_diag_skip=False the kernel routes its original QK matmul (bit-exact).
+        _qk_diag_kwargs = {}
+        if "qk_diag_skip" in getattr(tokamax_splash_kernel.SplashConfig, "__dataclass_fields__", {}):
+          _qk_diag_kwargs = dict(qk_diag_skip=self.qk_diag_skip, qk_diag_grid=self.qk_diag_grid)
         sa_config = tokamax_splash_kernel.SplashConfig(
             block_q=min(self.block_q, query.shape[2]),
             block_kv=min(self.block_kv, key.shape[2]),
@@ -1252,6 +1263,7 @@ class AttentionOp(nnx.Module):
             else None,
             dq_reduction_steps=config.dq_reduction_steps if config.dq_reduction_steps > 0 else None,
             use_experimental_scheduler=self.use_splash_scheduler,
+            **_qk_diag_kwargs,
         )
       else:
         sa_config = splash_attention_kernel.BlockSizes(
