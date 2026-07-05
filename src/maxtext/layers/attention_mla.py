@@ -1104,6 +1104,7 @@ class MLA(Attention):
       rope_kwargs: dict | None = None,
       kv_cache: Optional[Array] = None,
       attention_metadata: Optional[dict[str, Any]] = None,
+      wag_cell=None,
   ) -> tuple[Array, Optional[Array]]:
     """Forward pass for MLA, reusing `AttentionOp` for the actual attention.
 
@@ -1193,6 +1194,7 @@ class MLA(Attention):
         cached_values,
         indexer_mask=indexer_mask,
         record_max_logits=use_qk_clip,
+        wag_cell=wag_cell,
     )
 
     out = self._maybe_shard_with_logical(out, self.out_axis_names)

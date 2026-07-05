@@ -18,6 +18,9 @@
 import functools
 import math
 import jax
+from jax._src import core as jax_core
+from jax._src import tree_util as _tree_util
+from jax._src.pallas import core as pl_core
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
@@ -162,7 +165,15 @@ def main_kernel(
   )
   def inner_kernel():
     core_id = pl.program_id(0)
-    row_partition_size = in_hbm_ref.shape[0] // num_row_partitions
+    # Partition stride over the SLOT arrays (src/dst indices, weights) must be
+    # derived from the indices operand itself, NOT from the input buffer: the
+    # chunked combine (decouple_combine_rs_chunks) passes the FULL expert-sorted
+    # buffer with a per-chunk SLICE of the indices, so in_hbm_ref.shape[0] can be
+    # N x larger than the slot arrays. Deriving the stride from in_hbm_ref made
+    # every row partition p >= 1 read src/dst/weights OUT OF BOUNDS (silently,
+    # with disable_bounds_checks=True) and scatter garbage -- for EVERY n_chunks
+    # > 1. For the un-chunked call the two are equal, so this is a no-op there.
+    row_partition_size = src_indices_hbm_ref.shape[0] // num_row_partitions
     row_partition_id = core_id // num_column_partitions
     col_partition_id = core_id % num_column_partitions
 
@@ -477,9 +488,13 @@ def ragged_gather_reduce(
   assert topk_weights.ndim == 1, "ragged_gather_reduce only supports 1d topk_weights."
   assert valid_rows_mask.ndim == 1, "ragged_gather_reduce only supports 1d valid_rows_mask."
 
+  if enforce_fallback:
+    # Fallback is enforced. Use JAX reference. (Checked BEFORE get_tpu_info(),
+    # which raises on non-TPU backends -- keeps the pure-JAX path CPU-testable.)
+    return _fallback_implementation(x, indices, topk_weights, valid_rows_mask, reduce_group_size)
   sc_info = pltpu.get_tpu_info().sparse_core
-  if sc_info is None or enforce_fallback:
-    # Sparse core is not available or fallback is enforced. Use JAX reference.
+  if sc_info is None:
+    # Sparse core is not available. Use JAX reference.
     return _fallback_implementation(x, indices, topk_weights, valid_rows_mask, reduce_group_size)
 
   # Heuristic threshold on whether to fallback for small inputs.
@@ -518,9 +533,19 @@ def ragged_gather_reduce(
   )
   pad_input_size = padded_input_size - input_size
 
+  # Pad x's ROWS independently of the index count: x's row count is not tied
+  # to indices.size (the chunked combine passes the full buffer with a slice of
+  # the indices; the truncated-buffer mode passes a packed buffer shorter than
+  # the index list). We need (a) row 0..padded index targets valid, and (b) the
+  # row count to remain a multiple of the 32-bit packing factor used by the
+  # kernel's bitcast view. For the standard x.shape[0] == input_size call this
+  # equals the previous ((0, pad_input_size)) padding exactly.
+  input_packing = 32 // (dtype_bytes * 8)
+  pad_x_rows = max(padded_input_size - x.shape[0], 0)
+  pad_x_rows += -(x.shape[0] + pad_x_rows) % input_packing
   x = jnp.pad(
       x,
-      ((0, pad_input_size), (0, aligned_hidden_size - hidden_size)),
+      ((0, pad_x_rows), (0, aligned_hidden_size - hidden_size)),
       constant_values=0,
   )
   indices = jnp.pad(indices, (0, pad_input_size), constant_values=0)
@@ -595,3 +620,165 @@ def ragged_gather_reduce(
       out.astype(x.dtype),
       jnp.zeros_like(out, dtype=x.dtype),
   )[: (input_size // reduce_group_size), :hidden_size]
+
+
+def sc_accumulate_dims(input_size: int, hidden_size: int, reduce_group_size: int = 1):
+  """Padded (rows, cols) of the ACCUMULATE buffer for ``ragged_gather_reduce_accumulate``.
+
+  SparseCore-only (reads ``get_tpu_info``). The accumulate buffer must be pre-shaped to these
+  padded dims and threaded through the chunk loop so the padding is paid ONCE (not per chunk).
+  Mirrors the padding math in ``ragged_gather_reduce`` exactly.
+  """
+  sc_info = pltpu.get_tpu_info().sparse_core
+  assert sc_info is not None, "sc_accumulate_dims requires SparseCore"
+  num_column_partitions = 8
+  num_cores = sc_info.num_cores * sc_info.num_subcores
+  num_rows_partitions = num_cores // num_column_partitions
+  aligned_hidden_size = _align_to(hidden_size, 128 * num_column_partitions)
+  padded_input_size = _align_to(
+      input_size, math.lcm(num_rows_partitions * sc_info.num_lanes, reduce_group_size)
+  )
+  return padded_input_size // reduce_group_size, aligned_hidden_size
+
+
+def ragged_gather_reduce_accumulate(
+    accum,
+    x,
+    indices,
+    topk_weights,
+    valid_rows_mask,
+    reduce_group_size,
+    flops_override: int = -1,
+    bytes_accessed_override: int = -1,
+):
+  """In-place accumulate variant of :func:`ragged_gather_reduce` (SparseCore only).
+
+  BLOCKED / NOT WIRED (kept as a validated reference for the eventual infra fix). Correctness and
+  in-place aliasing are proven STANDALONE on v5p (chunked accumulate fill == un-chunked
+  ``ragged_gather``, max|diff|=0; 0 full-accum-buffer copies; temp flat in n_chunks). BUT it cannot
+  be used inside the model's ``lax.scan`` + ``custom_vjp``: initializing the core_map output ref to
+  an INPUT value (``jax_core.new_ref(accum)``) makes JAX treat that Ref as a jit output, and
+  "mutable array references cannot be returned" across the jit / custom_vjp boundary -- reproduced
+  for EVERY wrapper structure tried (jit+donate_argnums, jit without donation, and inline in the
+  ambient trace). ``pl.kernel`` avoids the leak only because its output ref comes from
+  ``new_ref(lax.empty(...))`` (an internal value, not an input), which cannot be initialized to
+  ``accum``; and ``pl.kernel`` exposes no ``input_output_aliases`` (only ``pl.pallas_call`` does, and
+  it has no SparseCore subcore mesh). Unblocking needs either ``input_output_aliases`` plumbed
+  through ``pl.kernel``, or a native SC scatter-write/accumulate primitive. Until then
+  ``chunked_ring_dispatch`` uses the full-buffer ``jnp.where`` merge (correct, cluster-validated,
+  N x traffic).
+
+  Identical gather/reduce math to ``ragged_gather_reduce``, but the kernel's output ref is
+  INITIALIZED to ``accum`` (an ``sc_accumulate_dims``-shaped float32 buffer), so the kernel writes
+  ONLY the valid (this-call's) destination rows in place and leaves every other row at its prior
+  ``accum`` value. There is NO final ``where``-zeroing. Threaded across the decouple_dispatch_chunks
+  loop this gives
+  O(chunk_rows) HBM write + O(chunk_rows) SC compute per chunk (the compaction only processes the
+  valid rows), replacing the rung-9 per-chunk full-buffer ``jnp.where`` merge (N x ~14GB traffic).
+
+  Because ``main_kernel`` OVERWRITES ``out[dst]`` (no read-accumulate) and each buffer row is
+  written by exactly one chunk (disjoint ``chunk_of_row``), the overwrite-in-place reproduces the
+  full-buffer gather bit-exactly. Validated standalone on v5p (num_lanes=8); SC numerics are
+  otherwise cluster-gated (CPU has no SparseCore).
+
+  Args:
+    accum: float32 ``[sc_accumulate_dims(input_size, hidden)]`` accumulate buffer (donated).
+    x, indices, topk_weights, valid_rows_mask, reduce_group_size: as in ``ragged_gather_reduce``.
+
+  Returns:
+    The updated accumulate buffer (same padded float32 shape as ``accum``).
+  """
+  assert x.ndim == 2 and indices.ndim == 1
+  sc_info = pltpu.get_tpu_info().sparse_core
+  assert sc_info is not None, "ragged_gather_reduce_accumulate requires SparseCore"
+
+  dtype = x.dtype
+  dtype_bytes = jax.dtypes.itemsize_bits(dtype) // 8
+  hidden_size = x.shape[-1]
+  input_size = indices.size
+  num_simd_lanes = sc_info.num_lanes
+  num_cores = sc_info.num_cores * sc_info.num_subcores
+  num_column_partitions = 8
+  assert num_cores % num_column_partitions == 0
+  num_rows_partitions = num_cores // num_column_partitions
+
+  aligned_hidden_size = _align_to(hidden_size, 128 * num_column_partitions)
+  col_size = aligned_hidden_size // num_column_partitions
+  padded_input_size = _align_to(
+      input_size, math.lcm(num_rows_partitions * num_simd_lanes, reduce_group_size)
+  )
+  pad_input_size = padded_input_size - input_size
+
+  input_packing = 32 // (dtype_bytes * 8)
+  pad_x_rows = max(padded_input_size - x.shape[0], 0)
+  pad_x_rows += -(x.shape[0] + pad_x_rows) % input_packing
+  x = jnp.pad(x, ((0, pad_x_rows), (0, aligned_hidden_size - hidden_size)), constant_values=0)
+  indices = jnp.pad(indices, (0, pad_input_size), constant_values=0)
+  topk_weights = jnp.pad(topk_weights, (0, pad_input_size), constant_values=0)
+  valid_rows_mask = jnp.pad(valid_rows_mask, (0, pad_input_size), constant_values=False)
+
+  src_indices, dst_indices, topk_weights, num_src_rows_per_row_partition, _mask = _preprocess(
+      indices, topk_weights, valid_rows_mask, reduce_group_size, num_rows_partitions, num_simd_lanes
+  )
+
+  vector_mesh = plsc.VectorSubcoreMesh(
+      num_cores=sc_info.num_cores,
+      num_subcores=sc_info.num_subcores,
+      core_axis_name="core",
+      subcore_axis_name="subcore",
+  )
+  scratch = dict(  # pylint: disable=use-dict-literal
+      num_rows_per_row_partition_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+      out_vmem_ref=pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
+      prev_iter_last_row_vmem_ref=pltpu.VMEM((1, col_size), jnp.uint32),
+      src_indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+      dst_indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+      topk_weights_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.float32),
+      sem_ref=pltpu.SemaphoreType.DMA((2,)),
+  )
+  body = functools.partial(
+      main_kernel,
+      core_axis_name=vector_mesh.core_axis_name,
+      subcore_axis_name=vector_mesh.subcore_axis_name,
+      num_row_partitions=num_rows_partitions,
+      num_column_partitions=num_column_partitions,
+  )
+  cost = get_cost_estimate(
+      padded_input_size=padded_input_size,
+      aligned_hidden_size=aligned_hidden_size,
+      reduce_group_size=reduce_group_size,
+      input_dtype_bytes=dtype_bytes,
+      flops_override=flops_override,
+      bytes_accessed_override=bytes_accessed_override,
+  )
+
+  # Mirror pl.kernel's OWN wrapper -- a plain `@jax.jit` around new_ref + core_map that returns
+  # `out_ref[...]` (a value) -- EXCEPT the single output ref is initialized to `accum` (NOT lax.empty)
+  # so the kernel accumulates in place, leaving unwritten rows at their prior value.
+  #
+  # The jit boundary is LOAD-BEARING: it fully scopes the new_ref Refs so none escapes. pl.kernel is
+  # exactly this shape and composes cleanly with the model's custom_vjp + lax.scan (it already runs
+  # inside ring_ragged_unsort's custom_vjp inside the per-layer scan). WITHOUT the jit (inlined in the
+  # ambient trace) the Ref leaks out of the enclosing custom_vjp ("mutable array references cannot be
+  # returned", rung9c); WITH `donate_argnums` the donated accum Ref leaks across the jit boundary
+  # itself (rung9b). So: jit, NO donation. Aliasing (accum buffer -> output, no full-buffer copy)
+  # comes from XLA's in-place buffer reuse -- accum is dead after each call (the barrier chain in
+  # chunked_ring_dispatch) -- verified on v5p (0 full-accum-buffer copies, temp flat in n_chunks).
+  @jax.jit
+  def _run(accum, num_src, xp, src_idx, dst_idx, w):
+    arg_refs = _tree_util.tree_map(jax_core.new_ref, (num_src, xp, src_idx, dst_idx, w))
+    out_ref = jax_core.new_ref(accum)  # init to accum -> in-place accumulate (unwritten rows kept)
+
+    @pl_core.core_map(
+        vector_mesh,
+        scratch_shapes=scratch,
+        compiler_params=pltpu.CompilerParams(**_COMPILER_PARAMS),
+        cost_estimate=cost,
+        name="sc_ragged_gather_reduce_accumulate",
+    )
+    def _(**scratch_kwrefs):
+      return body(*arg_refs, out_ref, **scratch_kwrefs)
+
+    return out_ref[...]
+
+  return _run(accum, num_src_rows_per_row_partition, x, src_indices, dst_indices, topk_weights)

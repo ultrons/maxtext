@@ -708,6 +708,17 @@ class SplashAttention(BaseModel):
   use_splash_scheduler: bool = Field(False, description="Use experimental splash attention scheduler.")
   sa_fuse_reciprocal: bool = Field(True, description="Maps to fuse_reciprocal in SplashConfig.")
   sa_use_base2_exp: bool = Field(True, description="Maps to use_base2_exp in SplashConfig.")
+  qk_diag_skip: bool = Field(
+      False,
+      description=(
+          "Skip fully-masked causal-diagonal QK sub-tiles in the fused dkv backward kernel"
+          " (tokamax SplashConfig.qk_diag_skip). Bit-exact; only valid for pure causal +"
+          " aligned square blocks + bf16 + fused bwd."
+      ),
+  )
+  qk_diag_grid: int = Field(
+      4, description="Sub-grid granularity for qk_diag_skip (tokamax SplashConfig.qk_diag_grid)."
+  )
   # If None, each local_sa_* flag inherits from the corresponding sa_* flag.
   local_sa_block_q: int | None = Field(None, description="Block size for Q in local splash attention.")
   local_sa_block_kv: int | None = Field(None, description="Block size for KV in local splash attention.")
@@ -755,6 +766,91 @@ class MoEGeneral(BaseModel):
   num_experts_per_tok: PositiveInt = Field(1, description="The number of experts to route each token to.")
   capacity_factor: float = Field(-1.0, description="Expert capacity factor. If < 0, no token dropping.")
   ragged_buffer_factor: float = Field(-1.0, description="Ragged buffer factor. If < 0, ragged buffer is worst case size.")
+  moe_n_chunks: PositiveInt = Field(
+      1,
+      description=(
+          "Number of token chunks for the ring-of-experts MoE pipeline. 1 disables chunking (identical to baseline). "
+          ">1 splits the per-shard tokens along the sequence dimension so each chunk's EP all-gather / reduce-scatter "
+          "overlaps the previous chunk's GMM compute. Requires use_ring_of_experts=True."
+      ),
+  )
+  moe_chunk_barrier: bool = Field(
+      False,
+      description=(
+          "Diagnostic (profiling, not production). When True, chain the chunked ring-of-experts MoE loop so each "
+          "chunk's input is fenced with jax.lax.optimization_barrier on the previous chunk's output, forcing XLA "
+          "to run the chunks sequentially (no interleave/fusion). Math is unchanged (barrier is identity), so loss "
+          "stays bit-exact. Used to test whether the token-AG/RS chunks overlap at all today. Requires "
+          "moe_n_chunks>1 and use_ring_of_experts=True to have any effect."
+      ),
+  )
+  decouple_combine_rs_chunks: int = Field(
+      0,
+      description=(
+          "DECOUPLED chunked combine->reduce-scatter (ring-of-experts): run the GMM FULL, chunk ONLY the "
+          "post-GMM combine+RS loop so each chunk's RS hides under the next chunk's combine. Distinct from "
+          "moe_n_chunks, which chunks the whole body INCL the GMM (caps ~2 on GMM efficiency); here the GMM is "
+          "untouched so N can go large. Must divide num_tokens by (N*ep_size). 0/1 = disabled (baseline). "
+          "Single-axis `expert` only (skips when expert axis is a tuple). Requires use_ring_of_experts=True."
+      ),
+  )
+  moe_shared_after_combine: bool = Field(
+      False,
+      description=(
+          "Schedule the DeepSeek SHARED-expert MLP into the chunk reduce-scatter window (requires "
+          "decouple_combine_rs_chunks>1 + use_ring_of_experts, single-axis expert, moe_n_chunks<=1): fence the "
+          "shared-expert input on the routed path's FIRST-chunk pre-RS combined output via optimization_barrier, "
+          "so the data-independent shared GMM overlaps the exposed chunk reduce-scatters instead of running early. "
+          "Identity on values (bit-exact). No-op when the chunked-combine path is inactive."
+      ),
+  )
+  moe_chunked_combine_in_remat: bool = Field(
+      False,
+      description=(
+          "RUNGS 7/8 of decouple_combine_rs_chunks: use the CHUNKED combine+RS in the moe_handwritten_bwd "
+          "RECOMPUTE as well (fused_bwd re-trace), chunking the backward's combine/RS. Gradient = the "
+          "rung-8 SINGLE memory-flat custom_vjp bwd (per-chunk all_gather transposes -> ONE full-buffer "
+          "ragged_gather; N-independent backward memory). Default False = rung-6 behavior "
+          "(recompute uses the un-chunked combine). Needs moe_handwritten_bwd + decouple_combine_rs_chunks>1."
+      ),
+  )
+  decouple_dispatch_chunks: int = Field(
+      0,
+      description=(
+          "INPUT-side dispatch chunking (rung 9e Route B): chunk the token EP all-gather + ragged-sort over "
+          "the input-token axis so each chunk's all-gather hides under the previous chunk's SC compaction. "
+          "GMM runs FULL downstream. COMPACTION-FIRST: per chunk one COMPACTED gather into a buffer_size/N "
+          "piece (rank-space bounds), then ONE full-buffer placement gather (buffer-position bounds) -- "
+          "~2x the un-chunked dispatch SC pass, no N x full-buffer merge traffic or live scratches. Single "
+          "custom_vjp with the un-chunked (N-independent) backward. Bit-exact vs un-chunked dispatch. "
+          "Ring-of-experts + plain 'expert' axis + use_ragged_sort + ragged_buffer_factor<=0 + non-Llama4; "
+          "must divide num_tokens_local. 0/1 = disabled. Forward-only under moe_handwritten_bwd."
+      ),
+  )
+  moe_direct_rs: bool = Field(
+      False,
+      description=(
+          "Ring-of-experts only, plain 'expert' EP axis. When True, replace the EP `jax.lax.psum_scatter` "
+          "after the combine with a direct-to-owner Pallas reduce-scatter (TC, async ICI DMA) so it neither "
+          "queues behind the SparseCore-offload collectives nor hits the v7x async-RS continuation-fusion "
+          "prohibition. Applies to the un-chunked ring combine AND each per-chunk RS of "
+          "decouple_combine_rs_chunks (distinct collective_id per chunk). Numerically == psum_scatter "
+          "(bf16 reduce-order, rel ~0.004); custom_vjp bwd = tiled all-gather. Default False = psum_scatter."
+      ),
+  )
+  moe_direct_combine_ag: bool = Field(
+      False,
+      description=(
+          "Ring-of-experts only, plain 'expert' EP axis. When True, replace the BACKWARD combine-cotangent "
+          "`jax.lax.all_gather` (the transpose of the combine reduce-scatter, == all-gather.626 in "
+          "chunked-combine-rs-bwd) with a direct-to-owner Pallas all-gather (_direct_all_gather, TC async "
+          "ICI DMA -- the symmetric counterpart of moe_direct_rs) so it neither queues behind the "
+          "SparseCore all-gather-offload collectives (xla_tpu_use_single_sparse_core_for_all_gather_offload) "
+          "nor hits the async-collective continuation-fusion restrictions. Numerically == lax.all_gather "
+          "(bf16, verified in isolation); custom_vjp bwd = psum_scatter (all_gather's transpose). Applies "
+          "to the decouple_combine_rs_chunks memory-flat backward. Default False = unchanged lax.all_gather."
+      ),
+  )
   moe_expert_input_dim: int = Field(
       -1,
       description="Dimension of tokens entering the MoE layer. If < 0, defaults to emb_dim.",
@@ -817,6 +913,138 @@ class MoEGeneral(BaseModel):
       "-1 means auto-compute, any > 0 value overrides the bytes_accessed cost estimate.",
   )
   use_random_routing: bool = Field(False, description="Whether to use random routing for debugging.")
+  moe_routing_key_as_input: bool = Field(
+      False,
+      description="Random routing: derive the routing key from a CONSTANT seed (pure jax, in-scope) instead of "
+      "the nnx rngs stream, so a hand-written MoE backward can recompute routing exactly. Freezes the routing "
+      "pattern across steps.",
+  )
+  moe_random_routing_seed: int = Field(0, description="Seed for the constant routing key (moe_routing_key_as_input).")
+  moe_weight_ag_scheduling_group: bool = Field(
+      False,
+      description=(
+          "Ring-of-experts only (shard_exp_on_fsdp=False). When True, pre-gather the routed FSDP expert "
+          "weights (w0/w1/wo embed dim) via an explicit all-gather custom_vjp emitted in the attention "
+          "phase, tagged with an XLA _scheduling_group_id, so the scheduler overlaps the otherwise-exposed "
+          "weight all-gather with attention compute. Default False = implicit boundary gather (unchanged "
+          "behavior)."
+      ),
+  )
+  moe_handwritten_bwd: bool = Field(
+      False,
+      description=(
+          "DeepSeek MoE ring-of-experts only. When True (requires moe_weight_ag_scheduling_group=True, "
+          "no mhc/engram), wrap the whole DeepSeek MoE decoder layer (hoisted weight gather + attention + "
+          "MoE) in a jax.custom_vjp INSIDE nn.scan with a hand-written backward. The bwd replays the "
+          "attention forward (attention-fwd remat) and emits the annotated weight RE-gather adjacent to "
+          "it, then MoE-bwd -> gather-bwd (psum_scatter -> FSDP-sharded weight grads, reusing "
+          "_make_cv_gather) -> attn-bwd. Residuals = decoder_layer_input + sharded params only (no "
+          "gathered weights saved). We own the remat, so the gather||attention annotation cannot cycle "
+          "against auto-remat. Numerically identical to autodiff (same pieces, kernels' own VJPs). The "
+          "MoE layer is NOT nn.remat-wrapped when this is on. Default False = autodiff + auto-remat "
+          "(reference)."
+      ),
+  )
+  moe_splash_host_offload: bool = Field(
+      False,
+      description=(
+          "DeepSeek MoE hand-written backward (requires moe_handwritten_bwd=True): ELIMINATE the splash "
+          "attention forward RECOMPUTE in the manual backward by HOST-OFFLOADING the splash output "
+          "(context, [batch,heads,seq,head_dim] bf16) + the log-sum-exp (lse) in the FORWARD and LOADING "
+          "them in the BACKWARD. fused_fwd captures the per-layer splash (out, lse) via the stock splash "
+          "save_residuals path, jax.device_put()s them to pinned_host, and threads them through the "
+          "custom_vjp residuals (the scan accumulates all layers on host). fused_bwd then does NOT rerun "
+          "the splash forward (_attn): it loads context for the MoE-backward input and computes the "
+          "attention grad (dq/dk/dv) via the STOCK tokamax dkv (_splash_attention_bwd_dkv) fed the loaded "
+          "lse + (Q,K,V). The cheap QKV/out projections + norms are still re-traced (only the expensive "
+          "splash kernel forward is skipped). Saving vs recomputing context is identity (deterministic "
+          "forward) => loss BIT-EXACT vs flag-off. Default False; flag OFF => byte-identical."
+      ),
+  )
+  moe_save_block_input: bool = Field(
+      False,
+      description=(
+          "DeepSeek MoE hand-written backward (requires moe_handwritten_bwd=True): DEVICE-SAVE the MoE "
+          "block's input hidden state (the post-attention-norm output, [batch, seq, emb] bf16 per layer) "
+          "in the fused forward's custom_vjp residuals, so the backward's MoE recompute consumes the SAVED "
+          "tensor instead of the one produced by the attention replay. The attention replay still runs "
+          "(vjp_attn needs it for dq/dk/dv and the o-proj/norm grads), but the MoE recompute no longer "
+          "serially depends on it -- the ~o-proj+norm recompute leaves the MoE critical path. Saved value "
+          "== replayed value exactly (deterministic replay) => loss AND grads BIT-EXACT vs flag-off. "
+          "Costs ~[batch*seq*emb] bf16 x num MoE layers of device HBM (residuals stacked by the layer "
+          "scan). Default False = byte-identical."
+      ),
+  )
+  moe_save_sort_indices: bool = Field(
+      False,
+      description=(
+          "DeepSeek MoE hand-written backward (requires moe_handwritten_bwd=True + use_ring_of_experts + "
+          "use_ragged_sort + sparse_matmul): DEVICE-SAVE the integer routing/sort tensors from the forward "
+          "(top-k expert indices, ragged-sort token order, per-expert group sizes, revert permutation; all "
+          "int32, replicated over the expert axis) through the custom_vjp residuals, so the backward's MoE "
+          "recompute SKIPS the top-k search and the two argsorts + one-hot group-size sum of the ragged "
+          "sort. The router weights (probs) are RE-DERIVED from the saved indices by a cheap take_along_axis "
+          "(kept differentiable, so the gate/router gradient path is unchanged -- saving the probs as "
+          "constants would zero it). Saved indices == recomputed indices exactly (deterministic routing) => "
+          "loss AND grads BIT-EXACT vs flag-off. Incompatible with decouple_dispatch_chunks>1 (the chunked "
+          "dispatch computes its sort internally). Default False = byte-identical."
+      ),
+  )
+  moe_direct_token_ag: bool = Field(
+      False,
+      description=(
+          "DeepSeek MoE hand-written backward (requires moe_handwritten_bwd=True + use_ring_of_experts + "
+          "sparse_matmul, single-axis expert parallelism): in the BACKWARD MoE recompute ONLY, run the EP "
+          "token/activation all-gather (the 'duplicate inputs to all expert shards' gather -- bf16"
+          "[tokens,embed], the big exposed one) with a direct-to-owner TensorCore Pallas all-gather "
+          "(_direct_all_gather, the symmetric counterpart of _direct_reduce_scatter) instead of the XLA "
+          "collective lax.all_gather. The XLA collective rides the SparseCore all-gather offload queue "
+          "(xla_tpu_use_single_sparse_core_for_all_gather_offload) and so SERIALIZES behind the SC-resident "
+          "backward weight re-gather; the Pallas kernel fires async ICI DMAs on the TensorCore, a different "
+          "engine, so XLA can OVERLAP the two. This is the cycle-SAFE placement lever (a prior "
+          "scheduling-group co-tag of the same two all-gathers hit a fundamental scheduling CYCLE). "
+          "Numerically == lax.all_gather (its custom_vjp gives the same psum_scatter transpose); the small "
+          "routing logits stay on the plain collective. Only the backward recompute is affected (forward "
+          "token-AG is untouched -- it is already hidden by the dispatch chunk pipeline). Default False => "
+          "byte-identical. RISK: on the TC the token-AG competes with the recompute GMMs rather than the SC "
+          "queue, so it can re-expose -- decide with a cluster A/B + xprof."
+      ),
+  )
+  moe_bwd_xlayer_prefetch: bool = Field(
+      False,
+      description=(
+          "DeepSeek MoE hand-written backward (requires moe_handwritten_bwd=True + "
+          "moe_weight_ag_scheduling_group=True + use_ring_of_experts, no mhc/engram/batch-split): fill the "
+          "per-layer BACKWARD splash-dkv window (the biggest contiguous TC block) with the NEXT-processed "
+          "backward layer's INDEPENDENT weight all-gather. The MoE up-proj weights (wi_0/wi_1) are lifted "
+          "to a Decoder-owned stacked param and threaded per-layer as scanned inputs; layer i also receives "
+          "the PREVIOUS layer's slice (W01[i-1]). In the reverse (backward) scan, layer i's fused_bwd emits "
+          "the FSDP all-gather of layer (i-1)'s w0/w1 (the value, stop_gradient) and hands it DOWN to layer "
+          "(i-1) via the cotangent of an identity-threaded dummy scan carry (a reverse-scan DATA channel, "
+          "verified bit-exact for real grads). Layer (i-1) CONSUMES that gathered value for its MoE "
+          "recompute -- so its all-gather FORWARD is DCE'd, emitted one layer early (in layer i's body, "
+          "overlapping layer i's dkv) -- while its weight-grad still flows via its own gather's "
+          "psum_scatter (the sole grad path -> d(W01[i-1])); the handed value carries ZERO cotangent (no "
+          "double-count). The top backward layer (no producer) falls back to its own in-layer gather. "
+          "Numerically identical to flag-off (the handed all-gather value is bit-identical to the in-layer "
+          "one); costs one layer of gathered-weight lookahead (~2 gathered up-proj weights) in HBM. "
+          "Default False = no lift, no carry (byte-identical schedule)."
+      ),
+  )
+  moe_splash_offload_scheduling_group: bool = Field(
+      False,
+      description=(
+          "Splash host-offload recovery (requires moe_splash_host_offload=True). Pure SCHEDULING (no "
+          "dataflow change, loss BIT-EXACT): tag BOTH the combine-backward cotangent all-gather (the "
+          "transpose of the direct/psum reduce-scatter -- profile op all-gather.626, ~2GB/layer, whose "
+          "overlap cover was the now-deleted splash-fwd recompute) AND the per-layer host->device splash "
+          "(context, lse) RESTORE copies with a shared XLA _scheduling_group_id. The AG (ICI) consumes "
+          "only the incoming layer-output cotangent, and the restore (Host-DMA) is independent of the MoE "
+          "backward, so the two engines' work becomes an overlap candidate for the latency-hiding "
+          "scheduler -- re-covering the exposure that made the host-offload win invert on hardware. "
+          "Default False = no tag (byte-identical schedule of the host-offload path)."
+      ),
+  )
   interleave_moe_layer_step: int = Field(1, description="Frequency of MoE layers, e.g., 2 means every 2nd layer is MoE.")
   moe_fsdp_use_two_stage_all_gather: bool = Field(
       False,
@@ -2561,6 +2789,47 @@ class MaxTextConfig(
     Computes all derived values and runs all cross-field validations after initial parsing.
     This logic is ported from the legacy pyconfig_deprecated.py system and adapted for Pydantic.
     """
+    if self.moe_splash_host_offload and not self.moe_handwritten_bwd:
+      raise ValueError(
+          "moe_splash_host_offload requires moe_handwritten_bwd=True: it host-offloads the splash output + "
+          "lse in the hand-written fused forward and loads them in the hand-written fused backward (replacing "
+          "the splash-fwd recompute). It has no effect on the autodiff path."
+      )
+    if self.moe_save_block_input and not self.moe_handwritten_bwd:
+      raise ValueError(
+          "moe_save_block_input requires moe_handwritten_bwd=True: it saves the MoE block input through the "
+          "hand-written fused forward's custom_vjp residuals and consumes it in the hand-written fused "
+          "backward. It has no effect on the autodiff path."
+      )
+    if self.moe_save_sort_indices:
+      if not self.moe_handwritten_bwd:
+        raise ValueError(
+            "moe_save_sort_indices requires moe_handwritten_bwd=True: it saves the routing/sort index "
+            "tensors through the hand-written fused forward's custom_vjp residuals and consumes them in "
+            "the hand-written fused backward. It has no effect on the autodiff path."
+        )
+      if not (self.use_ring_of_experts and self.use_ragged_sort and self.sparse_matmul):
+        raise ValueError(
+            "moe_save_sort_indices requires use_ring_of_experts=True + use_ragged_sort=True + "
+            "sparse_matmul=True (the saved tensors are the ring ragged-sort's index bundle)."
+        )
+      if self.decouple_dispatch_chunks > 1:
+        raise ValueError(
+            "moe_save_sort_indices is incompatible with decouple_dispatch_chunks>1: the chunked dispatch "
+            "computes its sort indices internally, so the forward capture path is not wired for it."
+        )
+    if self.moe_bwd_xlayer_prefetch:
+      if not (self.moe_handwritten_bwd and self.moe_weight_ag_scheduling_group):
+        raise ValueError(
+            "moe_bwd_xlayer_prefetch requires moe_handwritten_bwd=True + moe_weight_ag_scheduling_group=True: "
+            "it lifts the MoE up-proj weights to a Decoder-owned stacked param and reverse-prefetches their "
+            "all-gather through the hand-written fused backward's custom_vjp (a reverse-scan carry)."
+        )
+      if not self.use_ring_of_experts:
+        raise ValueError(
+            "moe_bwd_xlayer_prefetch requires use_ring_of_experts=True (the plain bf16 ring gather path is "
+            "the only one whose weight all-gather is expressible as the lifted (w0,w1) prefetch)."
+        )
     if self.custom_mesh_and_rule is not CustomRule.DEFAULT:
       custom_mesh_path = os.path.join(
           os.path.dirname(os.path.abspath(__file__)),

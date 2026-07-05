@@ -333,7 +333,16 @@ def _fallback_implementation(
   """Fallback to (non-ragged) JAX implementation for ragged gather."""
   out = x[indices]
   if has_weights:
-    out = out * weights[:, None]
+    # Match the SC kernel's dtype contract: weights are applied in float32 and
+    # the result is written back in x.dtype (the kernel unpacks bf16 -> f32,
+    # multiplies by the f32 weight, and repacks to bf16; its output buffer is
+    # x.dtype). The previous version let bf16 * f32 PROMOTE the output to f32,
+    # which leaked an f32 cotangent out of _ring_ragged_unsort_bwd into the
+    # tokamax gmm_v2 backward: an f32-LHS gmm sets size_lhs_sublane=8, and its
+    # bf16 output zero-fill then fails Mosaic tiling ("Expected the 2nd minor
+    # dimension is aligned to the tile", memref 8192x128xbf16 ->
+    # 1024x8x128xbf16 in left_fill_zero/dma_start).
+    out = (out.astype(jnp.float32) * weights[:, None].astype(jnp.float32)).astype(x.dtype)
   return out
 
 
@@ -415,9 +424,13 @@ def ragged_gather(
 
   dtype = x.dtype
 
+  if enforce_fallback:
+    # Fallback is enforced. Use JAX reference. (Checked BEFORE get_tpu_info(),
+    # which raises on non-TPU backends -- keeps the pure-JAX path CPU-testable.)
+    return _fallback_implementation(x, indices, weights, has_weights)
   sc_info = pltpu.get_tpu_info().sparse_core
-  if sc_info is None or enforce_fallback:
-    # Sparse core is not available or fallback is enforced. Use JAX reference.
+  if sc_info is None:
+    # Sparse core is not available. Use JAX reference.
     return _fallback_implementation(x, indices, weights, has_weights)
 
   hidden_size = x.shape[-1]

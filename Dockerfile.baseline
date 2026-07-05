@@ -1,0 +1,7 @@
+# Baseline: UPSTREAM AI-Hypercomputer/maxtext HEAD (fcb7ebeba, 2026-07-02) on the record's
+# new-libtpu base. Base image xlayer-hierrs-nl carries the exact 0622-nightly libtpu.so
+# (dated Jun 23 in site-packages/libtpu/) used by the 15.49s chunk=1 record run.
+# rm -rf first: a pure overlay would leave fork-only files from the base image's maxtext tree.
+FROM gcr.io/cloud-tpu-multipod-dev/integrate_v2:xlayer-hierrs-nl
+RUN rm -rf /deps/src/maxtext
+COPY src/maxtext/ /deps/src/maxtext/

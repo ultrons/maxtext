@@ -497,6 +497,8 @@ class AttentionOp(nnx.Module):
         self.use_splash_scheduler = self.config.local_use_splash_scheduler
         self.fuse_reciprocal = self.config.local_sa_fuse_reciprocal
         self.use_base2_exp = self.config.local_sa_use_base2_exp
+        self.qk_diag_skip = self.config.qk_diag_skip
+        self.qk_diag_grid = self.config.qk_diag_grid
       else:
         self.block_q = self.config.sa_block_q
         self.block_kv = self.config.sa_block_kv
@@ -513,6 +515,8 @@ class AttentionOp(nnx.Module):
         self.use_splash_scheduler = self.config.use_splash_scheduler
         self.fuse_reciprocal = self.config.sa_fuse_reciprocal
         self.use_base2_exp = self.config.sa_use_base2_exp
+        self.qk_diag_skip = self.config.qk_diag_skip
+        self.qk_diag_grid = self.config.qk_diag_grid
     self.attn_logits_soft_cap = attn_logits_soft_cap
     self.sliding_window_size = sliding_window_size
     self.chunk_attn_window_size = chunk_attn_window_size
@@ -938,6 +942,7 @@ class AttentionOp(nnx.Module):
       *,
       qk_product_einsum: Callable[..., Array],
       wv_product_einsum: Callable[..., Array],
+      wag_cell=None,
   ):
     """Apply attention"""
     self.check_attention_inputs(query, key, value)
@@ -1005,6 +1010,7 @@ class AttentionOp(nnx.Module):
             self.attn_logits_soft_cap,
             sinks,
             record_max_logits=record_max_logits,
+            wag_cell=wag_cell,
         )
         if max_logits is not None:
           self.max_logits = nnx.Intermediate(max_logits)
@@ -1186,6 +1192,7 @@ class AttentionOp(nnx.Module):
       sinks: Array | None = None,
       indexer_mask: Array | None = None,
       record_max_logits: bool = False,
+      wag_cell=None,
   ) -> tuple[Array, Array]:
     """TPU Flash Attention."""
 
@@ -1218,6 +1225,13 @@ class AttentionOp(nnx.Module):
     # create_splash_attention config
     def create_sa_config(config, query, key, attn_logits_soft_cap):
       if config.use_tokamax_splash:
+        # qk_diag_skip/qk_diag_grid are only accepted by the patched tokamax
+        # SplashConfig. Guard on the field's presence so an unpatched base image
+        # (the flag-off A/B control) still builds without a TypeError. With
+        # qk_diag_skip=False the kernel routes its original QK matmul (bit-exact).
+        _qk_diag_kwargs = {}
+        if "qk_diag_skip" in getattr(tokamax_splash_kernel.SplashConfig, "__dataclass_fields__", {}):
+          _qk_diag_kwargs = dict(qk_diag_skip=self.qk_diag_skip, qk_diag_grid=self.qk_diag_grid)
         sa_config = tokamax_splash_kernel.SplashConfig(
             block_q=min(self.block_q, query.shape[2]),
             block_kv=min(self.block_kv, key.shape[2]),
@@ -1249,6 +1263,7 @@ class AttentionOp(nnx.Module):
             else None,
             dq_reduction_steps=config.dq_reduction_steps if config.dq_reduction_steps > 0 else None,
             use_experimental_scheduler=self.use_splash_scheduler,
+            **_qk_diag_kwargs,
         )
       else:
         sa_config = splash_attention_kernel.BlockSizes(
@@ -1531,19 +1546,112 @@ class AttentionOp(nnx.Module):
     sinks = self._maybe_shard_with_pspec(sinks, sink_axis_names)
     indexer_mask = self._maybe_shard_with_pspec(indexer_mask, indexer_mask_axis_names)
 
-    ret = wrap_flash_attention(
-        query,
-        key,
-        value,
-        decoder_segment_ids_q,
-        decoder_segment_ids_kv,
-        sa_config,
-        None if self.config.use_jax_splash else splash_kernel,
-        cp_size,
-        load_balanced_context_parallel,
-        sinks,
-        indexer_mask,
+    # SPLASH HOST-OFFLOAD (moe_splash_host_offload), STOCK-splash path. Two phases keyed by wag_cell,
+    # handled OUTSIDE wrap_flash_attention (its shard_map signature is fixed; closing host tensors over
+    # the body would leak). We build dedicated shard_maps with the SAME q/k/v specs (axis_names_q etc.).
+    _host_off = (
+        getattr(self.config, "moe_splash_host_offload", False)
+        and self.config.use_tokamax_splash
+        and wag_cell is not None
+        and ("host_out" in wag_cell or "host_offload_fwd" in wag_cell)
+        and not record_max_logits
     )
+    if _host_off and "host_out" in wag_cell:
+      # BACKWARD retrace: NO splash forward. A custom_vjp returns the HOST-LOADED splash output (host_out)
+      # and routes dq/dk/dv through the STOCK tokamax dkv fed the loaded base2 lse (host_lse). Per-batch
+      # vmap inside the shard_map mirrors the forward kernel call. host_out/host_lse are REAL shard_map
+      # inputs (specs axis_names_q / lse) -> no closure leak.
+      _kw_ho = splash_kernel.kwargs
+      _cfg_ho = _kw_ho["config"]
+      _dkv_mi = splash_kernel.dkv_mask_info
+      _host_out = wag_cell["host_out"]
+      _host_lse = wag_cell["host_lse"]
+      _lse_spec_ho = (
+          jax.sharding.PartitionSpec(*axis_names_q[:-1])
+          if isinstance(axis_names_q, jax.sharding.PartitionSpec)
+          else axis_names_q[:-1]
+      )
+
+      @jax.custom_vjp
+      def _splash_from_host(q, k, v, out_h, lse_h):
+        return out_h
+
+      def _sfh_fwd(q, k, v, out_h, lse_h):
+        return out_h, (q, k, v, out_h, lse_h)
+
+      def _sfh_bwd(res, do):
+        q, k, v, out_h, lse_h = res
+
+        def _per_b(q, k, v, out_h, lse_h, do):
+          di = jnp.einsum("hsd,hsd->hs", out_h.astype(jnp.float32), do.astype(jnp.float32))
+          dq, dk, dv = tokamax_splash_kernel._splash_attention_bwd_dkv(
+              q, k, v, None, lse_h, do, di,
+              bq=_cfg_ho.block_q_dkv, bkv=_cfg_ho.block_kv_dkv,
+              bkv_compute=_cfg_ho.block_kv_dkv_compute,
+              is_mqa=_kw_ho["is_mqa"], mask_info=_dkv_mi,
+              mask_value=_kw_ho["mask_value"], mask_function=_kw_ho["mask_function"],
+              config=_cfg_ho, dkv_mask_sparsity=_kw_ho["dkv_mask_sparsity"])
+          return dq, dk, dv
+
+        dq, dk, dv = jax.vmap(_per_b, in_axes=(0, 0, 0, 0, 0, 0))(q, k, v, out_h, lse_h, do)
+        # out_h/lse_h are LOADED constants -> zero cotangent (they never feed back into params).
+        return dq, dk, dv, jnp.zeros_like(out_h), jnp.zeros_like(lse_h)
+
+      _splash_from_host.defvjp(_sfh_fwd, _sfh_bwd)
+      attention_output = jax.shard_map(
+          _splash_from_host, mesh=self.mesh,
+          in_specs=(axis_names_q, axis_names_kv, axis_names_kv, axis_names_q, _lse_spec_ho),
+          out_specs=axis_names_q, check_vma=False,
+      )(query, key, value, _host_out, _host_lse)
+      ret = (attention_output, None)
+    elif _host_off:
+      # FORWARD capture (STOCK splash): run the per-batch stock splash with save_residuals to expose lse,
+      # store (out, lse_base2) in wag_cell so fused_fwd host-offloads them. No custom backward needed --
+      # moe_handwritten_bwd discards this forward's autodiff residuals (the hand-written fused_bwd owns the
+      # gradient via the loaded-context dkv path). lse from stock tokamax save_residuals is NATURAL-log
+      # (==base2/LOG2E); multiply by LOG2E to store BASE2 lse (the dkv convention).
+      _LOG2E_ho = float(tokamax_splash_kernel.LOG2E)
+      _kernel_ho = partial(splash_kernel, max_logit_value=max_logit_value)
+      _lse_spec_ho = (
+          jax.sharding.PartitionSpec(*axis_names_q[:-1])
+          if isinstance(axis_names_q, jax.sharding.PartitionSpec)
+          else axis_names_q[:-1]
+      )
+
+      def _kernel_res_ho(q, k, v):
+        def _per_b(q, k, v):
+          out, stats = _kernel_ho(q, k, v, None, sinks=None, save_residuals=True)
+          return out, stats["logsumexp"]
+
+        return jax.vmap(_per_b, in_axes=(0, 0, 0))(q, k, v)
+
+      attention_output, _lse_ho = jax.shard_map(
+          _kernel_res_ho, mesh=self.mesh,
+          in_specs=(axis_names_q, axis_names_kv, axis_names_kv),
+          out_specs=(axis_names_q, _lse_spec_ho), check_vma=False,
+      )(query, key, value)
+      wag_cell["splash_out"] = attention_output                       # [B,H,S,Dv] bf16
+      wag_cell["splash_lse"] = _lse_ho.astype(jnp.float32) * _LOG2E_ho  # [B,H,S] f32, base2
+      # Store the SHARDED pspecs so the host-offload device_put preserves sharding (a.aval.sharding in the
+      # scan/custom_vjp trace is REPLICATED -> a replicated device_put would balloon HBM to the global
+      # tensor on every device). The dkv consumer reshards as needed on load.
+      wag_cell["splash_out_spec"] = axis_names_q
+      wag_cell["splash_lse_spec"] = _lse_spec_ho
+      ret = (attention_output, None)
+    else:
+      ret = wrap_flash_attention(
+          query,
+          key,
+          value,
+          decoder_segment_ids_q,
+          decoder_segment_ids_kv,
+          sa_config,
+          None if self.config.use_jax_splash else splash_kernel,
+          cp_size,
+          load_balanced_context_parallel,
+          sinks,
+          indexer_mask,
+      )
 
     x, max_logits = ret
     x = jnp.transpose(x, axes=(0, 2, 1, 3))
@@ -2095,6 +2203,7 @@ class AttentionOp(nnx.Module):
       compressed_mask: Optional[Array] = None,
       slot: Optional[int] = None,
       record_max_logits: bool = False,
+      wag_cell=None,
   ):
     if cached_values is None:
       prefill_kv_cache, ar_kv_cache = None, None
@@ -2129,6 +2238,7 @@ class AttentionOp(nnx.Module):
         record_max_logits=record_max_logits,
         qk_product_einsum=self.AqtEinsum_0,
         wv_product_einsum=self.AqtEinsum_1,
+        wag_cell=wag_cell,
     )
 
     # Return the "prefill" cache if it actually the combined prefill+ar kv cache

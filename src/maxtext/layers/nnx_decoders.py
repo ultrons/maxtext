@@ -991,16 +991,34 @@ class NNXDecoder(nnx.Module):
 
     use_kv = kv_caches_stacked is not None
 
-    def layer_fn(carry, scanned_vars):
-      # Ensure metadata rank matches the sliced values
-      scanned_vars = maxtext_utils_nnx.nnx_remove_scan_axis(scanned_vars, "layers")
+    # Backward cross-layer prefetch (moe_bwd_xlayer_prefetch): only for the scanned DeepSeek MoE stack.
+    # The carry becomes (hidden, dummy_reverse) and we add two extra scan inputs -- the PREVIOUS layer's
+    # (wi_0, wi_1) slice and a top-backward-layer flag -- so each layer's backward can gather the
+    # previous layer's up-proj weights (emitted in THIS layer's dkv window) and hand them down the
+    # reverse scan via the dummy's cotangent. (isinstance, not `is`: the bridge builds a subclass.)
+    _xl = (
+        self.config.moe_bwd_xlayer_prefetch
+        and isinstance(layers, deepseek.DeepSeekMoELayer)
+        and not use_kv
+    )
 
-      # Unpack the sliced variables for THIS layer
-      if use_kv:
-        current_params, current_state, kv_cache_layer = scanned_vars
-      else:
-        current_params, current_state = scanned_vars
+    def layer_fn(carry, scanned_vars):
+      xl_prev = xl_is_top = None
+      if _xl:
+        # scanned_vars = (params, state, (w0_prev, w1_prev), is_top); carry = (hidden, dummy)
+        current_params, current_state, xl_prev, xl_is_top = scanned_vars
+        current_params = maxtext_utils_nnx.nnx_remove_scan_axis(current_params, "layers")
+        current_state = maxtext_utils_nnx.nnx_remove_scan_axis(current_state, "layers")
         kv_cache_layer = None
+      else:
+        # Ensure metadata rank matches the sliced values
+        scanned_vars = maxtext_utils_nnx.nnx_remove_scan_axis(scanned_vars, "layers")
+        # Unpack the sliced variables for THIS layer
+        if use_kv:
+          current_params, current_state, kv_cache_layer = scanned_vars
+        else:
+          current_params, current_state = scanned_vars
+          kv_cache_layer = None
 
       if self.config.parameter_memory_host_offload:
         current_params = jax.tree.map(
@@ -1014,6 +1032,9 @@ class NNXDecoder(nnx.Module):
       call_kwargs = dict(valid_kwargs)
       if kv_cache_layer is not None:
         call_kwargs["kv_cache"] = kv_cache_layer
+      if _xl:
+        call_kwargs["xlayer_w01_prev"] = xl_prev
+        call_kwargs["is_top_bwd"] = xl_is_top
 
       layer_out = layer(carry, *args, **call_kwargs)
 
@@ -1037,7 +1058,37 @@ class NNXDecoder(nnx.Module):
         return new_carry, (new_current_state, updated_kv)
       return new_carry, new_current_state
 
-    layer_fn_wrapped = jax.checkpoint(layer_fn, policy=policy, prevent_cse=prevent_cse)
+    # moe_splash_host_offload: do NOT jax.checkpoint the DeepSeek MoE layer scan body. The layer owns
+    # its backward via jax.custom_vjp (moe_handwritten_bwd) and its residuals now include the
+    # host-offloaded splash (context, lse): under jax.checkpoint those residuals are REMATERIALIZED in
+    # the backward (the splash forward re-runs and the device->host copy happens per-layer inside the
+    # bwd, defeating the offload -- observed as host_temp == ONE layer's staging buffer instead of the
+    # [num_layers, ...] pinned_host accumulation). Without the wrap, autodiff stores exactly the
+    # custom_vjp's declared residuals across the scan: {inputs, params} + the pinned_host (out, lse) --
+    # nothing else, since the whole layer body is inside the custom_vjp (this is the nnx equivalent of
+    # the linen bypass in decoders.py set_remat_policy). Gated on moe_splash_host_offload /
+    # moe_save_block_input / moe_save_sort_indices (not bare moe_handwritten_bwd) so existing
+    # flag-off programs stay byte-identical; with all three off the residuals are inputs-only and
+    # the checkpoint wrap is a harmless no-op either way. The two device-save flags need the skip
+    # for the same reason as the splash offload: under jax.checkpoint their captured residuals
+    # (block input / routing bundle) are REMATERIALIZED in the backward instead of loaded.
+    _handwritten_owns_remat = (
+        self.config.moe_handwritten_bwd
+        and (
+            getattr(self.config, "moe_splash_host_offload", False)
+            or getattr(self.config, "moe_save_block_input", False)
+            or getattr(self.config, "moe_save_sort_indices", False)
+            or getattr(self.config, "moe_bwd_xlayer_prefetch", False)
+        )
+        # isinstance, not `is`: the linen<->nnx bridge builds the scanned layer as a dynamically
+        # created SUBCLASS of DeepSeekMoELayer, so class identity fails on that path and the
+        # checkpoint wrap silently re-materializes the custom_vjp's saved residuals in the bwd.
+        and isinstance(layers, deepseek.DeepSeekMoELayer)
+    )
+    if _handwritten_owns_remat:
+      layer_fn_wrapped = layer_fn
+    else:
+      layer_fn_wrapped = jax.checkpoint(layer_fn, policy=policy, prevent_cse=prevent_cse)
 
     if use_kv:
       # If kv_caches is provided (e.g., from vLLM), we CANNOT use jax.lax.scan
@@ -1069,7 +1120,38 @@ class NNXDecoder(nnx.Module):
       params = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(params, length)
       state = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(state, length)
 
-      final_carry, scanned_state = jax.lax.scan(layer_fn_wrapped, x_in, (params, state))
+      if _xl:
+        # Extra scan inputs + reverse dummy carry for the backward cross-layer prefetch.
+        from maxtext.utils.sharding import logical_to_mesh_axes as _l2m
+        _moe_st = params["DeepSeekMoeBlock_0"]["MoeBlock_0"]
+        _w0_full = _moe_st["wi_0"].value  # [L, E, embed, mlp] (scan leading axis)
+        _w1_full = _moe_st["wi_1"].value
+        # PREVIOUS-layer slice: prev[i] = W01[i-1]; pad i=0 with W01[0] (its producer gather is handed to
+        # nobody -> DCE'd; is_top[0] is False so layer 0 still consumes its handed value normally).
+        _w0_prev = jnp.concatenate([_w0_full[:1], _w0_full[:-1]], axis=0)
+        _w1_prev = jnp.concatenate([_w1_full[:1], _w1_full[:-1]], axis=0)
+        # top backward layer owns its gather (no producer). float (0.0/1.0): a bool tracer cannot be a
+        # custom_vjp nondiff arg, so is_top is a regular differentiable input with a zero cotangent.
+        _is_top = (jnp.arange(length) == (length - 1)).astype(jnp.float32)
+        _rules = None if self.config.using_pipeline_parallelism else self.config.logical_axis_rules
+        _in_spec = _l2m(("exp", "embed_moe", "mlp_moe"), self.mesh, _rules)
+        _out_spec = _l2m(("exp", "embed_tensor_transpose", "mlp_no_fsdp"), self.mesh, _rules)
+
+        def _gather0(w):
+          w = w.astype(self.config.dtype)
+          return jax.shard_map(
+              lambda z: jax.lax.all_gather(z, "fsdp", axis=1, tiled=True),
+              mesh=self.mesh, in_specs=(_in_spec,), out_specs=_out_spec, check_vma=False,
+          )(w)
+
+        # dummy reverse-carry SEED = zeros of the gathered w0/w1 shape+sharding (the top backward layer
+        # ignores it via is_top). zeros_like of the gather -> the all-gather compute DCEs.
+        _dummy0 = (jnp.zeros_like(_gather0(_w0_full[0])), jnp.zeros_like(_gather0(_w1_full[0])))
+        (final_carry, _dummy_final), scanned_state = jax.lax.scan(
+            layer_fn_wrapped, (x_in, _dummy0), (params, state, (_w0_prev, _w1_prev), _is_top)
+        )
+      else:
+        final_carry, scanned_state = jax.lax.scan(layer_fn_wrapped, x_in, (params, state))
       returned_kv_stacked = None
 
       # Ensure metadata rank matches the stacked values
