@@ -38,7 +38,7 @@ spec:
             - { key: google.com/tpu, operator: Exists, effect: NoSchedule }
             containers:
             - name: trainer
-              image: gcr.io/tpu-prod-env-automated/integrate_v2:1410-upstream-ac9498b64
+              image: gcr.io/tpu-vm-gke-testing/integrate_v2:1410-upstream-ac9498b64
               imagePullPolicy: Always
               command: ["bash","-c"]
               args:
