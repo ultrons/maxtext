@@ -1,0 +1,609 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""CPU equivalence test: chunked combine+RS vs un-chunked ring_ragged_unsort + psum_scatter.
+
+Run with:
+  XLA_FLAGS=--xla_force_host_platform_device_count=8 JAX_PLATFORMS=cpu \
+      python3 tests/chunked_combine_equiv_test.py
+
+Covers the failure mode that the old EP=4/uniform test missed: EP=8 with NON-UNIFORM
+random group sizes across experts/shards, and GARBAGE values in the buffer positions
+OUTSIDE each shard's valid [shard_output_start, shard_output_end) range (in the real
+model those rows are uninitialized GMM output -- any mask/shard misalignment gathers
+them and blows up the output, which is exactly the observed step-0 NaN signature).
+
+Rung 8 additions: the chunked combine's SINGLE memory-flat custom_vjp backward is gated
+BIT-EXACT (diff == 0) against the un-chunked bwd for full AND truncated buffers, its one
+full-permutation ragged_gather's addressing is SC-emulated in-bounds per shard/N, and two
+composition smokes (return_first_combine_token under grad; lax.scan with carry-derived
+ridx/w custom_vjp inputs) guard the fence-cotangent drop and the scan-constvar trap.
+
+Rung 8b addition: the bwd's cotangent all_gather is now ONE tiled AG of the whole g_out with
+the (chunk, shard) -> (shard, chunk) row reorder composed into the bwd gather's token indices
+(no data transpose) instead of N per-chunk AGs; ``cotangent_single_ag_reorder_checks`` gates
+the two constructions bit-exact (f32 + bf16), and every existing BWD gate (bit-exact vs
+un-chunked, token-path, scan) now runs THROUGH the single-AG path.
+"""
+
+import os
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+if "xla_force_host_platform_device_count" not in os.environ.get("XLA_FLAGS", ""):
+  os.environ["XLA_FLAGS"] = os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=8"
+
+import functools
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from maxtext.kernels.ragged.ragged_sort import chunked_ring_combine_reduce_scatter, ring_ragged_unsort
+
+TOPK = 4
+NUM_EXPERTS = 16
+HIDDEN = 16
+NUM_TOKENS = 128  # divisible by n_chunks * ep_size for all tested combos
+
+
+def _make_routing(key, skew=3.0):
+  """Random top-k routing with a strong per-expert bias -> NON-UNIFORM group sizes."""
+  k_logits, k_bias = jax.random.split(key)
+  logits = jax.random.normal(k_logits, (NUM_TOKENS, NUM_EXPERTS))
+  logits = logits + skew * jax.random.normal(k_bias, (NUM_EXPERTS,))  # skew expert popularity
+  topk_indices = jax.lax.top_k(logits, TOPK)[1].astype(jnp.int32)  # [T, topk], distinct per token
+  flat = topk_indices.reshape(-1)
+  sort_idx = jnp.argsort(flat)
+  revert = jnp.argsort(sort_idx).astype(jnp.int32)  # topk_argsort_revert_indices
+  group_sizes = jnp.sum(jax.nn.one_hot(flat, NUM_EXPERTS, dtype=jnp.int32), axis=0)
+  return revert, group_sizes
+
+
+def _shard_ranges(group_sizes, ep_size):
+  offsets = np.concatenate([[0], np.cumsum(np.asarray(group_sizes))])
+  local_e = NUM_EXPERTS // ep_size
+  starts = offsets[np.arange(ep_size) * local_e]
+  ends = offsets[(np.arange(ep_size) + 1) * local_e]
+  return starts, ends
+
+
+def _make_full_buffers(key, group_sizes, ep_size):
+  """Per-shard FULL (mode-1) buffers: true values inside [start, end), garbage outside."""
+  n_slots = NUM_TOKENS * TOPK
+  k_true, k_junk = jax.random.split(key)
+  buf_true = jax.random.normal(k_true, (n_slots, HIDDEN), dtype=jnp.float32) * 1e-3
+  starts, ends = _shard_ranges(group_sizes, ep_size)
+  bufs = []
+  for s in range(ep_size):
+    pos = np.arange(n_slots)
+    valid = (pos >= starts[s]) & (pos < ends[s])
+    garbage = 30.0 * (s + 1) + jax.random.normal(jax.random.fold_in(k_junk, s), (n_slots, HIDDEN))
+    bufs.append(jnp.where(jnp.asarray(valid)[:, None], buf_true, garbage))
+  return jnp.stack(bufs), buf_true  # [ep, n_slots, H]
+
+
+def _make_truncated_buffers(key, group_sizes, ep_size, buffer_size):
+  """Per-shard PACKED (mode-2) buffers of size buffer_size < num_tokens*topk."""
+  n_slots = NUM_TOKENS * TOPK
+  k_true, k_junk = jax.random.split(key)
+  buf_true = jax.random.normal(k_true, (n_slots, HIDDEN), dtype=jnp.float32) * 1e-3
+  starts, ends = _shard_ranges(group_sizes, ep_size)
+  bufs = []
+  for s in range(ep_size):
+    limit = min(int(ends[s] - starts[s]), buffer_size)
+    src = np.clip(starts[s] + np.arange(buffer_size), 0, n_slots - 1)
+    packed = jnp.asarray(np.asarray(buf_true)[src])
+    valid = np.arange(buffer_size) < limit
+    garbage = 30.0 * (s + 1) + jax.random.normal(jax.random.fold_in(k_junk, s), (buffer_size, HIDDEN))
+    bufs.append(jnp.where(jnp.asarray(valid)[:, None], packed, garbage))
+  return jnp.stack(bufs)  # [ep, buffer_size, H]
+
+
+def _run(mesh, ep_size, bufs, group_sizes, revert, w_flat, n_chunks):
+  """n_chunks == 0 -> un-chunked reference (ring_ragged_unsort + single psum_scatter)."""
+  local_e = NUM_EXPERTS // ep_size
+
+  # On CPU there is no SparseCore: force the pure-JAX fallback path explicitly
+  # (pltpu.get_tpu_info() raises on non-TPU backends instead of returning sc_info=None).
+  fb = dict(enforce_gather_fallback=True, enforce_gather_reduce_fallback=True)
+
+  def body(buf, gs, ridx, wf):
+    buf = buf[0]
+    if n_chunks == 0:
+      out = ring_ragged_unsort(buf, gs, ridx, TOPK, local_e, "ep", topk_weights=wf, **fb)
+      return jax.lax.psum_scatter(out, "ep", scatter_dimension=0, tiled=True)
+    return chunked_ring_combine_reduce_scatter(buf, gs, ridx, TOPK, local_e, "ep", wf, ep_size, n_chunks, **fb)
+
+  fn = jax.shard_map(
+      body,
+      mesh=mesh,
+      in_specs=(jax.P("ep"), jax.P(), jax.P(), jax.P()),
+      out_specs=jax.P("ep"),
+  )
+  return jax.jit(fn)(bufs, group_sizes, revert, w_flat)  # [T, H] global (concat of shard slices)
+
+
+def _report(name, ref, out, ep_size, n_chunks):
+  diff = np.abs(np.asarray(ref) - np.asarray(out))
+  per = NUM_TOKENS // (max(n_chunks, 1) * ep_size)
+  # rows belonging to chunk 0 = first `per` rows of every shard's T/ep block
+  row_in_shard = np.arange(NUM_TOKENS) % (NUM_TOKENS // ep_size)
+  c0_mask = row_in_shard < per
+  max_all = diff.max()
+  max_c0 = diff[c0_mask].max()
+  max_rest = diff[~c0_mask].max() if (~c0_mask).any() else 0.0
+  print(f"  {name}: max|diff|={max_all:.3e}  (chunk0-rows {max_c0:.3e}, c>0-rows {max_rest:.3e})")
+  return max_all, max_c0, max_rest
+
+
+def _emulate_sc_gather_reduce(x, indices, weights, valid_mask, k, num_row_partitions, lanes, stride_from_buffer):
+  """Numpy emulation of the SC ragged_gather_reduce wrapper + main_kernel ADDRESSING.
+
+  Mirrors: wrapper padding, _preprocess (per-partition validity compaction, src/dst/weights),
+  and inner_kernel's row-partition addressing (row_start = p * row_partition_size, reading
+  ceil(nvalid_p / lanes) * lanes rows of the slot arrays). ``stride_from_buffer=True``
+  reproduces the ORIGINAL bug: row_partition_size = in_hbm_ref.shape[0] // P (the x buffer's
+  row count); ``False`` uses the FIXED expression: src_indices_hbm_ref.shape[0] // P. Raises
+  IndexError when a partition would read the slot arrays out of bounds (on hardware this is a
+  SILENT garbage read: disable_bounds_checks=True); otherwise returns the numeric result.
+  """
+  import math as _math
+
+  n = indices.shape[0]
+  p_cnt, hidden = num_row_partitions, x.shape[1]
+  align = _math.lcm(p_cnt * lanes, k)
+  padded = -(-n // align) * align
+  idx = np.pad(indices, (0, padded - n))
+  wts = np.pad(weights, (0, padded - n))
+  msk = np.pad(valid_mask, (0, padded - n))
+  x_rows = max(padded, x.shape[0])  # wrapper pads x rows up to padded_input_size if shorter
+  xp = np.zeros((x_rows, hidden), np.float32)
+  xp[: x.shape[0]] = x
+
+  # _preprocess: compact valid slots to the front of each partition (stable), build src/dst/w
+  rps = padded // p_cnt
+  m2 = msk.reshape(p_cnt, rps)
+  order = np.argsort(~m2, axis=-1, kind="stable") + np.arange(p_cnt)[:, None] * rps
+  order = order.reshape(-1)
+  src, dst, w_s = idx[order], order // k, wts[order]
+  nvalid = m2.sum(axis=-1)
+
+  # inner_kernel addressing
+  stride = (x_rows if stride_from_buffer else padded) // p_cnt
+  out = np.zeros((padded // k, hidden), np.float32)
+  for p in range(p_cnt):
+    n_rows = int(-(-int(nvalid[p]) // lanes) * lanes)  # kernel reads whole lane tiles
+    row_start = p * stride
+    if n_rows and row_start + n_rows > padded:
+      raise IndexError(
+          f"partition {p}: reads slot rows [{row_start}, {row_start + n_rows}) beyond "
+          f"slot-array length {padded} (buffer rows {x_rows}); silent garbage on SC"
+      )
+    for j in range(int(nvalid[p])):
+      r = row_start + j
+      out[dst[r]] += w_s[r] * xp[src[r]]
+  group_mask = msk.reshape(-1, k).any(axis=-1)
+  out = np.where(group_mask[:, None], out, 0.0)
+  return out[: n // k]
+
+
+def sc_kernel_contract_checks(failures):
+  """Emulated-SC checks for the ragged_gather_reduce row-partition-stride fix.
+
+  Demonstrates WHY sliced-operand chunking was abandoned: with per-chunk SLICED indices
+  (x.rows = N * indices.rows) the buggy buffer-derived stride read the slot arrays out of
+  bounds for EVERY chunk at EVERY n_chunks > 1 (N-independent, matching the cluster step-0
+  NaN); the fixed stride is exact for all N and identical at N=1. The production chunked
+  combine now passes FULL-shape operands with a validity window (slot_window), so the kernel
+  never sees sliced operands -- the stride fix stays as kernel hardening (it also covers the
+  truncated-buffer mode, where x.rows < indices.rows even un-chunked)."""
+  lanes, p_cnt = 16, 2  # v7x-like: sc num_lanes=16; 16 subcores -> 8 col partitions x 2 row partitions
+  key = jax.random.PRNGKey(0)
+  revert, group_sizes = _make_routing(key, skew=3.0)
+  n_slots = NUM_TOKENS * TOPK
+  x = np.asarray(jax.random.normal(jax.random.fold_in(key, 1), (n_slots, HIDDEN), dtype=jnp.float32))
+  w = np.asarray(jax.random.uniform(jax.random.fold_in(key, 2), (n_slots,), dtype=jnp.float32))
+  starts, ends = _shard_ranges(group_sizes, 8)
+  rv = np.asarray(revert)
+  s = 3  # emulate shard 3's combine call
+  mask_full = (rv >= starts[s]) & (rv < ends[s])
+
+  for n_chunks in (1, 2, 4, 8):
+    spc = n_slots // n_chunks
+    ok_fixed = True
+    oob_chunks = 0
+    for c in range(n_chunks):
+      sl = slice(c * spc, (c + 1) * spc)
+      ref = (x[rv[sl]] * w[sl][:, None] * mask_full[sl][:, None]).reshape(-1, TOPK, HIDDEN).sum(axis=1)
+      got = _emulate_sc_gather_reduce(x, rv[sl], w[sl], mask_full[sl], TOPK, p_cnt, lanes, False)
+      ok_fixed &= np.allclose(ref, got, atol=1e-5)
+      try:
+        _emulate_sc_gather_reduce(x, rv[sl], w[sl], mask_full[sl], TOPK, p_cnt, lanes, True)
+      except IndexError:
+        oob_chunks += 1
+    print(f"  SC-emulation N={n_chunks}: fixed-stride exact={ok_fixed}, buggy-stride OOB chunks={oob_chunks}/{n_chunks}")
+    if not ok_fixed:
+      failures.append(f"SC-emulation N={n_chunks}: fixed stride numerically wrong")
+    if n_chunks > 1 and oob_chunks == 0:
+      failures.append(f"SC-emulation N={n_chunks}: buggy stride did NOT violate bounds (expected OOB)")
+    if n_chunks == 1 and oob_chunks:
+      failures.append("SC-emulation N=1: un-chunked call must not go OOB with either stride")
+
+
+def _emulate_sc_gather_bwd(g, indices, weights, start, end, lanes, num_cores):
+  """Numpy emulation of the SC ragged_gather wrapper + main_kernel ADDRESSING (backward use).
+
+  Mirrors: wrapper padding of indices/weights to a block multiple, and main_kernel's
+  block-range derivation ``block_start = start // block_size``, ``block_end = cdiv(end,
+  block_size)``, ``row_tile_start = aligned_start + ...`` which indexes the INDEX/WEIGHT/OUTPUT
+  row axis. Returns (out, oob): ``out`` has one row per index (NaN sentinel where the kernel
+  never wrote -- uninitialized HBM on hardware), ``oob`` is True when the block range indexes
+  the (possibly chunk-sized) arrays out of bounds (silent on SC: bounds checks off).
+  """
+  n = indices.shape[0]
+  bs = lanes * num_cores
+  padded_n = -(-n // bs) * bs
+  block_start = int(start) // bs
+  block_end = -(-int(end) // bs)
+  if int(end) == int(start):
+    block_end = block_start
+  lo_row, hi_row = block_start * bs, block_end * bs
+  oob = hi_row > padded_n or lo_row > padded_n
+  out = np.full((n, g.shape[1]), np.nan, np.float32)
+  for r in range(max(lo_row, 0), min(hi_row, n)):
+    out[r] = weights[r] * g[indices[r]]
+  return out, oob
+
+
+def sc_memory_flat_bwd_contract_checks(failures):
+  """Emulated-SC addressing check for the rung-8 MEMORY-FLAT single-gather backward.
+
+  The chunked combine's single custom_vjp bwd issues ONE ragged_gather whose index array is
+  the FULL inverse permutation (n == num_slots), so output row j IS buffer position j and the
+  shard's buffer-position [shard_output_start, shard_output_end) is the kernel's OUTPUT-ROW
+  range AS-IS (the un-chunked-style call -- no rank-space searchsorted conversion). Verify,
+  for every shard and every N (the chunk-major permute changes with N), that (a) the kernel's
+  block range never indexes the (full-length) index/weight/output arrays out of bounds and
+  (b) every row in [start, end) is written with the expected buffer-position grad
+  ``w[idx_inv[j]] * g[idx_inv[j] // topk]`` (no NaN = no uninitialized shard rows).
+  """
+  lanes, num_cores = 8, 4  # block_size 32: small vs n_slots so the block range has resolution
+  key = jax.random.PRNGKey(2)
+  revert, group_sizes = _make_routing(key, skew=3.0)
+  n_slots = NUM_TOKENS * TOPK
+  w = np.asarray(jax.random.uniform(jax.random.fold_in(key, 2), (n_slots,), dtype=jnp.float32))
+  rv = np.asarray(revert)
+
+  for ep_size in (8, 4):
+    starts, ends = _shard_ranges(group_sizes, ep_size)
+    for n_chunks in (1, 2, 4, 8):
+      # chunk-major token permute, exactly as the forward applies it (N>1, ep>1 only)
+      if n_chunks > 1 and ep_size > 1:
+        per = NUM_TOKENS // (n_chunks * ep_size)
+        perm = np.transpose(np.arange(NUM_TOKENS).reshape(ep_size, n_chunks, per), (1, 0, 2)).reshape(-1)
+      else:
+        perm = np.arange(NUM_TOKENS)
+      rv_p = rv.reshape(NUM_TOKENS, TOPK)[perm].reshape(-1)
+      w_p = w.reshape(NUM_TOKENS, TOPK)[perm].reshape(-1)
+      g_p = np.asarray(
+          jax.random.normal(jax.random.fold_in(key, 50 + n_chunks), (NUM_TOKENS, HIDDEN), dtype=jnp.float32)
+      )
+      idx_inv = np.argsort(rv_p, kind="stable")
+      w_sorted = w_p[idx_inv]
+      expected = w_sorted[:, None] * g_p[idx_inv // TOPK]  # grad at buffer position j (row j)
+      ok = True
+      oob_any = False
+      for s in range(ep_size):
+        st, en = int(starts[s]), int(ends[s])
+        out, oob = _emulate_sc_gather_bwd(g_p, idx_inv // TOPK, w_sorted, st, en, lanes, num_cores)
+        oob_any |= oob
+        if en > st:
+          seg = out[st:en]
+          ok &= (not np.isnan(seg).any()) and np.array_equal(seg, expected[st:en])
+      print(f"  SC-memflat-bwd EP={ep_size} N={n_chunks}: in-bounds={not oob_any}, shard-rows exact={ok}")
+      if oob_any:
+        failures.append(f"SC-memflat-bwd EP={ep_size} N={n_chunks}: single-gather block range OOB")
+      if not ok:
+        failures.append(f"SC-memflat-bwd EP={ep_size} N={n_chunks}: shard rows wrong or unwritten")
+
+
+def sc_bwd_kernel_contract_checks(failures):
+  """Emulated-SC checks for the CHUNKED-input ring_ragged_unsort backward (rung 7).
+
+  ragged_gather's [start, end) ranges over its OUTPUT/INDEX-ROW axis. The chunked bwd used to
+  pass the shard's BUFFER-POSITION range (correct only un-chunked, where row j == position j):
+  with chunk-sized arrays this reads/writes out of bounds or selects the wrong rank rows --
+  the step-1 NaN under moe_chunked_combine_in_remat. The fix converts the range to RANK space
+  (searchsorted over the chunk's sorted buffer positions). Buggy bounds must fail for every
+  chunk at every N > 1 and never at N = 1; fixed bounds must be exact everywhere.
+  """
+  # block_size = 32 (lanes=8 x 4 cores): SMALL relative to the chunk length so the block
+  # range has resolution -- with block_size ~ chunk length everything rounds to whole blocks
+  # and the toy scale can't expose the addressing bug (at production scale the shard's
+  # buffer-position offsets exceed the chunk-sized arrays outright). Checked over ALL shards.
+  lanes, num_cores = 8, 4
+  key = jax.random.PRNGKey(1)
+  revert, group_sizes = _make_routing(key, skew=3.0)
+  n_slots = NUM_TOKENS * TOPK
+  w = np.asarray(jax.random.uniform(jax.random.fold_in(key, 2), (n_slots,), dtype=jnp.float32))
+  starts, ends = _shard_ranges(group_sizes, 8)
+  rv = np.asarray(revert)
+
+  for n_chunks in (1, 2, 4, 8):
+    spc = n_slots // n_chunks
+    bad_buggy = 0
+    total = 0
+    ok_fixed = True
+    for s in range(8):
+      start_s, end_s = int(starts[s]), int(ends[s])
+      if end_s == start_s:
+        continue  # empty shard: nothing to check
+      for c in range(n_chunks):
+        total += 1
+        sl = slice(c * spc, (c + 1) * spc)
+        rv_c, w_c = rv[sl], w[sl]
+        g_c = np.asarray(
+            jax.random.normal(jax.random.fold_in(key, 100 + c), (spc // TOPK, HIDDEN), dtype=jnp.float32)
+        )
+        idx_inv = np.argsort(rv_c, kind="stable")
+        sorted_pos = rv_c[idx_inv]
+        w_sorted = w_c[idx_inv]
+        # expected grad on THIS SHARD'S buffer rows: grad[rv_c[i]] = w_c[i] * g_c[i // TOPK]
+        expected = np.zeros((n_slots, HIDDEN), np.float32)
+        hit = (rv_c >= start_s) & (rv_c < end_s)
+        expected[rv_c[hit]] = w_c[hit, None] * g_c[np.nonzero(hit)[0] // TOPK]
+
+        def run(lo, hi):
+          out, oob = _emulate_sc_gather_bwd(g_c, idx_inv // TOPK, w_sorted, lo, hi, lanes, num_cores)
+          buf = np.zeros((n_slots, HIDDEN), np.float32)
+          buf[sorted_pos] = out  # the chunked-input grad scatter-back
+          match = (not np.isnan(buf[start_s:end_s]).any()) and np.array_equal(
+              buf[start_s:end_s], expected[start_s:end_s]
+          )
+          return oob, match
+
+        oob_b, match_b = run(start_s, end_s)  # BUGGY: buffer-position bounds
+        lo = int(np.searchsorted(sorted_pos, start_s))
+        hi = int(np.searchsorted(sorted_pos, end_s))
+        oob_f, match_f = run(lo, hi)  # FIXED: rank-space bounds
+        if oob_b or not match_b:
+          bad_buggy += 1
+        ok_fixed &= (not oob_f) and match_f
+    print(
+        f"  SC-bwd-emulation N={n_chunks}: fixed exact+in-bounds={ok_fixed}, "
+        f"buggy OOB-or-wrong shard-chunks={bad_buggy}/{total}"
+    )
+    if not ok_fixed:
+      failures.append(f"SC-bwd-emulation N={n_chunks}: fixed rank-space bounds wrong")
+    if n_chunks > 1 and bad_buggy == 0:
+      failures.append(f"SC-bwd-emulation N={n_chunks}: buggy bounds unexpectedly OK (0/{total})")
+    if n_chunks == 1 and bad_buggy:
+      failures.append("SC-bwd-emulation N=1: un-chunked bounds must be correct")
+
+
+def cotangent_single_ag_reorder_checks(failures):
+  """Rung 8b: OLD per-chunk-AG vs NEW single-AG + composed-index read, bit-exact.
+
+  The memory-flat bwd's step (1) used N per-chunk all_gathers of g_out concatenated in chunk
+  order (profiled: +1866 AG ops / +710ms exposed AG lane per step vs the flat fwd). g_out is
+  contiguous, so the bwd now issues ONE tiled all_gather of the whole buffer (SHARD-major row
+  order) and composes the (chunk, shard) -> (shard, chunk) row map into the gather's token
+  indices (``_bwd_ag_row`` -- pure int arithmetic, no data transpose, no extra cotangent
+  copy). Assert jnp.array_equal (bit-exact) between the per-chunk-AG concat and the
+  composed-index read of the single AG for EVERY row, under shard_map, f32 AND bf16 (the real
+  cotangent dtype), all EP x N combos, INCLUDING the identity-gated cases (n_chunks == 1).
+  """
+  devices = np.array(jax.devices())
+  for ep_size in (8, 4):
+    mesh = jax.sharding.Mesh(devices[:ep_size], ("ep",))
+    for dtype, dname in ((jnp.float32, "f32"), (jnp.bfloat16, "bf16")):
+      g_global = jax.random.normal(jax.random.PRNGKey(3), (NUM_TOKENS, HIDDEN), dtype=jnp.float32).astype(dtype)
+      for n_chunks in (1, 2, 4, 8):
+        rpc = (NUM_TOKENS // n_chunks) // ep_size  # rows_per_chunk_out
+
+        def body(g_out, _n=n_chunks, _rpc=rpc, _ep=ep_size):
+          # OLD (rung 8): N per-chunk AGs, concat in chunk order.
+          old = jnp.concatenate(
+              [jax.lax.all_gather(g_out[c * _rpc : (c + 1) * _rpc], "ep", axis=0, tiled=True) for c in range(_n)],
+              axis=0,
+          )
+          # NEW (rung 8b): ONE tiled AG; read row t through the composed index map, exactly
+          # as _chunked_combine_rs_bwd's _bwd_ag_row (incl. its n_chunks/ep_size gating).
+          g_full = jax.lax.all_gather(g_out, "ep", axis=0, tiled=True)
+          tok = jnp.arange(NUM_TOKENS, dtype=jnp.int32)
+          if _n > 1 and _ep > 1:
+            chunk_rows = _ep * _rpc
+            c, rem = tok // chunk_rows, tok % chunk_rows
+            r, i = rem // _rpc, rem % _rpc
+            tok = r * (_n * _rpc) + c * _rpc + i
+          new = g_full[tok]
+          return old, new
+
+        # check_vma=False: both outputs ARE replicated (tiled all_gather over the full axis)
+        # but the static VMA check cannot infer that.
+        fn = jax.shard_map(body, mesh=mesh, in_specs=(jax.P("ep"),), out_specs=(jax.P(), jax.P()), check_vma=False)
+        old, new = jax.jit(fn)(g_global)
+        exact = bool(jnp.array_equal(old, new))
+        print(f"  cotangent-AG-reorder EP={ep_size} N={n_chunks} {dname}: bit-exact={exact}")
+        if not exact:
+          failures.append(f"cotangent-AG-reorder EP={ep_size} N={n_chunks} {dname}: single-AG reorder != per-chunk AGs")
+
+
+def _token_and_scan_smokes(mesh, ep_size, bufs, group_sizes, revert, w_flat, n_chunks, grads_ref, failures):
+  """Two rung-8 bwd composition smokes (one EP/N combo is enough; math is combo-independent).
+
+  1. return_first_combine_token=True under grad: the custom_vjp fwd returns (out, token); the
+     bwd drops the token cotangent (it is identically zero through the moe_shared_after_combine
+     optimization_barrier fence). Grad wrt the buffer must be bit-identical to the no-token run.
+  2. lax.scan-wrapped grad with ridx/w derived from the CARRY (scan-body tracers), mirroring the
+     per-layer scan in the model: the custom_vjp takes them as EXPLICIT inputs, so this must
+     trace without "No constant handler for DynamicJaxprTracer" and match 2x the single-call
+     grad (2 identical accumulation steps).
+  """
+  local_e = NUM_EXPERTS // ep_size
+  fb = dict(enforce_gather_fallback=True, enforce_gather_reduce_fallback=True)
+  ct = jax.random.normal(jax.random.PRNGKey(7), (NUM_TOKENS, HIDDEN), dtype=jnp.float32)
+
+  # --- 1. token-emitting path under grad ---
+  def body_tok(buf, gs, ridx, wf):
+    out, tok = chunked_ring_combine_reduce_scatter(
+        buf[0], gs, ridx, TOPK, local_e, "ep", wf, ep_size, n_chunks, return_first_combine_token=True, **fb
+    )
+    return out, tok
+
+  fn_tok = jax.shard_map(
+      body_tok,
+      mesh=mesh,
+      in_specs=(jax.P("ep"), jax.P(), jax.P(), jax.P()),
+      out_specs=(jax.P("ep"), jax.P("ep")),
+  )
+  loss_tok = lambda b: jnp.vdot(jax.jit(fn_tok)(b, group_sizes, revert, w_flat)[0], ct)
+  g_tok = np.asarray(jax.grad(loss_tok)(bufs))
+  tdiff = np.abs(g_tok - grads_ref).max()
+  print(f"  token-path   N={n_chunks} BWD (return_first_combine_token): max|grad diff|={tdiff:.3e}")
+  if tdiff > 0.0:
+    failures.append(f"EP={ep_size} token-path N={n_chunks} BWD not bit-exact vs no-token run: {tdiff:.3e}")
+
+  # --- 2. scan-wrapped grad (carry-derived ridx/w tracers) ---
+  def body_scan(buf, gs, ridx, wf, ct_l):
+    buf = buf[0]
+
+    def step(carry, _):
+      # indices/weights DERIVED FROM THE CARRY -> scan-body tracers into the custom_vjp inputs,
+      # like routing derived from the carried activations in the per-layer scan.
+      ridx_t = ridx + (carry * 0.0).astype(jnp.int32)
+      wf_t = wf * carry
+      out = chunked_ring_combine_reduce_scatter(
+          buf, gs, ridx_t, TOPK, local_e, "ep", wf_t, ep_size, n_chunks, **fb
+      )
+      return carry, jnp.vdot(out, ct_l)
+
+    _, ys = jax.lax.scan(step, jnp.float32(1.0), None, length=2)
+    return jnp.sum(ys)[None]
+
+  fn_scan = jax.shard_map(
+      body_scan,
+      mesh=mesh,
+      in_specs=(jax.P("ep"), jax.P(), jax.P(), jax.P(), jax.P("ep")),
+      out_specs=jax.P("ep"),
+  )
+  loss_scan = lambda b: jnp.sum(jax.jit(fn_scan)(b, group_sizes, revert, w_flat, ct))
+  g_scan = np.asarray(jax.grad(loss_scan)(bufs))
+  sdiff = np.abs(g_scan - 2.0 * grads_ref).max()
+  print(f"  scan-wrapped N={n_chunks} BWD (carry-derived ridx/w): max|grad diff vs 2x single|={sdiff:.3e}")
+  if sdiff > 0.0:
+    failures.append(f"EP={ep_size} scan-wrapped N={n_chunks} BWD: max|grad diff vs 2x single|={sdiff:.3e}")
+
+
+def main():
+  devices = np.array(jax.devices())
+  assert len(devices) >= 8, f"need 8 CPU devices, got {len(devices)}"
+  failures = []
+
+  print("SC ragged_gather_reduce kernel-contract emulation (row-partition stride):")
+  sc_kernel_contract_checks(failures)
+
+  print("SC ragged_gather BWD kernel-contract emulation (rank-space [start,end) bounds):")
+  sc_bwd_kernel_contract_checks(failures)
+
+  print("SC ragged_gather MEMORY-FLAT single-vjp BWD emulation (full-permutation output rows):")
+  sc_memory_flat_bwd_contract_checks(failures)
+
+  print("Cotangent single-AG reorder vs per-chunk AGs (rung 8b, bit-exact):")
+  cotangent_single_ag_reorder_checks(failures)
+
+  for ep_size in (8, 4):
+    mesh = jax.sharding.Mesh(devices[:ep_size], ("ep",))
+    for case, skew in (("non-uniform", 3.0), ("uniform-ish", 0.0)):
+      key = jax.random.PRNGKey(42)
+      k_route, k_buf, k_w = jax.random.split(key, 3)
+      revert, group_sizes = _make_routing(k_route, skew=skew)
+      gs_np = np.asarray(group_sizes)
+      w_flat = jax.random.uniform(k_w, (NUM_TOKENS * TOPK,), dtype=jnp.float32)
+
+      # ---- full-buffer (mode 1) ----
+      bufs, buf_true = _make_full_buffers(k_buf, group_sizes, ep_size)
+      ref = _run(mesh, ep_size, bufs, group_sizes, revert, w_flat, 0)
+
+      # dense ground truth: out[t] = sum_k w[t*topk+k] * buf_true[revert[t*topk+k]]
+      gt = (np.asarray(buf_true)[np.asarray(revert)] * np.asarray(w_flat)[:, None]).reshape(
+          NUM_TOKENS, TOPK, HIDDEN
+      ).sum(axis=1)
+      gt_err = np.abs(gt - np.asarray(ref)).max()
+      print(f"EP={ep_size} {case}: group_sizes std={gs_np.std():.1f} min={gs_np.min()} max={gs_np.max()}; "
+            f"unchunked-ref vs dense ground truth max|diff|={gt_err:.3e}")
+      if gt_err > 2e-6:
+        failures.append(f"EP={ep_size} {case}: reference itself wrong ({gt_err:.3e})")
+
+      for n in (1, 2, 4, 8):
+        out = _run(mesh, ep_size, bufs, group_sizes, revert, w_flat, n)
+        max_all, _, _ = _report(f"full-buffer  N={n}", ref, out, ep_size, n)
+        if max_all > 1e-6:
+          failures.append(f"EP={ep_size} {case} full-buffer N={n}: max|diff|={max_all:.3e}")
+
+      # ---- autodiff backward (grad wrt the expert-sorted buffer), full-buffer mode ----
+      # Rung 8: the chunked combine carries ONE memory-flat custom_vjp (per-chunk all_gather
+      # transposes concatenated into a single full-buffer ragged_gather over the FULL permuted
+      # inverse permutation). Every multiply in that bwd has bit-identical operands to the
+      # un-chunked ring_ragged_unsort bwd (pure relabeling of slots/tokens), so the grad must be
+      # BIT-EXACT (== 0 diff), not just close.
+      ct = jax.random.normal(jax.random.PRNGKey(7), (NUM_TOKENS, HIDDEN), dtype=jnp.float32)
+      grads = {}
+      for n in (0, 1, 2, 4, 8):
+        loss_fn = lambda b, _n=n: jnp.vdot(_run(mesh, ep_size, b, group_sizes, revert, w_flat, _n), ct)
+        grads[n] = np.asarray(jax.grad(loss_fn)(bufs))
+      for n in (1, 2, 4, 8):
+        gdiff = np.abs(grads[n] - grads[0]).max()
+        print(f"  full-buffer  N={n} BWD: max|grad diff|={gdiff:.3e}")
+        if gdiff > 0.0:
+          failures.append(f"EP={ep_size} {case} full-buffer N={n} BWD not bit-exact: max|grad diff|={gdiff:.3e}")
+
+      if ep_size == 8 and case == "non-uniform":
+        _token_and_scan_smokes(mesh, ep_size, bufs, group_sizes, revert, w_flat, 4, grads[4], failures)
+
+      # ---- truncated packed buffer (mode 2 un-chunked; exercises the mode boundary) ----
+      buffer_size = 96 if ep_size == 8 else 192  # < T*topk/N for small N, >= for large N
+      bufs_t = _make_truncated_buffers(k_buf, group_sizes, ep_size, buffer_size)
+      ref_t = _run(mesh, ep_size, bufs_t, group_sizes, revert, w_flat, 0)
+      for n in (1, 2, 4, 8):
+        out_t = _run(mesh, ep_size, bufs_t, group_sizes, revert, w_flat, n)
+        max_all, _, _ = _report(f"trunc-buffer N={n} (B={buffer_size})", ref_t, out_t, ep_size, n)
+        if max_all > 1e-6:
+          failures.append(f"EP={ep_size} {case} trunc-buffer N={n}: max|diff|={max_all:.3e}")
+
+      # ---- truncated packed buffer BACKWARD (NEW capability of the rung-8 single vjp: the
+      # per-chunk bwd raised NotImplementedError here; the memory-flat bwd handles the packed
+      # mode because its idx_inv is the FULL inverse permutation, indexed by buffer position) ----
+      ct_t = jax.random.normal(jax.random.PRNGKey(11), (NUM_TOKENS, HIDDEN), dtype=jnp.float32)
+      grads_t = {}
+      for n in (0, 1, 2, 4, 8):
+        loss_fn_t = lambda b, _n=n: jnp.vdot(_run(mesh, ep_size, b, group_sizes, revert, w_flat, _n), ct_t)
+        grads_t[n] = np.asarray(jax.grad(loss_fn_t)(bufs_t))
+      for n in (1, 2, 4, 8):
+        gdiff = np.abs(grads_t[n] - grads_t[0]).max()
+        print(f"  trunc-buffer N={n} BWD: max|grad diff|={gdiff:.3e}")
+        if gdiff > 0.0:
+          failures.append(f"EP={ep_size} {case} trunc-buffer N={n} BWD not bit-exact: max|grad diff|={gdiff:.3e}")
+
+  print()
+  if failures:
+    print("FAILURES:")
+    for f in failures:
+      print(f"  {f}")
+    raise SystemExit(1)
+  print("ALL CASES PASSED (chunked == un-chunked reference)")
+
+
+if __name__ == "__main__":
+  main()
