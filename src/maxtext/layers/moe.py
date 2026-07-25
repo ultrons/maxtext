@@ -921,6 +921,9 @@ class RoutedMoE(nnx.Module):
       return size
     return self.mesh.shape.get(self._tensor_parallelism_name, 1)
 
+  def get_tensor_transpose_parallelism_size(self):
+    return self.mesh.shape.get("tensor_transpose", 1)
+
   def get_context_autoregressive_parallelism_size(self):
     return self.mesh.shape.get("context_autoregressive", 1)
 
