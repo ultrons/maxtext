@@ -39,6 +39,7 @@ COMPILE="compile_topology=tpu7x-512 compile_topology_num_slices=1 base_output_di
 
 echo "=== AOT gate: tpu7x-512, chunk=${CHUNK}, all levers ON ==="
 sudo docker run --rm \
+  -v /mnt/disks/scratch/maxtext-1410-upstream/src/maxtext:/deps/src/maxtext:ro \
   -e LIBTPU_INIT_ARGS="$BASEFLAGS" \
   -e JAX_PLATFORMS=cpu -e ENABLE_PJRT_COMPATIBILITY=true \
   "$IMAGE" \

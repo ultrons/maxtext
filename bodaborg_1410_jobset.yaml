@@ -29,11 +29,15 @@ spec:
           metadata:
             annotations:
               cloud.google.com/gke-tpu-slice-topology: "4x8x8"
+              cloud.google.com/skip-tpu-webhook-check: "true"
           spec:
             restartPolicy: Never
             nodeSelector:
               cloud.google.com/gke-tpu-accelerator: tpu7x
               cloud.google.com/gke-tpu-topology: 4x8x8
+              cloud.google.com/gke-accelerator-count: "4"
+              cloud.google.com/placement-policy-name: tpu7x-512-4x8x8-placement-policy
+              cloud.google.com/reservation-name: cloudtpu-20260710003900-159478293
             tolerations:
             - { key: google.com/tpu, operator: Exists, effect: NoSchedule }
             containers:
