@@ -945,6 +945,14 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use Ring of Experts for sparse matmul expert parallelism.",
   )
+  use_fused_a2a: bool = Field(
+      False,
+      description=(
+          "Replace the a2a MoE dispatch->gmm->combine with the vendored fused K1/K2 a2a kernel "
+          "(maxtext.kernels.a2a_fused). Requires use_ring_of_experts=False. PHASE B (no SwiGLU): "
+          "up->down only (loss wrong, perf signal); SwiGLU to be added."
+      ),
+  )
   moe_dispatch_no_expert_sharding: bool = Field(
       False,
       description=(

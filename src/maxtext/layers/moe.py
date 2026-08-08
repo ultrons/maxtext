@@ -2368,6 +2368,43 @@ class RoutedMoE(nnx.Module):
         saved_sort=None, sort_save_cell=None,
     ):
       batch_size, sequence_length, _ = x.shape
+
+      if self.config.use_fused_a2a:
+        # PHASE B: replace the a2a route->gmm->combine with the vendored fused K1/K2 a2a kernel.
+        # up->down ONLY (kernel has no gate/SwiGLU yet) => loss is WRONG; this is the PERF signal.
+        # _moe_body runs inside sparse_matmul's shard_map (expert axis present) so the fused
+        # layer's collectives work without a nested shard_map. w1=up, wo=down (gate w0 skipped).
+        from maxtext.kernels.a2a_fused.fused_layer_vjp import make_fused_moe_layer
+
+        _D = x.shape[-1]
+        _k = self.num_experts_per_tok
+        _weights, _sel = self.get_topk(logits, pre_bias_logits, rngs, sharded_input_ids)
+        _T = batch_size * sequence_length
+        _blk = 512
+        _cap = ((_T * _k + _blk - 1) // _blk) * _blk  # align_up(T*k, blk); dropless CAP
+        _mn = self.mesh.axis_names
+        _ms = dict(zip(self.mesh.axis_names, self.mesh.devices.shape))
+        _layer = make_fused_moe_layer(
+            ep=self.get_expert_parallelism_size(),
+            num_experts=self.config.num_experts,
+            cap_rows=_cap,
+            blk=_blk,
+            ep_axis=self._expert_parallelism_name,
+            mesh_axis_names=_mn,
+            mesh_shape=_ms,
+            recompute_residuals=True,
+            dw_impl="tgmm",
+            self_last=True,
+        )
+        _out = _layer(
+            x.reshape(_T, _D).astype(jnp.bfloat16),
+            _sel.reshape(_T, _k).astype(jnp.int32),
+            _weights.reshape(_T, _k).astype(jnp.float32),
+            w1.astype(jnp.bfloat16),
+            wo.astype(jnp.bfloat16),
+        )
+        return _out.reshape(batch_size, sequence_length, _D).astype(x.dtype), None, None
+
       x, routing, route_metadata = route(
           x, logits, pre_bias_logits, rngs, input_ids=sharded_input_ids,
           saved_sort=saved_sort, sort_save_cell=sort_save_cell,
