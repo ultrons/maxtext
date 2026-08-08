@@ -763,7 +763,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       return _merge(p, rest_).DeepSeekMoeBlock_0.gather_routed_weights()
 
     def _attn(p, x_in, seg, pos, rest_):
-      return _merge(p, rest_).self_attention_with_norm_op(x_in, seg, pos, det)  # (hidden, intermediate)
+      return _merge(p, rest_).self_attention_with_norm_op(x_in, seg, pos, det, self.model_mode)  # (hidden, intermediate)
 
     def _moe(p, hidden_states, intermediate_inputs, weights, rest_, saved_routing=None):
       # BACKWARD RECOMPUTE ONLY (called from fused_bwd below). By default
@@ -811,7 +811,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       # them so fused_fwd can device_put them to pinned_host (the residuals the backward loads instead of
       # recomputing the splash forward).
       wag_cell = {"host_offload_fwd": True} if self.config.moe_splash_host_offload else None
-      hidden_states, intermediate_inputs = m.self_attention_with_norm_op(x_in, seg0, pos0, det, wag_cell=wag_cell)
+      hidden_states, intermediate_inputs = m.self_attention_with_norm_op(x_in, seg0, pos0, det, self.model_mode, wag_cell=wag_cell)
       splash_out = wag_cell.get("splash_out") if wag_cell is not None else None
       splash_lse = wag_cell.get("splash_lse") if wag_cell is not None else None
       splash_out_spec = wag_cell.get("splash_out_spec") if wag_cell is not None else None
@@ -915,7 +915,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
           "host_out": _back(host_out, host_out_spec),
           "host_lse": _back(host_lse, host_lse_spec),
       }
-      return m.self_attention_with_norm_op(x_in, seg, pos, det, wag_cell=wag_cell)
+      return m.self_attention_with_norm_op(x_in, seg, pos, det, self.model_mode, wag_cell=wag_cell)
 
     def fused_bwd(res, cotangents):
       p, x_in, seg, pos, rest_, host_splash, saved_hidden, saved_routing = res
@@ -1030,7 +1030,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
         m = _merge(p, rest_)
         weights = m.DeepSeekMoeBlock_0.gather_routed_weights()
         wag_cell = {"host_offload_fwd": True} if _host_off_xl else None
-        hidden_states, intermediate_inputs = m.self_attention_with_norm_op(x_in, seg0, pos0, det, wag_cell=wag_cell)
+        hidden_states, intermediate_inputs = m.self_attention_with_norm_op(x_in, seg0, pos0, det, self.model_mode, wag_cell=wag_cell)
         so = wag_cell.get("splash_out") if wag_cell is not None else None
         sl = wag_cell.get("splash_lse") if wag_cell is not None else None
         sos = wag_cell.get("splash_out_spec") if wag_cell is not None else None
