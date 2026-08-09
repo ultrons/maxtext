@@ -55,6 +55,30 @@ from qwix.contrib.sparsity import sparsity_module
 import qwix.pallas as qpl
 import tokamax
 
+
+@jax.custom_vjp
+def _ste_quant(w, sc):
+  """Straight-through e4m3 quantizer for moe_fp8_boundary_qag.
+
+  Forward: e4m3 qvalue = clip(w / sc, +-448). Backward (STE): pass the incoming cotangent straight
+  through to w in BF16, d w = g / sc, with NO gradient to the scale. This keeps the weight gradient
+  in bf16 (never e4m3 -- an e4m3 gradient overflows and NaNs the weight reduce-scatter) and bypasses
+  the convert-to-e4m3 vjp entirely.
+  """
+  return jnp.clip(w / sc.astype(w.dtype), -448.0, 448.0).astype(jnp.float8_e4m3fn)
+
+
+def _ste_quant_fwd(w, sc):
+  return _ste_quant(w, sc), (sc,)
+
+
+def _ste_quant_bwd(res, g):
+  (sc,) = res
+  return (g.astype(jnp.bfloat16) / sc.astype(jnp.bfloat16), None)
+
+
+_ste_quant.defvjp(_ste_quant_fwd, _ste_quant_bwd)
+
 set_xla_metadata = xla_metadata.set_xla_metadata
 
 
@@ -2490,8 +2514,9 @@ class RoutedMoE(nnx.Module):
       intermediate_layer = gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather, w0_scale, w1_scale)
 
       wo_gather_axes, wo_tile_size = get_wo_gmm_params()
-      # moe_fp8_boundary_qag: build the wo QArray at the LAST moment (raw e4m3 qvalue + per-tensor scale)
-      _wo = qpl.QArray(qvalue=wo, scale=wo_scale, zero_point=None, qtype=jnp.float8_e4m3fn) if _fp8bq else wo
+      # moe_fp8_boundary_qag: wo STAYS bf16 (per-output-channel over its embed gather axis is unsound),
+      # so it is never quantized -- pass it through as-is regardless of _fp8bq.
+      _wo = wo
       intermediate_output = gmm_fn(
           intermediate_layer,
           _wo,
@@ -2675,6 +2700,10 @@ class RoutedMoE(nnx.Module):
     # boundary-gathers only e4m3); the per-tensor SCALES ride separate replicated args; the QArray is
     # reconstructed inside the body (no bf16 dequant between gather and gmm consumer -> no elision).
     _fp8bq = getattr(self.config, "moe_fp8_boundary_qag", False)
+    # moe_fp8_boundary_qag: the w0/w1 fp8 scale is [1,1,mlp] (per-mlp-channel, shared across experts),
+    # so it is REPLICATED -> P(). (A per-expert [exp,1,mlp] scale would need expert-axis sharding AND
+    # a stock gmm_v2 backward fix; deferred -- see _q_boundary.)
+    _w0sc_pspec = _w1sc_pspec = P()
 
     @functools.partial(
         jax.shard_map,
@@ -2691,9 +2720,9 @@ class RoutedMoE(nnx.Module):
             wo_bias_pspec,
             decoder_tokens_pspec,
             P(),  # Replicate the input key
-            P(),  # w0 fp8 qvalue scale (moe_fp8_boundary_qag)
-            P(),  # w1 fp8 qvalue scale
-            P(),  # wo fp8 qvalue scale
+            _w0sc_pspec,  # w0 fp8 qvalue scale (moe_fp8_boundary_qag, per-expert-channel sharded)
+            _w1sc_pspec,  # w1 fp8 qvalue scale (per-expert-channel sharded)
+            P(),  # wo scale unused (wo stays bf16)
             routing_bundle_specs if saved_routing is not None else None,
         ),
         out_specs=(
@@ -2836,13 +2865,24 @@ class RoutedMoE(nnx.Module):
     if wo_bias is not None:
       wo_bias = self._maybe_shard_with_pspec(wo_bias, wo_bias_pspec)
 
-    # moe_fp8_boundary_qag: quantize each fsdp-sharded weight to (e4m3 qvalue, DYNAMIC per-tensor
-    # scale). jnp.max over an fsdp-sharded array all-reduces to a global scalar. Pass the qvalue as
-    # the weight arg (keeps the weight pspec -> boundary-gathers e4m3) and the scale as a separate
-    # replicated arg; the QArray is rebuilt inside the body. Default: pass bf16 weight + dummy scales.
+    # moe_fp8_boundary_qag: quantize w0/w1 to (e4m3 qvalue, DYNAMIC PER-OUTPUT-CHANNEL scale) at the
+    # shard_map boundary. w0/w1 are [exp, embed, mlp], gathered over embed (fsdp); the output channel
+    # is the mlp axis, so scale = max(|w|, axis=embed)/448 -> [exp,1,mlp]. That max over the
+    # fsdp-sharded embed all-reduces a small [exp,1,mlp] tensor (cheap), and the scale is replicated
+    # along the embed gather axis -> gathering the e4m3 qvalue stays sound. wo is [exp, mlp, embed];
+    # its output channel IS embed = the gather axis, so per-output-channel + gather-over-embed is
+    # unsound -> wo STAYS bf16 (never quantized). Pass the qvalue as the weight arg (keeps the pspec
+    # -> boundary-gathers e4m3) + the scale as a replicated arg; the QArray is rebuilt before gmm_fn.
     def _q_boundary(w):
-      sc = (jnp.max(jnp.abs(w)).astype(jnp.float32) / 448.0 + 1e-20).reshape((1,) * w.ndim)
-      qv = jnp.clip(w / sc.astype(w.dtype), -448.0, 448.0).astype(jnp.float8_e4m3fn)
+      # DYNAMIC PER-OUTPUT-CHANNEL scale over the mlp axis, SHARED across the local experts: max over
+      # (expert axis 0, embed axis 1) -> [1,1,mlp]. Per-EXPERT [exp,1,mlp] is more granular but breaks
+      # stock gmm_v2 backward (_dlhs_scale_grad_by_rhs_scale repeats the per-expert scale by the GLOBAL
+      # group_sizes[256] vs the 32 local experts). [1,1,mlp] hits the shared-scale branch (no repeat),
+      # stays replicated along the embed gather axis (sound), and is still per-channel dynamic (not
+      # per-tensor). The max over the fsdp-sharded embed all-reduces a tiny [1,1,mlp] tensor (cheap).
+      sc = jax.lax.stop_gradient(
+          jnp.max(jnp.abs(w), axis=(0, 1), keepdims=True).astype(jnp.float32) / 448.0 + 1e-20)  # [1,1,mlp]
+      qv = _ste_quant(w, sc)  # STE custom_vjp: e4m3 fwd, bf16 d w = g/sc bwd (no e4m3 gradient)
       # Pin the e4m3 qvalue with an optimization_barrier so XLA's algebraic simplifier cannot sink the
       # bf16->e4m3 convert PAST the GSPMD boundary all-gather (which would gather bf16). REQUIRES
       # xla_tpu_aggressive_opt_barrier_removal=false at runtime, else the barrier is deleted first.
@@ -2851,7 +2891,7 @@ class RoutedMoE(nnx.Module):
     if _fp8bq:
       w0_kernel, _w0sc = _q_boundary(w0_kernel)
       w1_kernel, _w1sc = _q_boundary(w1_kernel)
-      wo_kernel, _wosc = _q_boundary(wo_kernel)
+      _wosc = jnp.float32(1.0)  # wo stays bf16 (per-output-channel over the embed gather axis is unsound)
     else:
       _w0sc = _w1sc = _wosc = jnp.float32(1.0)
     result = sparse_matmul_route_and_compute(
