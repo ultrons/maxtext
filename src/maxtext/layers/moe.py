@@ -1927,7 +1927,11 @@ class RoutedMoE(nnx.Module):
       return input_activation.shape[0] > 1
 
     def explicitly_weight_ag(shard_exp_on_fsdp):
-      if shard_exp_on_fsdp:
+      # moe_fp8_ring_weight_ag: also fire the in-GMM fp8 weight-AG (QAG) on the RING path
+      # (not shard_exp_on_fsdp) so the FSDP embed-sharded weight is gathered as the e4m3 qvalue
+      # (half the wire bytes) inside the GMM instead of the bf16 GSPMD boundary gather. Requires a
+      # fixed (static) weight scale so only the qvalue rides the wire.
+      if shard_exp_on_fsdp or getattr(self.config, "moe_fp8_ring_weight_ag", False):
         quantization_rule = qpl.get_current_rule("gmm")
         if quantization_rule and quantization_rule.weight_calibration_method.startswith("fixed"):
           return True
@@ -2239,12 +2243,17 @@ class RoutedMoE(nnx.Module):
           active.append((ax, tensor_dim_index))
       return active
 
+    _ring_fp8_wag = getattr(self.config, "moe_fp8_ring_weight_ag", False) and not self.config.shard_exp_on_fsdp
     def get_wi_gmm_params():
       wi_gather_axes = []
       if weight_gather:
-        # wi [Experts, In, Hidden] -> Gather Exp(0) and Hidden(2)
-        wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[0], 0))
-        wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[2], 2))
+        if _ring_fp8_wag:
+          # ring fp8 weight-AG: gather ONLY the FSDP-sharded In/embed (dim 1, the GMM contracting dim)
+          wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[1], 1))
+        else:
+          # wi [Experts, In, Hidden] -> Gather Exp(0) and Hidden(2)
+          wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[0], 0))
+          wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[2], 2))
       wi_tile_size = (
           self.config.wi_tile_fwd_batch_seq,  # m (LHS batch)
           self.config.wi_tile_fwd_embed_dim,  # k  (contracting)
@@ -2261,9 +2270,13 @@ class RoutedMoE(nnx.Module):
     def get_wo_gmm_params():
       wo_gather_axes = []
       if weight_gather:
-        # wo [Experts, Hidden, Out] -> Gather Exp(0) and Hidden(1)
-        wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[0], 0))
-        wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[1], 1))
+        if _ring_fp8_wag:
+          # ring fp8 weight-AG: gather ONLY the FSDP-sharded Out/embed (dim 2, the GMM output dim)
+          wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[2], 2))
+        else:
+          # wo [Experts, Hidden, Out] -> Gather Exp(0) and Hidden(1)
+          wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[0], 0))
+          wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[1], 1))
       wo_tile_size = (
           self.config.wo_tile_fwd_batch_seq,  # m (LHS batch)
           self.config.wo_tile_fwd_mlp_dim,  # k (contracting)

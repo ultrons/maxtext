@@ -1020,6 +1020,16 @@ class MoEGeneral(BaseModel):
           "behavior)."
       ),
   )
+  moe_fp8_ring_weight_ag: bool = Field(
+      False,
+      description=(
+          "Ring-of-experts (shard_exp_on_fsdp=False) + qwix fp8 (quantization=fp8_full, "
+          "use_qwix_quantization, fixed weight calibration). Fire the in-GMM fp8 weight-AG (the existing "
+          "QAG `_fwd_gather_weight`) on the ring path: gather the FSDP embed-sharded expert weight as the "
+          "e4m3 qvalue (HALF the wire bytes) inside gmm_v2 instead of the bf16 GSPMD boundary gather. "
+          "Targets the ~184 ms/step exposed weight-AG. Default False."
+      ),
+  )
   moe_fwd_direct_token_ag: bool = Field(
       False,
       description=(
