@@ -1,0 +1,83 @@
+# DISCRIMINATING TEST (advisor-designed): stock-JAX jax.distributed.initialize on a SINGLE
+# physical 4x4x4 pool, PINNED by nodepool. NO Kueue (no queue-name -> kube-scheduler places
+# directly, no gang formation), NO TAS composition annotations, NO slice-topology. Standard GKE
+# exclusive-topology single-slice. Goal: eliminate the 200+-pods-for-16-indices formation churn
+# that confounded every prior rung.
+#   RESULT_INIT_OK      => stock JAX works on this hardware; the enemy is TAS churn / VF release.
+#   START/STOP_SESSION  => VXC host-agent path broken on a virgin idle pool with a clean 16 -> infra.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: siv-init-pin7
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 16
+        completions: 16
+        backoffLimit: 0
+        completionMode: Indexed
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/skip-tpu-webhook-check: "true"
+          spec:
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-nodepool: bodaborg-super-tpu7x-y6k-np-7
+            tolerations:
+            - { key: google.com/tpu, operator: Equal, value: present, effect: NoSchedule }
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/integrate_v2:1410-upstream-ac9498b64
+              imagePullPolicy: IfNotPresent
+              command: ["bash","-c"]
+              args:
+              - |
+                set -u
+                IFS=',' read -ra HOSTS <<< "$TPU_WORKER_HOSTNAMES"
+                N=${#HOSTS[@]}
+                echo "WID=$TPU_WORKER_ID NODE=$NODE_NAME NHOSTS=$N barrier: waiting for peer DNS..."
+                stable=0
+                for attempt in $(seq 1 150); do
+                  ok=1
+                  for h in "${HOSTS[@]}"; do getent hosts "$h" >/dev/null 2>&1 || { ok=0; break; }; done
+                  if [ $ok -eq 1 ]; then stable=$((stable+1)); else stable=0; fi
+                  [ $stable -ge 2 ] && { echo "WID=$TPU_WORKER_ID all $N DNS stable at attempt $attempt"; break; }
+                  sleep 2
+                done
+                echo "WID=$TPU_WORKER_ID settle 30s..."; sleep 30
+                python3 -c '
+                import time,os
+                t0=time.time()
+                import jax
+                wid=os.environ.get("TPU_WORKER_ID"); node=os.environ.get("NODE_NAME")
+                print("WID",wid,"NODE",node,"calling initialize...",flush=True)
+                jax.distributed.initialize(initialization_timeout=900)
+                print("WID",wid,"NODE",node,"RESULT_INIT_OK dt=%.1f"%(time.time()-t0),"global=",jax.device_count(),"local=",jax.local_device_count(),flush=True)
+                import jax.numpy as jnp
+                x=jnp.ones(jax.local_device_count())
+                s=float(jnp.sum(jax.pmap(lambda a: jax.lax.psum(a,"i"),axis_name="i")(x)))
+                print("WID",wid,"NODE",node,"RESULT_COLLECTIVE_OK psum=",s,flush=True)
+                '
+                echo "PYEXIT=$? WID=$TPU_WORKER_ID NODE=$NODE_NAME"
+                sleep 120
+              env:
+              - { name: PYTHONUNBUFFERED, value: "1" }
+              - name: NODE_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: spec.nodeName
+              resources:
+                limits:   { google.com/tpu: "4" }
+                requests: { google.com/tpu: "4" }

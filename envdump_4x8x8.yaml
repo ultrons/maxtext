@@ -1,0 +1,59 @@
+# DIAGNOSTIC: dump webhook-injected TPU_* env for a 4x8x8 (64-host) composed slice.
+# No compile, maxRestarts:0. Confirms whether TPU_TOPOLOGY/HOST_BOUNDS = logical 4x8x8 (64h) or physical 4x4x4 (16h).
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: siv-envdump-4x8x8
+  namespace: default
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          kueue.x-k8s.io/queue-name: multislice-queue
+        annotations:
+          cloud.google.com/gke-tpu-slice-topology: 4x8x8
+      spec:
+        parallelism: 64
+        completions: 64
+        backoffLimit: 0
+        completionMode: Indexed
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: 4x8x8
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+              kueue.x-k8s.io/safe-to-forcefully-delete: "true"
+          spec:
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/reservation-name: ghostfish-y6kzjgh4shlno
+            tolerations:
+            - { key: google.com/tpu, operator: Equal, value: present, effect: NoSchedule }
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/integrate_v2:1410-upstream-ac9498b64
+              imagePullPolicy: IfNotPresent
+              command: ["bash","-c"]
+              args:
+              - |
+                echo "=== TPU ENV WORKER_ID=$TPU_WORKER_ID ==="
+                env | grep -E '^TPU_|^HOST_BOUNDS' | grep -v HOSTNAMES | sort
+                echo "TPU_WORKER_HOSTNAMES_COUNT=$(echo $TPU_WORKER_HOSTNAMES | tr ',' '\n' | wc -l)"
+                sleep 600
+              resources:
+                limits:
+                  google.com/tpu: "4"
+                requests:
+                  google.com/tpu: "4"

@@ -2075,6 +2075,29 @@ class RoutedMoE(nnx.Module):
               jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True)
               for z in (logits, pre_bias_logits)
           )
+        elif self.config.moe_wag_cotag_token and isinstance(self._expert_parallelism_name, str):
+          # moe_wag_cotag_token: FORWARD-ONLY-tag the EP token dispatch all-gather into the weight-AG
+          # scheduling group so XLA co-schedules it with the w0 FSDP weight all-gather (two SC-offload
+          # collectives on independent ICI axes -> concurrent on the 2 SparseCores). The custom_vjp keeps
+          # the BACKWARD transpose (a reduce-scatter) OUT of the group: a plain tagged all-gather would let
+          # its RS inherit the tag, and a forward AG + its backward RS in one group closes a scheduling
+          # CYCLE. Mirrors _make_cv_gather. Scheduling-only; numerics == lax.all_gather.
+          ep_axis = self._expert_parallelism_name
+
+          @jax.custom_vjp
+          def _ep_g(z):  # PRIMAL: plain all-gather (what the backward recompute re-traces)
+            return jax.lax.all_gather(z, axis_name=ep_axis, tiled=True)
+
+          def _ep_g_fwd(z):  # FORWARD under diff: tagged all-gather
+            with _scheduling_group(_WEIGHT_AG_SCHED_GROUP):
+              out = jax.lax.all_gather(z, axis_name=ep_axis, tiled=True)
+            return out, None  # no residual
+
+          def _ep_g_bwd(_res, ct):  # transpose of a tiled all-gather (concat axis 0) = reduce-scatter, UNtagged
+            return (jax.lax.psum_scatter(ct, axis_name=ep_axis, scatter_dimension=0, tiled=True),)
+
+          _ep_g.defvjp(_ep_g_fwd, _ep_g_bwd)
+          x, logits, pre_bias_logits = tuple(_ep_g(z) for z in (x, logits, pre_bias_logits))
         else:
           # Duplicate inputs to all expert shards.
           x, logits, pre_bias_logits = tuple(

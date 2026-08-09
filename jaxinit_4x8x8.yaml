@@ -1,0 +1,70 @@
+# DIAGNOSTIC: minimal jax.distributed.initialize() + trivial collective on composed 4x8x8.
+# Isolates libtpu ICI init (composition) from maxtext. No compile. maxRestarts:0.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: siv-jaxinit-4x8x8
+  namespace: default
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          kueue.x-k8s.io/queue-name: multislice-queue
+        annotations:
+          cloud.google.com/gke-tpu-slice-topology: 4x8x8
+      spec:
+        parallelism: 64
+        completions: 64
+        backoffLimit: 0
+        completionMode: Indexed
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: 4x8x8
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+              kueue.x-k8s.io/safe-to-forcefully-delete: "true"
+          spec:
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/reservation-name: ghostfish-y6kzjgh4shlno
+            tolerations:
+            - { key: google.com/tpu, operator: Equal, value: present, effect: NoSchedule }
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/integrate_v2:1410-upstream-ac9498b64
+              imagePullPolicy: IfNotPresent
+              command: ["bash","-c"]
+              args:
+              - |
+                python3 -c '
+                import time,os
+                t0=time.time()
+                import jax
+                print("WID",os.environ.get("TPU_WORKER_ID"),"calling initialize...",flush=True)
+                jax.distributed.initialize()
+                print("WID",os.environ.get("TPU_WORKER_ID"),"INIT_OK dt=%.1f"%(time.time()-t0),"global=",jax.device_count(),"local=",jax.local_device_count(),flush=True)
+                x=jax.numpy.ones(jax.local_device_count())
+                s=float(jax.numpy.sum(jax.pmap(lambda a: jax.lax.psum(a,"i"),axis_name="i")(x)))
+                print("WID",os.environ.get("TPU_WORKER_ID"),"COLLECTIVE_OK psum=",s,flush=True)
+                ' 2>&1
+                echo "EXITCODE=$? WID=$TPU_WORKER_ID"
+                sleep 120
+              env:
+              - { name: PYTHONUNBUFFERED, value: "1" }
+              resources:
+                limits:
+                  google.com/tpu: "4"
+                requests:
+                  google.com/tpu: "4"

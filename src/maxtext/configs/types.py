@@ -1020,6 +1020,19 @@ class MoEGeneral(BaseModel):
           "behavior)."
       ),
   )
+  moe_wag_cotag_token: bool = Field(
+      False,
+      description=(
+          "Ring-of-experts only; requires moe_weight_ag_scheduling_group=True. Tag the FORWARD EP token "
+          "dispatch all-gather (the 'duplicate x to all expert shards' gather over the expert axis) into "
+          "the weight-AG scheduling group (_WEIGHT_AG_SCHED_GROUP), so XLA co-schedules it with the w0 FSDP "
+          "weight all-gather -- two SC-offload collectives on independent ICI axes (expert token vs fsdp "
+          "weight) that can run concurrently on the 2 SparseCores under xla_tpu_enable_concurrent_sparse_"
+          "core_offloading. Forward-only-tagged custom_vjp (the backward psum_scatter stays OUT of the group, "
+          "else forward-AG + backward-RS in one group closes a scheduling CYCLE). Numerically == lax."
+          "all_gather. Default False = untagged dispatch AG."
+      ),
+  )
   moe_handwritten_bwd: bool = Field(
       False,
       description=(
