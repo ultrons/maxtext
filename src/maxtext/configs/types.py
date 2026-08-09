@@ -1029,6 +1029,16 @@ class MoEGeneral(BaseModel):
           "stays f32. amax movable to RMSNorm to hide the overhead. Default False."
       ),
   )
+  moe_fp8_boundary_qag: bool = Field(
+      False,
+      description=(
+          "Ring-of-experts: quantize expert weights (w0/w1/wo) to a qwix QArray (e4m3 qvalue + DYNAMIC "
+          "per-tensor scale) BEFORE the sparse_matmul shard_map, thread the QArray through so GSPMD "
+          "boundary-gathers ONLY the e4m3 qvalue (half wire bytes, overlapped), and feed qvalue+scale into "
+          "gmm_v2 (dequant in-kernel). No bf16 dequant between gather and consumer -> XLA cannot elide. "
+          "weight_gather_axes stays [] (no in-GMM re-gather). Forward-AG; targets ~184ms exposed weight-AG."
+      ),
+  )
   moe_fp8_ring_weight_ag: bool = Field(
       False,
       description=(

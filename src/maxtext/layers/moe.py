@@ -1869,8 +1869,12 @@ class RoutedMoE(nnx.Module):
           return tuple(sorted(a.strip() for a in vma_content.split(",")))
         return tuple()
 
+      # moe_fp8_boundary_qag: the kernel may be a qwix QArray (e4m3 qvalue + scale) built at the gmm
+      # call site. VMA is on the qvalue leaf, and we must NOT astype it to bf16 (that would dequant the
+      # e4m3 wire); ops.gmm consumes the QArray (rhs=qvalue, rhs_scale=scale) and dequants in-kernel.
+      _kernel_is_qarray = isinstance(kernel, qpl.QArray)
       lhs_vma_axes = extract_vma(inputs)
-      rhs_vma_axes = extract_vma(kernel)
+      rhs_vma_axes = extract_vma(kernel.qvalue if _kernel_is_qarray else kernel)
       if inputs.shape[0] != expert_assignments.shape[0]:
         raise ValueError("The number of input tokens must match the number of expert assignments!")
 
@@ -1878,7 +1882,8 @@ class RoutedMoE(nnx.Module):
       orig_inputs_shape = inputs.shape  # save shape of inputs before potentially padding.
       inputs, padding_amount = max_utils.maybe_pad(inputs, self.config.wi_tile_fwd_batch_seq)
       inputs = inputs.astype(self.dtype)
-      kernel = kernel.astype(self.dtype)
+      if not _kernel_is_qarray:
+        kernel = kernel.astype(self.dtype)
       lhs_quantize_dtype, rhs_quantize_dtype = get_quantization_dtypes()
 
       # Interpret the megablox Pallas kernel only when the TARGET is NOT TPU (CPU or GPU,
@@ -2305,10 +2310,12 @@ class RoutedMoE(nnx.Module):
       )
       return wo_gather_axes, wo_tile_size
 
-    def gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather):
+    def gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather, w0_scale=None, w1_scale=None):
       """Run the two up-projections (gate + up) and apply the FFN activation."""
       wi_gather_axes, wi_tile_size = get_wi_gmm_params()
-      if self.config.prefuse_moe_weights:
+      # moe_fp8_boundary_qag: build the w0/w1 QArrays at the LAST moment (raw e4m3 qvalue + per-tensor
+      # scale). Force the non-prefuse path (can't concat two e4m3 tensors with different per-tensor scales).
+      if self.config.prefuse_moe_weights and not _fp8bq:
         # Weights are stored as (G,K,2N); w0/w1 are adjacent slices so XLA elides this concat.
         w_fused = jnp.concatenate([w0, w1], axis=-1)
         out = gmm_fn(x, w_fused, tiling=wi_tile_size, weight_gather_axes=wi_gather_axes)
@@ -2323,9 +2330,11 @@ class RoutedMoE(nnx.Module):
         layer_w0 = adc.checkpoint_name(adc.checkpoint_name(layer_w0, "mlpwi_0"), "moe_mlpwi_0")
         layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
       else:
+        _w0 = qpl.QArray(qvalue=w0, scale=w0_scale, zero_point=None, qtype=jnp.float8_e4m3fn) if _fp8bq else w0
+        _w1 = qpl.QArray(qvalue=w1, scale=w1_scale, zero_point=None, qtype=jnp.float8_e4m3fn) if _fp8bq else w1
         layer_w0 = gmm_fn(
             x,
-            w0,
+            _w0,
             tiling=wi_tile_size,
             weight_gather_axes=wi_gather_axes,
         )
@@ -2337,7 +2346,7 @@ class RoutedMoE(nnx.Module):
 
         layer_w1 = gmm_fn(
             x,
-            w1,
+            _w1,
             tiling=wi_tile_size,
             weight_gather_axes=wi_gather_axes,
         )
@@ -2429,7 +2438,7 @@ class RoutedMoE(nnx.Module):
 
     def _moe_body(
         x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs,
-        saved_sort=None, sort_save_cell=None,
+        w0_scale=None, w1_scale=None, wo_scale=None, saved_sort=None, sort_save_cell=None,
     ):
       batch_size, sequence_length, _ = x.shape
 
@@ -2478,12 +2487,14 @@ class RoutedMoE(nnx.Module):
         w0_bias, w1_bias, wo_bias = self.transform_bias(routing.selected_experts, w0_bias, w1_bias, wo_bias)
 
       gmm_fn = get_gmm_for_local_experts(x, routing, route_metadata)
-      intermediate_layer = gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather)
+      intermediate_layer = gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather, w0_scale, w1_scale)
 
       wo_gather_axes, wo_tile_size = get_wo_gmm_params()
+      # moe_fp8_boundary_qag: build the wo QArray at the LAST moment (raw e4m3 qvalue + per-tensor scale)
+      _wo = qpl.QArray(qvalue=wo, scale=wo_scale, zero_point=None, qtype=jnp.float8_e4m3fn) if _fp8bq else wo
       intermediate_output = gmm_fn(
           intermediate_layer,
-          wo,
+          _wo,
           tiling=wo_tile_size,
           weight_gather_axes=wo_gather_axes,
       )
@@ -2660,6 +2671,11 @@ class RoutedMoE(nnx.Module):
       sel, tis, gs, rev = bundle
       return (sel, tis, gs[0], rev)
 
+    # moe_fp8_boundary_qag: the weight args carry the e4m3 QVALUE (keep the weight pspec -> GSPMD
+    # boundary-gathers only e4m3); the per-tensor SCALES ride separate replicated args; the QArray is
+    # reconstructed inside the body (no bf16 dequant between gather and gmm consumer -> no elision).
+    _fp8bq = getattr(self.config, "moe_fp8_boundary_qag", False)
+
     @functools.partial(
         jax.shard_map,
         mesh=self.mesh,
@@ -2675,6 +2691,9 @@ class RoutedMoE(nnx.Module):
             wo_bias_pspec,
             decoder_tokens_pspec,
             P(),  # Replicate the input key
+            P(),  # w0 fp8 qvalue scale (moe_fp8_boundary_qag)
+            P(),  # w1 fp8 qvalue scale
+            P(),  # wo fp8 qvalue scale
             routing_bundle_specs if saved_routing is not None else None,
         ),
         out_specs=(
@@ -2693,8 +2712,13 @@ class RoutedMoE(nnx.Module):
         check_vma=self.config.check_vma,
     )
     def sparse_matmul_route_and_compute(
-        x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs, saved_routing_in
+        x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs,
+        w0_scale, w1_scale, wo_scale, saved_routing_in
     ):
+      # moe_fp8_boundary_qag: w0/w1/wo arrived as boundary-gathered e4m3 qvalues (RAW arrays). They
+      # flow through _moe_body/route/gmm_up as raw e4m3; the QArray is built at the LAST moment, right
+      # before each gmm_fn call (gmm_up/gmm_down), so the ring plumbing never sees a QArray. The
+      # per-tensor scales (w0_scale/w1_scale/wo_scale) thread alongside to those call sites.
       # The expert weights (w0/w1/wo) are all-gathered over FSDP once at this
       # shard_map entry (implicitly, via the `embed_tensor_transpose` pspec which
       # drops fsdp -> GSPMD inserts the boundary all-gather) and reused across all
@@ -2705,6 +2729,7 @@ class RoutedMoE(nnx.Module):
         saved_c = _unpack_routing_chunk(saved_routing_in[0]) if saved_routing_in is not None else None
         result = _moe_body(
             x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs,
+            w0_scale=w0_scale, w1_scale=w1_scale, wo_scale=wo_scale,
             saved_sort=saved_c, sort_save_cell=cell,
         )
         if save_routing:
@@ -2746,6 +2771,9 @@ class RoutedMoE(nnx.Module):
             wo_bias,
             None if sharded_input_ids is None else sharded_input_ids[:, sl],
             rngs,
+            w0_scale=w0_scale,
+            w1_scale=w1_scale,
+            wo_scale=wo_scale,
             saved_sort=saved_c,
             sort_save_cell=cell,
         )
@@ -2808,6 +2836,20 @@ class RoutedMoE(nnx.Module):
     if wo_bias is not None:
       wo_bias = self._maybe_shard_with_pspec(wo_bias, wo_bias_pspec)
 
+    # moe_fp8_boundary_qag: quantize each fsdp-sharded weight to (e4m3 qvalue, DYNAMIC per-tensor
+    # scale). jnp.max over an fsdp-sharded array all-reduces to a global scalar. Pass the qvalue as
+    # the weight arg (keeps the weight pspec -> boundary-gathers e4m3) and the scale as a separate
+    # replicated arg; the QArray is rebuilt inside the body. Default: pass bf16 weight + dummy scales.
+    def _q_boundary(w):
+      sc = (jnp.max(jnp.abs(w)).astype(jnp.float32) / 448.0 + 1e-20).reshape((1,) * w.ndim)
+      qv = jnp.clip(w / sc.astype(w.dtype), -448.0, 448.0).astype(jnp.float8_e4m3fn)
+      return qv, sc
+    if _fp8bq:
+      w0_kernel, _w0sc = _q_boundary(w0_kernel)
+      w1_kernel, _w1sc = _q_boundary(w1_kernel)
+      wo_kernel, _wosc = _q_boundary(wo_kernel)
+    else:
+      _w0sc = _w1sc = _wosc = jnp.float32(1.0)
     result = sparse_matmul_route_and_compute(
         inputs,
         gate_logits,
@@ -2820,6 +2862,9 @@ class RoutedMoE(nnx.Module):
         wo_bias,
         input_ids,
         self.rngs,
+        _w0sc,
+        _w1sc,
+        _wosc,
         saved_routing,
     )
     if return_combine_token and not emit_combine_token:
