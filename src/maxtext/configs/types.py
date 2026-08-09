@@ -1020,6 +1020,15 @@ class MoEGeneral(BaseModel):
           "behavior)."
       ),
   )
+  moe_fp8_dispatch_wire: bool = Field(
+      False,
+      description=(
+          "Ring-of-experts: quantize the dispatch tokens to e4m3 (global scale) so the ring dispatch "
+          "gather moves HALF the wire bytes (ragged_gather dtype-agnostic, packing 2->4), then dequant "
+          "back to bf16 after the sort (GMM re-quantizes in-kernel). Wire-only: the k-way combine reduce "
+          "stays f32. amax movable to RMSNorm to hide the overhead. Default False."
+      ),
+  )
   moe_fp8_ring_weight_ag: bool = Field(
       False,
       description=(

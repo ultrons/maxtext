@@ -1234,8 +1234,20 @@ class RoutedMoE(nnx.Module):
               topk_indices_2d, self.config.num_experts, self.num_experts_per_tok
           )
           sort_save_cell["sort_bundle"] = (selected_experts,) + tuple(precomputed_sort)
+        # moe_fp8_dispatch_wire: quantize the dispatch tokens to e4m3 (global scale) so the ring
+        # dispatch gather moves HALF the wire bytes (ragged_gather is dtype-agnostic, packing 2->4),
+        # then dequant back to bf16 right after the sort (the GMM re-quantizes in-kernel as today).
+        # Wire-only: the k-way combine reduce stays f32/bf16. amax here is a full reduction (movable
+        # to the RMSNorm epilogue later to hide it). Gated, default off.
+        _fp8_wire = getattr(self.config, "moe_fp8_dispatch_wire", False) and isinstance(
+            self._expert_parallelism_name, str
+        )
+        _dispatch_in = inputs_2d
+        if _fp8_wire:
+          _wire_scale = (jnp.max(jnp.abs(inputs_2d)).astype(jnp.float32) / 448.0 + 1e-20)
+          _dispatch_in = (inputs_2d / _wire_scale.astype(inputs_2d.dtype)).astype(jnp.float8_e4m3fn)
         sorted_inputs, group_size, sorted_selected_experts = ring_ragged_sort(
-            inputs_2d,
+            _dispatch_in,
             topk_indices_2d,
             self.config.num_experts,
             self.num_experts_per_tok,
@@ -1251,6 +1263,9 @@ class RoutedMoE(nnx.Module):
             precomputed_sort=precomputed_sort,
             use_single_sparsecore=self.config.ragged_sort_use_single_sparsecore,
         )
+        if _fp8_wire:
+          # dequant the e4m3-dispatched tokens back to bf16 (the GMM quantizes in-kernel as today)
+          sorted_inputs = sorted_inputs.astype(inputs_2d.dtype) * _wire_scale.astype(inputs_2d.dtype)
     else:
       if saved_sort is not None or sort_save_cell is not None:
         raise ValueError("moe_save_sort_indices requires the ring ragged-sort path (use_ragged_sort + ring of experts).")

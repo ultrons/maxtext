@@ -192,6 +192,12 @@ def ring_ragged_sort(
         _,
     ) = res
     g_x, _, _ = g_out
+    # fp8 wire (moe_fp8_dispatch_wire): the forward may dispatch an e4m3 tensor, so the cotangent
+    # is 8-bit-float-typed. Gradients flow in bf16 regardless of the forward wire dtype -- normalize
+    # so the gather-reduce (which multiplies by f32 weights) doesn't hit an 8-bit promotion. No-op
+    # for the normal bf16 path; leaves f32 configs untouched.
+    if jnp.issubdtype(g_x.dtype, jnp.floating) and g_x.dtype.itemsize < 2:
+      g_x = g_x.astype(jnp.bfloat16)
     # Restrict to the [start, end) source range via a validity bitmask. The
     # ragged kernel packs valid rows to the front of each row-partition and
     # only iterates over the populated prefix, so we hand it the mask directly
