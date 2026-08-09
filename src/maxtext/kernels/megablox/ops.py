@@ -178,6 +178,12 @@ def _gmm_fwd(
   - rhs: [g, k, n] if transpose_rhs=False. [g, n, k] if transpose_rhs=True
   """
 
+  # moe_fp8_boundary_qag: record whether the PRIMAL rhs arg was already a QArray on entry (pre-quantized
+  # e4m3 weight built at the ring gmm call site). Baseline qwix quantizes rhs INSIDE this fwd (primal
+  # arg is a plain array, residual rhs is a QArray), so the residual's QArray-ness cannot distinguish
+  # the two -- only the entry type can. The VJP cotangent structure must match the PRIMAL arg.
+  rhs_is_qarray_input = isinstance(rhs, qpl.QArray)
+
   # Quantize activation and weight
   if quantization_rule:
     # pyrefly: ignore[bad-assignment]
@@ -218,7 +224,7 @@ def _gmm_fwd(
         lhs_vma_axes,
     )
 
-  return out, (lhs, rhs, group_sizes, group_offset, partial_sum)  # pyrefly: ignore[bad-return]
+  return out, (lhs, rhs, group_sizes, group_offset, partial_sum, rhs_is_qarray_input)  # pyrefly: ignore[bad-return]
 
 
 def _fwd_quantize_activation_and_weight(
@@ -420,8 +426,14 @@ def _gmm_bwd(
 ) -> tuple[jnp.ndarray, jnp.ndarray, None, None, jnp.ndarray | None, jnp.ndarray | None]:
   """Backward function for throughput GMM VJP."""
   del preferred_element_type
-  lhs, rhs, group_sizes, group_offset, partial_sum_fwd = residual
+  lhs, rhs, group_sizes, group_offset, partial_sum_fwd, rhs_is_qarray_input = residual
   num_actual_groups = rhs.shape[0]
+  # moe_fp8_boundary_qag: if the PRIMAL rhs arg was a QArray (pre-quantized e4m3 weight built at the
+  # ring gmm call site), _bwd_prepare_inputs unwraps it to rhs.qvalue below, so _compute_drhs yields a
+  # plain-array weight gradient -- but the VJP cotangent must match the QArray pytree. Capture the
+  # QArray here and re-wrap drhs at the end with a ZERO scale cotangent (forward-only fp8: the
+  # deterministic per-tensor scale carries no gradient). Baseline (rhs_is_qarray_input=False): no wrap.
+  _orig_rhs_qarray = rhs if rhs_is_qarray_input else None
 
   # Jargon used here:
   #  - lhs: input activation in forward pass, possibly quantized.
@@ -481,6 +493,14 @@ def _gmm_bwd(
   #
   # TODO(tgale, enriqueps, apaske): Fuse this transposition into the tgmm.
   drhs = drhs.swapaxes(1, 2) if transpose_rhs else drhs
+  if _orig_rhs_qarray is not None:
+    # Match the QArray pytree of the primal rhs; zero scale cotangent (forward-only fp8 weight-AG).
+    drhs = qpl.QArray(
+        qvalue=drhs.astype(_orig_rhs_qarray.qvalue.dtype),
+        scale=jnp.zeros_like(_orig_rhs_qarray.scale),
+        zero_point=None,
+        qtype=_orig_rhs_qarray.qtype,
+    )
   dpartial_sum = grad if partial_sum_fwd is not None else None
   d_existing_out = None if use_tokamax_backend else grad
 
