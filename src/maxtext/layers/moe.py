@@ -2843,6 +2843,10 @@ class RoutedMoE(nnx.Module):
     def _q_boundary(w):
       sc = (jnp.max(jnp.abs(w)).astype(jnp.float32) / 448.0 + 1e-20).reshape((1,) * w.ndim)
       qv = jnp.clip(w / sc.astype(w.dtype), -448.0, 448.0).astype(jnp.float8_e4m3fn)
+      # Pin the e4m3 qvalue with an optimization_barrier so XLA's algebraic simplifier cannot sink the
+      # bf16->e4m3 convert PAST the GSPMD boundary all-gather (which would gather bf16). REQUIRES
+      # xla_tpu_aggressive_opt_barrier_removal=false at runtime, else the barrier is deleted first.
+      qv = jax.lax.optimization_barrier(qv)
       return qv, sc
     if _fp8bq:
       w0_kernel, _w0sc = _q_boundary(w0_kernel)
