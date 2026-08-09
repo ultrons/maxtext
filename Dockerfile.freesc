@@ -1,0 +1,3 @@
+FROM gcr.io/tpu-vm-gke-testing/integrate_v2:1410-up2-d59a6a618
+RUN rm -rf /deps/src/maxtext
+COPY src/maxtext/ /deps/src/maxtext/

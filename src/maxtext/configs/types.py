@@ -1020,6 +1020,17 @@ class MoEGeneral(BaseModel):
           "behavior)."
       ),
   )
+  moe_fwd_direct_token_ag: bool = Field(
+      False,
+      description=(
+          "Ring-of-experts only, single-axis expert. Run the FORWARD EP token dispatch all-gather (the big "
+          "bf16[tokens,embed] 'duplicate x to all expert shards' gather) with the direct-to-owner TensorCore "
+          "Pallas kernel (_direct_all_gather) instead of the XLA lax.all_gather -- moving it OFF the "
+          "SparseCore offload queue (the SC-lane binder) onto the TC ICI DMAs. Small routing logits stay on "
+          "the plain collective. custom_vjp gives the same psum_scatter transpose (numerics == lax."
+          "all_gather). Symmetric to moe_direct_token_ag (backward recompute). Default False."
+      ),
+  )
   moe_wag_cotag_token: bool = Field(
       False,
       description=(

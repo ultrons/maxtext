@@ -263,6 +263,7 @@ _direct_all_gather.defvjp(_dag_fwd, _dag_bwd)
 # signals. (In practice token-AG is dispatch-phase and combine-AG is combine-phase, so they are not
 # concurrently in flight anyway; distinct ids are belt-and-suspenders.)
 _DIRECT_TOKEN_AG_COLLECTIVE_ID = 40  # moe_direct_token_ag: backward-recompute EP token all-gather
+_DIRECT_FWD_TOKEN_AG_COLLECTIVE_ID = 45  # moe_fwd_direct_token_ag: FORWARD EP token dispatch all-gather
 _DIRECT_COMBINE_AG_COLLECTIVE_ID = 50  # moe_direct_combine_ag: backward combine-cotangent all-gather (== .626)
 
 
@@ -2071,6 +2072,18 @@ class RoutedMoE(nnx.Module):
           # Flag-off (bwd_direct_token_ag=False, and the whole forward) takes the tuple gather below
           # => byte-identical.
           x = _direct_all_gather(x, self.mesh, self._expert_parallelism_name, _DIRECT_TOKEN_AG_COLLECTIVE_ID)
+          logits, pre_bias_logits = tuple(
+              jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True)
+              for z in (logits, pre_bias_logits)
+          )
+        elif self.config.moe_fwd_direct_token_ag and isinstance(self._expert_parallelism_name, str):
+          # moe_fwd_direct_token_ag: run the FORWARD EP token dispatch all-gather of the big token tensor
+          # `x` (bf16[tokens,embed]) with the direct-to-owner TensorCore Pallas kernel (_direct_all_gather)
+          # instead of the XLA lax.all_gather -- moving it OFF the SparseCore offload queue (the 4.07s
+          # binder) onto the TC ICI DMAs. The small routing logits stay on the plain collective. Its
+          # custom_vjp gives the same psum_scatter transpose, so numerics == lax.all_gather. Symmetric to
+          # moe_direct_token_ag (which does the BACKWARD recompute); this does the FORWARD dispatch.
+          x = _direct_all_gather(x, self.mesh, self._expert_parallelism_name, _DIRECT_FWD_TOKEN_AG_COLLECTIVE_ID)
           logits, pre_bias_logits = tuple(
               jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True)
               for z in (logits, pre_bias_logits)
