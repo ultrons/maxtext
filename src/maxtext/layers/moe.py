@@ -2342,7 +2342,7 @@ class RoutedMoE(nnx.Module):
       wi_gather_axes, wi_tile_size = get_wi_gmm_params()
       # moe_fp8_boundary_qag: build the w0/w1 QArrays at the LAST moment (raw e4m3 qvalue + per-tensor
       # scale). Force the non-prefuse path (can't concat two e4m3 tensors with different per-tensor scales).
-      if self.config.prefuse_moe_weights and not _fp8bq:
+      if self.config.prefuse_moe_weights and not _fp8q:
         # Weights are stored as (G,K,2N); w0/w1 are adjacent slices so XLA elides this concat.
         w_fused = jnp.concatenate([w0, w1], axis=-1)
         out = gmm_fn(x, w_fused, tiling=wi_tile_size, weight_gather_axes=wi_gather_axes)
@@ -2357,8 +2357,8 @@ class RoutedMoE(nnx.Module):
         layer_w0 = adc.checkpoint_name(adc.checkpoint_name(layer_w0, "mlpwi_0"), "moe_mlpwi_0")
         layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
       else:
-        _w0 = qpl.QArray(qvalue=w0, scale=w0_scale, zero_point=None, qtype=jnp.float8_e4m3fn) if _fp8bq else w0
-        _w1 = qpl.QArray(qvalue=w1, scale=w1_scale, zero_point=None, qtype=jnp.float8_e4m3fn) if _fp8bq else w1
+        _w0 = qpl.QArray(qvalue=w0, scale=w0_scale, zero_point=None, qtype=jnp.float8_e4m3fn) if _fp8q else w0
+        _w1 = qpl.QArray(qvalue=w1, scale=w1_scale, zero_point=None, qtype=jnp.float8_e4m3fn) if _fp8q else w1
         layer_w0 = gmm_fn(
             x,
             _w0,
@@ -2517,9 +2517,10 @@ class RoutedMoE(nnx.Module):
       intermediate_layer = gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather, w0_scale, w1_scale)
 
       wo_gather_axes, wo_tile_size = get_wo_gmm_params()
-      # moe_fp8_boundary_qag: wo STAYS bf16 (per-output-channel over its embed gather axis is unsound),
-      # so it is never quantized -- pass it through as-is regardless of _fp8bq.
-      _wo = wo
+      # moe_fp8_cv_weight_ag (_fp8wo): wo arrives as an e4m3 qvalue gathered by the cv-gather; build
+      # its QArray here (global [1,1,embed] scale -- identical on every shard, no consistency issue).
+      # moe_fp8_boundary_qag keeps wo bf16 (per-output-channel over its embed GSPMD-gather is unsound).
+      _wo = qpl.QArray(qvalue=wo, scale=wo_scale, zero_point=None, qtype=jnp.float8_e4m3fn) if _fp8wo else wo
       intermediate_output = gmm_fn(
           intermediate_layer,
           _wo,
@@ -2703,6 +2704,7 @@ class RoutedMoE(nnx.Module):
     # boundary-gathers only e4m3); the per-tensor SCALES ride separate replicated args; the QArray is
     # reconstructed inside the body (no bf16 dequant between gather and gmm consumer -> no elision).
     _fp8bq = getattr(self.config, "moe_fp8_boundary_qag", False)
+    _fp8cv = getattr(self.config, "moe_fp8_cv_weight_ag", False)
     # moe_fp8_boundary_qag: the w0/w1 fp8 scale is [1,1,mlp] (per-mlp-channel, shared across experts),
     # so it is REPLICATED -> P(). (A per-expert [exp,1,mlp] scale would need expert-axis sharding AND
     # a stock gmm_v2 backward fix; deferred -- see _q_boundary.)
@@ -2823,6 +2825,16 @@ class RoutedMoE(nnx.Module):
         return output, lb_loss, bias_updates, tuple(routing_bundles)
       return output, lb_loss, bias_updates
 
+    # moe_fp8_cv_weight_ag: pregathered weights arrive as qwix QArrays (e4m3 qvalue gathered by the
+    # fp8 cv-gather + replicated [1,1,n] f32 scale). Split BEFORE any sharding constraint: the qvalue
+    # rides the normal weight arg (already gathered -> the shard_map boundary gather is a no-op), the
+    # scale rides the threaded scale args; the QArray is rebuilt at the gmm call sites.
+    _fp8cv_in = _fp8cv and isinstance(w0_kernel, qpl.QArray)
+    if _fp8cv_in:
+      _w0sc, w0_kernel = w0_kernel.scale, w0_kernel.qvalue
+      _w1sc, w1_kernel = w1_kernel.scale, w1_kernel.qvalue
+      _wosc, wo_kernel = wo_kernel.scale, wo_kernel.qvalue
+
     if self.config.moe_fsdp_use_two_stage_all_gather:
       # Unshard on fsdp axis
       w0_kernel = self._maybe_shard_with_logical(w0_kernel, ("exp_with_fsdp", "embed_tensor_transpose", "mlp"))
@@ -2891,12 +2903,18 @@ class RoutedMoE(nnx.Module):
       # xla_tpu_aggressive_opt_barrier_removal=false at runtime, else the barrier is deleted first.
       qv = jax.lax.optimization_barrier(qv)
       return qv, sc
-    if _fp8bq:
+    if _fp8cv_in:
+      pass  # scales already split from the pregathered QArrays above
+    elif _fp8bq:
       w0_kernel, _w0sc = _q_boundary(w0_kernel)
       w1_kernel, _w1sc = _q_boundary(w1_kernel)
       _wosc = jnp.float32(1.0)  # wo stays bf16 (per-output-channel over the embed gather axis is unsound)
     else:
       _w0sc = _w1sc = _wosc = jnp.float32(1.0)
+    # Body-level fp8 gates (late-bound closures read these at trace time inside the shard_map body):
+    # _fp8q -> build the w0/w1 QArray at the gmm call sites; _fp8wo -> wo too (cv path only).
+    _fp8q = _fp8bq or _fp8cv_in
+    _fp8wo = _fp8cv_in
     result = sparse_matmul_route_and_compute(
         inputs,
         gate_logits,
@@ -3613,7 +3631,10 @@ class RoutedMoE(nnx.Module):
       - wo_only=True: gather ONLY wo (the consumer path, where w0/w1 come from swap_gather_w01).
     """
     cfg = self.config
-    if not (cfg.moe_weight_ag_scheduling_group and cfg.use_ring_of_experts and not cfg.shard_exp_on_fsdp):
+    _fp8cv = getattr(cfg, "moe_fp8_cv_weight_ag", False)
+    if not (
+        (cfg.moe_weight_ag_scheduling_group or _fp8cv) and cfg.use_ring_of_experts and not cfg.shard_exp_on_fsdp
+    ):
       return None
     # Only the plain path is safe to pre-gather; otherwise weights need
     # post-processing (scale/sparsity/fuse) that happens in __call__.
@@ -3674,12 +3695,69 @@ class RoutedMoE(nnx.Module):
       _g.defvjp(_g_fwd, _g_bwd)
       return _g
 
+    # moe_fp8_cv_weight_ag: fp8 variant of _make_cv_gather. Quantize the BF16 param to e4m3 with the
+    # caller-supplied [1,1,n] scale, then all-gather the QVALUE inside the mini shard_map. The
+    # SPMDFullToShardShape boundary is opaque to the algebraic simplifier, so the bf16->e4m3 convert
+    # CANNOT be sunk past the collective (the elision that killed every GSPMD-boundary attempt).
+    # Backward: ct (bf16, from the gmm QArray-drhs) -> psum_scatter bf16 -> /scale = STE weight grad
+    # in BF16 (the ct is NEVER cast to e4m3 -- that overflow was the round-1 NaN).
+    def _make_cv_quant_gather(in_pspec, out_pspec, gather_axis, sched_group):
+      def _quant(w, sc):
+        return jnp.clip(w / sc.astype(w.dtype), -448.0, 448.0).astype(jnp.float8_e4m3fn)
+
+      @jax.custom_vjp
+      def _g(w, sc):  # PRIMAL: plain quantize + gather (what remat recomputes in the backward)
+        return jax.shard_map(
+            lambda x: jax.lax.all_gather(x, "fsdp", axis=gather_axis, tiled=True),
+            mesh=self.mesh, in_specs=(in_pspec,), out_specs=out_pspec, check_vma=False)(_quant(w, sc))
+
+      def _g_fwd(w, sc):  # FORWARD under diff: optionally annotated gather (overlaps attention)
+        if sched_group is None:
+          return _g(w, sc), (sc,)
+        def _fn(x):
+          with _scheduling_group(sched_group):
+            return jax.lax.all_gather(x, "fsdp", axis=gather_axis, tiled=True)
+        qv_full = jax.shard_map(
+            _fn, mesh=self.mesh, in_specs=(in_pspec,), out_specs=out_pspec, check_vma=False)(_quant(w, sc))
+        return qv_full, (sc,)
+
+      def _g_bwd(res, ct):
+        (sc,) = res
+        ct = ct.astype(jnp.bfloat16)  # bf16 wire for the gradient; never e4m3
+        g_sharded = jax.shard_map(
+            lambda gg: jax.lax.psum_scatter(gg, "fsdp", scatter_dimension=gather_axis, tiled=True),
+            mesh=self.mesh, in_specs=(out_pspec,), out_specs=in_pspec, check_vma=False)(ct)
+        # STE through the quantize: d w = scattered ct / scale (no gradient to the scale)
+        return (g_sharded / sc.astype(g_sharded.dtype), jnp.zeros_like(sc))
+
+      _g.defvjp(_g_fwd, _g_bwd)
+      return _g
+
+    def _cv_scale(w):
+      # DYNAMIC per-output-channel scale on the GLOBAL param: max over (exp, k) -> [1,1,n]. The max
+      # over the fsdp-sharded dim is a tiny GSPMD all-reduce ([1,1,n], negligible). stop_gradient:
+      # forward-only scale (STE backward).
+      return jax.lax.stop_gradient(
+          jnp.max(jnp.abs(w), axis=(0, 1), keepdims=True).astype(jnp.float32) / 448.0 + 1e-20)
+
     # Distinct scheduling-group ids per weight so the all-gather-combiner cannot
     # fuse the three into one un-hideable monolith; each smaller gather can
     # then be scheduled independently behind different attention-phase compute.
     # NO optimization_barrier: it is self-dual, so a barrier on the gathered weight
     # fences the weight-grad feeding the backward psum_scatter -> pins the RS exposed.
     # The distinct group ids already prevent the all-gather-combiner fusion.
+    if _fp8cv and not w01_only and not wo_only:
+      # fp8 cv-gather (plain 3-tuple path only; the handwritten/xlayer variants stay bf16).
+      # Tags sub-flag: None disables the scheduling-group annotation (isolate tag cost vs fp8 win).
+      _tags = getattr(cfg, "moe_fp8_cv_weight_ag_tags", True)
+      g0 = _WEIGHT_AG_SCHED_GROUP if _tags else None
+      g1 = _WEIGHT_AG_SCHED_GROUP + 1 if _tags else None
+      g2 = _WEIGHT_AG_SCHED_GROUP + 2 if _tags else None
+      sc0, sc1, sco = _cv_scale(w0), _cv_scale(w1), _cv_scale(wo)
+      w0 = qpl.QArray(qvalue=_make_cv_quant_gather(wi_in, w0_out, 1, g0)(w0, sc0), scale=sc0)
+      w1 = qpl.QArray(qvalue=_make_cv_quant_gather(wi_in, w0_out, 1, g1)(w1, sc1), scale=sc1)
+      wo = qpl.QArray(qvalue=_make_cv_quant_gather(wo_in, wo_out, 2, g2)(wo, sco), scale=sco)
+      return (w0, w1, wo)
     if w01_only:
       # Reverse-prefetch gather of the NEXT backward layer's w0/w1 only (no wo). The producer caller
       # stop_gradients the result (pure scheduling: the consuming layer routes the grad via swap_gather's

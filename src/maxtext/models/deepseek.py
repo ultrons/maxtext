@@ -665,7 +665,9 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
     # a _scheduling_group_id via _make_cv_gather). Returns None unless the plain
     # bf16 ring path holds, in which case the MoE falls back to its in-block gather.
     pregathered_weights = None
-    if self.config.moe_weight_ag_scheduling_group:
+    # moe_fp8_cv_weight_ag also routes through gather_routed_weights: the cv-gather then quantizes
+    # to e4m3 and gathers the qvalue (returns QArrays), with or without the scheduling-group tags.
+    if self.config.moe_weight_ag_scheduling_group or getattr(self.config, "moe_fp8_cv_weight_ag", False):
       pregathered_weights = self.DeepSeekMoeBlock_0.gather_routed_weights()
 
     hidden_states, intermediate_inputs = self.self_attention_with_norm_op(

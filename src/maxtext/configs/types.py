@@ -1039,6 +1039,25 @@ class MoEGeneral(BaseModel):
           "weight_gather_axes stays [] (no in-GMM re-gather). Forward-AG; targets ~184ms exposed weight-AG."
       ),
   )
+  moe_fp8_cv_weight_ag: bool = Field(
+      False,
+      description=(
+          "Ring-of-experts fp8 weight-AG via the EXPLICIT cv-gather (gather_weights/_make_cv_gather) "
+          "machinery: quantize w0/w1/wo to e4m3 with a DYNAMIC per-output-channel [1,1,n] scale on the "
+          "global param, then all-gather the QVALUE inside the cv-gather's mini shard_map (opaque "
+          "SPMDFullToShardShape boundary -> the simplifier cannot sink the convert past the collective; "
+          "elision-proof). Returns QArrays as pregathered_weights; scale rides to the gmm via the "
+          "threaded scale args; backward = psum_scatter(bf16 ct)/scale (STE, weight grad never e4m3)."
+      ),
+  )
+  moe_fp8_cv_weight_ag_tags: bool = Field(
+      True,
+      description=(
+          "Sub-flag of moe_fp8_cv_weight_ag: annotate the forward cv-gather with the "
+          "_scheduling_group_id tags (overlap with attention). False = plain untagged gather, to "
+          "isolate the tag cost from the fp8 win."
+      ),
+  )
   moe_fp8_ring_weight_ag: bool = Field(
       False,
       description=(
