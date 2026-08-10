@@ -273,6 +273,9 @@ def tgmm_block_fp8(
   del quantize_lhs
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)
+  else:
+    # ops.py may pass a scalar (shape ()); the kernel's prefetch ref needs shape (1,)
+    group_offset = jnp.asarray(group_offset, jnp.int32).reshape(1)
   if vmem_limit_bytes is None:
     vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
   target_zero_ref_bytes = 2 * 1024 * 1024
