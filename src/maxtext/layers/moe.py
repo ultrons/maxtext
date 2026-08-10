@@ -44,6 +44,7 @@ from maxtext.kernels.ragged.ragged_sort import chunked_ring_dispatch
 from maxtext.kernels.ragged.ragged_sort import compute_ring_sort_indices
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_sort
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_unsort
+from maxtext.kernels.ring_ag import ring_all_gather
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
@@ -78,6 +79,34 @@ def _ste_quant_bwd(_res, g):
 
 
 _ste_quant.defvjp(_ste_quant_fwd, _ste_quant_bwd)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3))
+def _ring_ct_reduce_scatter(output, mesh, ep_name, collective_id):
+  """The combine reduce-scatter with its backward cotangent all-gather on the TC RING kernel.
+
+  FORWARD: byte-identical to the stock path -- the plain XLA
+  ``jax.lax.psum_scatter(output, ep_name, scatter_dimension=0, tiled=True)`` (also what the remat
+  recompute re-traces: the primal is the plain collective, so NO Pallas DMA ever runs in a
+  rematted region). BACKWARD: the autodiff transpose of that tiled psum_scatter is a tiled EP
+  all-gather of the loop-carried cotangent (bf16 [tokens_local, ...] -> [num_tokens, ...]) -- the
+  #1+#2 worst-overlap collectives in the record profile (~810ms/step pair): as an XLA collective
+  it rides the SparseCore all-gather-offload queue and stalls behind the SC combines. Here it runs
+  on the bidirectional store-and-forward TC ring kernel instead (ICI DMAs on the TensorCore, where
+  the backward has slack), numerically == lax.all_gather (pure tiled data move, bit-exact).
+  """
+  return jax.lax.psum_scatter(output, ep_name, scatter_dimension=0, tiled=True)
+
+
+def _ring_ct_rs_fwd(output, mesh, ep_name, collective_id):
+  return _ring_ct_reduce_scatter(output, mesh, ep_name, collective_id), None
+
+
+def _ring_ct_rs_bwd(mesh, ep_name, collective_id, _res, ct):
+  return (ring_all_gather(ct, mesh, (ep_name,), 0, collective_id),)
+
+
+_ring_ct_reduce_scatter.defvjp(_ring_ct_rs_fwd, _ring_ct_rs_bwd)
 
 set_xla_metadata = xla_metadata.set_xla_metadata
 
@@ -289,6 +318,7 @@ _direct_all_gather.defvjp(_dag_fwd, _dag_bwd)
 _DIRECT_TOKEN_AG_COLLECTIVE_ID = 40  # moe_direct_token_ag: backward-recompute EP token all-gather
 _DIRECT_FWD_TOKEN_AG_COLLECTIVE_ID = 45  # moe_fwd_direct_token_ag: FORWARD EP token dispatch all-gather
 _DIRECT_COMBINE_AG_COLLECTIVE_ID = 50  # moe_direct_combine_ag: backward combine-cotangent all-gather (== .626)
+_RING_CT_AG_COLLECTIVE_ID = 55  # moe_ring_cotangent_ag: backward combine-cotangent RING all-gather
 
 
 def _scheduling_group(group_id):
@@ -2652,6 +2682,10 @@ class RoutedMoE(nnx.Module):
           # manbwd RECOMPUTE; tagging its transpose all-gather (_drs_bwd == all-gather.626) lets the
           # scheduler overlap it with the co-tagged splash host restore copies. None otherwise.
           output = _direct_reduce_scatter(output, self.mesh, "expert", 7, self._splash_offload_sched_group())
+        elif getattr(self.config, "moe_ring_cotangent_ag", False) and self._expert_parallelism_name == "expert":
+          # moe_ring_cotangent_ag: forward = the SAME plain psum_scatter (untouched); ONLY the
+          # backward cotangent all-gather moves onto the TC ring kernel (see _ring_ct_reduce_scatter).
+          output = _ring_ct_reduce_scatter(output, self.mesh, "expert", _RING_CT_AG_COLLECTIVE_ID)
         else:
           output = jax.lax.psum_scatter(output, self._expert_parallelism_name, scatter_dimension=0, tiled=True)
         return output, routing.lb_loss, routing.bias_updates

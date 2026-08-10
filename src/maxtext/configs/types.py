@@ -1039,6 +1039,16 @@ class MoEGeneral(BaseModel):
           "weight_gather_axes stays [] (no in-GMM re-gather). Forward-AG; targets ~184ms exposed weight-AG."
       ),
   )
+  moe_ring_cotangent_ag: bool = Field(
+      False,
+      description=(
+          "Run the BACKWARD combine-cotangent EP all-gather (the autodiff transpose of the ring "
+          "combine psum_scatter; the top worst-overlap collectives in the record profile, "
+          "~810ms/step pair) on the bidirectional TC ring Pallas kernel instead of the XLA "
+          "collective, moving it OFF the SparseCore all-gather-offload queue onto the TensorCore "
+          "ICI DMAs. FORWARD is byte-identical (plain psum_scatter). Single-axis EP only."
+      ),
+  )
   moe_fp8_cv_weight_ag: bool = Field(
       False,
       description=(
