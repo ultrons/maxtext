@@ -2169,6 +2169,14 @@ class RoutedMoE(nnx.Module):
               for z in (x, logits, pre_bias_logits)
           )
 
+        # moe_x_sorted (option A): tag the PRE-duplication GATHERED tokens ([tokens_gathered, embed],
+        # ~235MB/chunk at pdbs1) -- NOT the post-sort x_sorted, whose topk-8 row duplication makes it
+        # 229GB across 61 layers (compile-OOM, measured 233.55G). With moe_x_sorted=device the
+        # backward LOADS this tensor, killing the rematted EP dispatch all-gather; the SC ragged sort
+        # still re-runs from it (the duplication IS the sort -- accepted). Inert under the default
+        # moe_x_sorted=remat. In the chunk_dispatch branch x stays local (tag harmless there).
+        x = adc.checkpoint_name(x, "moe_x_sorted")
+
         # "Route" tokens within each shard.
         num_experts_per_shard = self.config.num_experts // num_ep
         (
@@ -2519,16 +2527,9 @@ class RoutedMoE(nnx.Module):
           x, logits, pre_bias_logits, rngs, input_ids=sharded_input_ids,
           saved_sort=saved_sort, sort_save_cell=sort_save_cell,
       )
-      # moe_x_sorted: tag the SORTED expert input + its small routing/metadata bundle for the remat
-      # policy. With moe_x_sorted=device the backward LOADS these instead of re-running route() --
-      # killing the rematted dispatch token all-gather + SC ragged sort/gather (the up-proj wgrad
-      # needs x_sorted anyway). The routing/metadata leaves (indices, group sizes, weights -- tiny)
-      # must be saved too, else the sort kernel re-runs just to reproduce them for the gmm/unsort
-      # backward. Tags are inert under the default moe_x_sorted=remat.
-      _cn = lambda t: adc.checkpoint_name(t, "moe_x_sorted") if isinstance(t, jax.Array) else t
-      x = _cn(x)
-      routing = jax.tree.map(_cn, routing)
-      route_metadata = jax.tree.map(_cn, route_metadata)
+      # (moe_x_sorted option A: the save tag lives on the PRE-duplication gathered tokens inside
+      # route()'s dispatch block -- NOT here on the post-sort x, whose topk-8 duplication made the
+      # save 229GB/compile-OOM. The sort re-runs in the backward from the saved gathered tokens.)
 
       if self.config.mlp_bias:
         w0_bias, w1_bias, wo_bias = self.transform_bias(routing.selected_experts, w0_bias, w1_bias, wo_bias)

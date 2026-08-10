@@ -1574,12 +1574,12 @@ class RematAndOffload(BaseModel):
   moe_x_sorted: RematLocation = Field(
       RematLocation.REMAT,
       description=(
-          "Remat policy for the sorted MoE expert input (x_sorted, post-dispatch/ragged-sort, per "
-          "chunk) plus its small routing/metadata bundle. 'device' saves them across the remat "
-          "boundary so the BACKWARD does not re-run the dispatch token all-gather + SC ragged "
-          "sort/gather; the up/down gmm re-runs from the saved tensor. Cost: ~940MB/layer bf16 at "
-          "pdbs=1 (x is bf16 pre-kernel; gmm_v2 quantizes the lhs in-kernel). Default 'remat' = "
-          "recompute (today's behavior)."
+          "Remat policy for the PRE-duplication EP-dispatch-gathered MoE tokens ([tokens_gathered, "
+          "embed] bf16, tagged inside route() before permute/ragged-sort). 'device' saves them so "
+          "the BACKWARD loads the gathered tokens instead of re-running the EP dispatch all-gather "
+          "(~2 token-AGs/layer); the SC ragged sort still re-runs from the saved tensor (its topk-8 "
+          "row duplication is why the post-sort buffer cannot be saved: 229GB = compile-OOM). Cost: "
+          "~470MB/layer bf16 at pdbs=1 (28.7GB over 61 layers). Default 'remat' = recompute."
       ),
   )
   moe_fp8_scale: RematLocation = Field(
