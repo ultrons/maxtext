@@ -1571,6 +1571,14 @@ class RematAndOffload(BaseModel):
       RematLocation.REMAT,
       description="Remat policy for the second MLP layer's output.",
   )
+  moe_fp8_scale: RematLocation = Field(
+      RematLocation.DEVICE,
+      description=(
+          "Remat policy for the moe_fp8_cv_weight_ag dynamic [1,1,n] weight scales (tiny). Default "
+          "'device': saved so the rematted backward loads the scale instead of re-running its "
+          "cross-shard max reduction (a per-layer latency-bound tiny collective) in the bwd scope."
+      ),
+  )
   moe_mlpwi_0: RematLocation = Field(
       RematLocation.REMAT,
       description="Remat policy for the first part of a gated MoE's output.",
@@ -3585,6 +3593,7 @@ class MaxTextConfig(
           "indexer_cutoff_threshold",
           "context",
           "mlpwi",
+          "moe_fp8_scale",
           "moe_mlpwi_0",
           "moe_mlpwi_1",
           "moe_mlpwo",
@@ -4587,6 +4596,7 @@ class RLConfig(
           "indexer_cutoff_threshold",
           "context",
           "mlpwi",
+          "moe_fp8_scale",
           "moe_mlpwi_0",
           "moe_mlpwi_1",
           "moe_mlpwo",

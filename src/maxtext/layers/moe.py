@@ -61,20 +61,20 @@ def _ste_quant(w, sc):
   """Straight-through e4m3 quantizer for moe_fp8_boundary_qag.
 
   Forward: e4m3 qvalue = clip(w / sc, +-448). Backward (STE): pass the incoming cotangent straight
-  through to w in BF16, d w = g / sc, with NO gradient to the scale. This keeps the weight gradient
-  in bf16 (never e4m3 -- an e4m3 gradient overflows and NaNs the weight reduce-scatter) and bypasses
-  the convert-to-e4m3 vjp entirely.
+  through to w in BF16 UNCHANGED. The gmm backward computes drhs with NO rhs.scale applied (it is
+  already dL/d(dequantized weight)), and w -> qv*sc is the identity chain, so the STE vjp is a plain
+  pass-through -- a /sc here would inflate the per-channel gradient by 1/sc. This also keeps the
+  weight gradient in bf16 (never e4m3 -- an e4m3 gradient overflows and NaNs the reduce-scatter).
   """
   return jnp.clip(w / sc.astype(w.dtype), -448.0, 448.0).astype(jnp.float8_e4m3fn)
 
 
 def _ste_quant_fwd(w, sc):
-  return _ste_quant(w, sc), (sc,)
+  return _ste_quant(w, sc), None
 
 
-def _ste_quant_bwd(res, g):
-  (sc,) = res
-  return (g.astype(jnp.bfloat16) / sc.astype(jnp.bfloat16), None)
+def _ste_quant_bwd(_res, g):
+  return (g.astype(jnp.bfloat16), None)
 
 
 _ste_quant.defvjp(_ste_quant_fwd, _ste_quant_bwd)
@@ -2357,8 +2357,18 @@ class RoutedMoE(nnx.Module):
         layer_w0 = adc.checkpoint_name(adc.checkpoint_name(layer_w0, "mlpwi_0"), "moe_mlpwi_0")
         layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
       else:
-        _w0 = qpl.QArray(qvalue=w0, scale=w0_scale, zero_point=None, qtype=jnp.float8_e4m3fn) if _fp8q else w0
-        _w1 = qpl.QArray(qvalue=w1, scale=w1_scale, zero_point=None, qtype=jnp.float8_e4m3fn) if _fp8q else w1
+        # stop_gradient on the scale: kills the cotangent path to the replicated shard_map scale
+        # input -- without it, the shard_map transpose psums the (always-zero, but opaque through
+        # the gmm custom_vjp) scale ct per layer, and remat re-materializes those tiny psums in the
+        # backward at the SC-offload ~21ms latency floor (the +3.7s/step cluster regression).
+        _w0 = (
+            qpl.QArray(qvalue=w0, scale=jax.lax.stop_gradient(w0_scale), zero_point=None, qtype=jnp.float8_e4m3fn)
+            if _fp8q else w0
+        )
+        _w1 = (
+            qpl.QArray(qvalue=w1, scale=jax.lax.stop_gradient(w1_scale), zero_point=None, qtype=jnp.float8_e4m3fn)
+            if _fp8q else w1
+        )
         layer_w0 = gmm_fn(
             x,
             _w0,
@@ -2520,7 +2530,11 @@ class RoutedMoE(nnx.Module):
       # moe_fp8_cv_weight_ag (_fp8wo): wo arrives as an e4m3 qvalue gathered by the cv-gather; build
       # its QArray here (global [1,1,embed] scale -- identical on every shard, no consistency issue).
       # moe_fp8_boundary_qag keeps wo bf16 (per-output-channel over its embed GSPMD-gather is unsound).
-      _wo = qpl.QArray(qvalue=wo, scale=wo_scale, zero_point=None, qtype=jnp.float8_e4m3fn) if _fp8wo else wo
+      # stop_gradient on the scale: no ct path -> no per-layer boundary psum (see gmm_up).
+      _wo = (
+          qpl.QArray(qvalue=wo, scale=jax.lax.stop_gradient(wo_scale), zero_point=None, qtype=jnp.float8_e4m3fn)
+          if _fp8wo else wo
+      )
       intermediate_output = gmm_fn(
           intermediate_layer,
           _wo,
@@ -3723,22 +3737,34 @@ class RoutedMoE(nnx.Module):
 
       def _g_bwd(res, ct):
         (sc,) = res
-        ct = ct.astype(jnp.bfloat16)  # bf16 wire for the gradient; never e4m3
-        g_sharded = jax.shard_map(
-            lambda gg: jax.lax.psum_scatter(gg, "fsdp", scatter_dimension=gather_axis, tiled=True),
-            mesh=self.mesh, in_specs=(out_pspec,), out_specs=in_pspec, check_vma=False)(ct)
-        # STE through the quantize: d w = scattered ct / scale (no gradient to the scale)
-        return (g_sharded / sc.astype(g_sharded.dtype), jnp.zeros_like(sc))
+        # The incoming ct is the ALREADY-GLOBAL dL/d(dequantized weight):
+        #  - the gmm backward computes drhs = lhs^T @ ct with NO rhs.scale applied
+        #    (ops._compute_drhs / _drhs_run_tokamax_v2), and with out = x @ (qv*sc), qv = w/sc,
+        #    the w -> qv*sc chain is the identity -> NO /sc here (an extra /sc inflated the
+        #    per-channel grad by 1/sc ~1e2-1e3x -> clipping crushed the step; cluster bug 2);
+        #  - the MAIN shard_map's transpose already psums the per-shard contributions over the
+        #    replicated fsdp axis -> the ct is the summed global gradient. So the transpose of
+        #    "quantize + gather" is just a RESHARD back to the param's storage sharding (a local
+        #    slice, NO collective) -- a psum_scatter here sums <fsdp> identical replicas and
+        #    overcounts the gradient by x128 (numerically verified at x8 on an 8-way test mesh).
+        g = ct.astype(jnp.bfloat16)  # bf16 wire for the gradient; never e4m3
+        g = jax.lax.with_sharding_constraint(g, jax.sharding.NamedSharding(self.mesh, in_pspec))
+        return (g, jnp.zeros_like(sc))
 
       _g.defvjp(_g_fwd, _g_bwd)
       return _g
 
     def _cv_scale(w):
       # DYNAMIC per-output-channel scale on the GLOBAL param: max over (exp, k) -> [1,1,n]. The max
-      # over the fsdp-sharded dim is a tiny GSPMD all-reduce ([1,1,n], negligible). stop_gradient:
-      # forward-only scale (STE backward).
-      return jax.lax.stop_gradient(
+      # over the fsdp-sharded dim is a tiny GSPMD all-reduce ([1,1,n], negligible -- and for wo it
+      # crosses no shard at all). stop_gradient: forward-only scale (STE backward).
+      # checkpoint_name: SAVE the [1,1,n] scale (tiny) under remat_policy=custom so the rematted
+      # backward (which re-runs quantize+gather for the e4m3 bwd re-gather) LOADS it instead of
+      # re-running the cross-shard max reduction inside the checkpoint scope. Config key
+      # moe_fp8_scale defaults to 'device'.
+      sc = jax.lax.stop_gradient(
           jnp.max(jnp.abs(w), axis=(0, 1), keepdims=True).astype(jnp.float32) / 448.0 + 1e-20)
+      return adc.checkpoint_name(sc, "moe_fp8_scale")
 
     # Distinct scheduling-group ids per weight so the all-gather-combiner cannot
     # fuse the three into one un-hideable monolith; each smaller gather can
