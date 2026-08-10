@@ -2589,6 +2589,20 @@ class RoutedMoE(nnx.Module):
       # route()'s dispatch block -- NOT here on the post-sort x, whose topk-8 duplication made the
       # save 229GB/compile-OOM. The sort re-runs in the backward from the saved gathered tokens.)
 
+      # moe_sanitize_ragged_buffer: zero the UNWRITTEN tail rows of the ragged-sorted buffer. The
+      # sort kernel leaves rows beyond the valid token count as stale HBM ("never read" holds for
+      # the index-gather path but NOT for the tgmm weight-grad, whose dense m-contraction reads ALL
+      # buffer rows: a stale Inf/NaN row x zero-cotangent = NaN in the weight gradient). STATIC act
+      # calibration masks this by clipping the buffer finite at the pre-quantize; DYNAMIC (absmax)
+      # act calibration feeds the gmm raw bf16 -> in-kernel amax turns stale Inf into NaN
+      # (amax=Inf -> inv=0 -> Inf*0=NaN; probe receipt in test_amax_edges.py). One masked write
+      # over the buffer per chunk.
+      if getattr(self.config, "moe_sanitize_ragged_buffer", False):
+        _lgs = routing.local_group_sizes if routing.local_group_sizes is not None else routing.group_sizes
+        _valid_rows = jnp.sum(_lgs).astype(jnp.int32)
+        _row_ids = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
+        x = jnp.where(_row_ids < _valid_rows, x, jnp.zeros((), x.dtype))
+
       if self.config.mlp_bias:
         w0_bias, w1_bias, wo_bias = self.transform_bias(routing.selected_experts, w0_bias, w1_bias, wo_bias)
 

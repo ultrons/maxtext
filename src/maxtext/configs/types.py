@@ -1039,6 +1039,18 @@ class MoEGeneral(BaseModel):
           "weight_gather_axes stays [] (no in-GMM re-gather). Forward-AG; targets ~184ms exposed weight-AG."
       ),
   )
+  moe_sanitize_ragged_buffer: bool = Field(
+      False,
+      description=(
+          "Zero the unwritten tail rows of the ragged-sorted MoE buffer after the sort. Stale HBM "
+          "rows there are never read by the index-gather paths, but the tgmm weight-grad's dense "
+          "m-contraction reads ALL buffer rows: a stale Inf/NaN row times a zero cotangent is NaN "
+          "in the weight gradient. Static act calibration clips the buffer finite (masking the "
+          "issue); dynamic (absmax) act calibration feeds raw bf16 to the kernel, whose per-row "
+          "amax turns stale Inf into NaN (amax=Inf -> inv=0 -> Inf*0=NaN). Enable with "
+          "act_quantization_calibration_method=absmax. One masked buffer write per chunk."
+      ),
+  )
   moe_ring_combine_rs: bool = Field(
       False,
       description=(
