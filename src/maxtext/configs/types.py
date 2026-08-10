@@ -466,6 +466,17 @@ class Quantization(BaseModel):
       "absmax",
       description="Quantization calibration method used for activations.",
   )
+  bwd_quantization_dtype: str = Field(
+      "e5m2",
+      description=(
+          "fp8 dtype for the BACKWARD (gradient) quantization in the fp8_full qwix recipe: 'e5m2' "
+          "(range +-57344, 2 mantissa bits -- today's default) or 'e4m3' (range +-448, 3 mantissa "
+          "bits -- NVIDIA's MLPerf DSv3 recipe uses e4m3 for gradients too; arXiv:2506.08027 "
+          "ablates e5m2 grads DEGRADING under block scaling while all-e4m3 matches bf16). The "
+          "absmax dynamic scaling machinery derives the clip range from finfo(qtype), so +-448 "
+          "clipping for e4m3 is automatic."
+      ),
+  )
   bwd_quantization_calibration_method: str = Field(
       "absmax",
       description="Quantization calibration method used for gradients.",
