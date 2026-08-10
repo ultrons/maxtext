@@ -2719,6 +2719,23 @@ class RoutedMoE(nnx.Module):
     # reconstructed inside the body (no bf16 dequant between gather and gmm consumer -> no elision).
     _fp8bq = getattr(self.config, "moe_fp8_boundary_qag", False)
     _fp8cv = getattr(self.config, "moe_fp8_cv_weight_ag", False)
+    # moe_fp8_cv_weight_ag: the weights arrive as qwix QArrays (e4m3 qvalue STILL STORAGE-SHARDED on
+    # fsdp-embed + replicated [1,1,n] f32 scale). Split them here, BEFORE the shard_map decorator, and
+    # OVERRIDE the weight in_specs to the STORAGE sharding: the e4m3 all-gather then happens INSIDE
+    # the body (top of sparse_matmul_route_and_compute). Structure rationale (cluster round-2 profile):
+    # with a replicated-in weight, the shard_map transpose ARs the weight grad and the reshard slices
+    # it -- XLA failed to fuse that into one reduce-scatter (two slow RSs @ 22-38 GB/s + extra AR,
+    # +0.35s/step). With a SHARDED-in weight + in-body gather, autodiff transposes the gather into ONE
+    # direct psum_scatter to storage sharding (the baseline's efficient 235 GB/s form), and the
+    # boundary adds no extra reduction (the input is varying, not replicated) -> no x128 overcount.
+    _fp8cv_in = _fp8cv and isinstance(w0_kernel, qpl.QArray)
+    if _fp8cv_in:
+      _w0sc, w0_kernel = w0_kernel.scale, w0_kernel.qvalue
+      _w1sc, w1_kernel = w1_kernel.scale, w1_kernel.qvalue
+      _wosc, wo_kernel = wo_kernel.scale, wo_kernel.qvalue
+      w0_pspec = self._logical_to_mesh_axes(self.wi_kernel_axes)
+      w1_pspec = self._logical_to_mesh_axes(self.wi_kernel_axes)
+      wo_pspec = self._logical_to_mesh_axes(self.wo_kernel_axes)
     # moe_fp8_boundary_qag: the w0/w1 fp8 scale is [1,1,mlp] (per-mlp-channel, shared across experts),
     # so it is REPLICATED -> P(). (A per-expert [exp,1,mlp] scale would need expert-axis sharding AND
     # a stock gmm_v2 backward fix; deferred -- see _q_boundary.)
@@ -2763,10 +2780,17 @@ class RoutedMoE(nnx.Module):
         x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs,
         w0_scale, w1_scale, wo_scale, saved_routing_in
     ):
-      # moe_fp8_boundary_qag: w0/w1/wo arrived as boundary-gathered e4m3 qvalues (RAW arrays). They
-      # flow through _moe_body/route/gmm_up as raw e4m3; the QArray is built at the LAST moment, right
-      # before each gmm_fn call (gmm_up/gmm_down), so the ring plumbing never sees a QArray. The
-      # per-tensor scales (w0_scale/w1_scale/wo_scale) thread alongside to those call sites.
+      # moe_fp8_cv_weight_ag (_fp8cv_in): w0/w1/wo arrive STORAGE-SHARDED e4m3 qvalues (fsdp on the
+      # embed dim). Gather them here, ONCE, INSIDE the body: the explicit e4m3 lax.all_gather is
+      # elision-proof, and its autodiff transpose is ONE direct psum_scatter of the bf16 weight grad
+      # to storage sharding (the efficient single-RS form; no boundary AR, no x128 overcount).
+      # Gathered once, reused across all chunks. The QArray is still built at the LAST moment before
+      # each gmm_fn call; the scales (w0_scale/w1_scale/wo_scale) thread alongside.
+      if _fp8cv_in:
+        w0 = jax.lax.all_gather(w0, "fsdp", axis=1, tiled=True)  # [exp, embed_full, mlp]
+        w1 = jax.lax.all_gather(w1, "fsdp", axis=1, tiled=True)
+        wo = jax.lax.all_gather(wo, "fsdp", axis=2, tiled=True)  # [exp, mlp, embed_full]
+      # (moe_fp8_boundary_qag: w0/w1 arrive boundary-gathered e4m3; same last-moment QArray plumbing.)
       # The expert weights (w0/w1/wo) are all-gathered over FSDP once at this
       # shard_map entry (implicitly, via the `embed_tensor_transpose` pspec which
       # drops fsdp -> GSPMD inserts the boundary all-gather) and reused across all
@@ -2838,16 +2862,6 @@ class RoutedMoE(nnx.Module):
       if save_routing:
         return output, lb_loss, bias_updates, tuple(routing_bundles)
       return output, lb_loss, bias_updates
-
-    # moe_fp8_cv_weight_ag: pregathered weights arrive as qwix QArrays (e4m3 qvalue gathered by the
-    # fp8 cv-gather + replicated [1,1,n] f32 scale). Split BEFORE any sharding constraint: the qvalue
-    # rides the normal weight arg (already gathered -> the shard_map boundary gather is a no-op), the
-    # scale rides the threaded scale args; the QArray is rebuilt at the gmm call sites.
-    _fp8cv_in = _fp8cv and isinstance(w0_kernel, qpl.QArray)
-    if _fp8cv_in:
-      _w0sc, w0_kernel = w0_kernel.scale, w0_kernel.qvalue
-      _w1sc, w1_kernel = w1_kernel.scale, w1_kernel.qvalue
-      _wosc, wo_kernel = wo_kernel.scale, wo_kernel.qvalue
 
     if self.config.moe_fsdp_use_two_stage_all_gather:
       # Unshard on fsdp axis
@@ -3709,51 +3723,6 @@ class RoutedMoE(nnx.Module):
       _g.defvjp(_g_fwd, _g_bwd)
       return _g
 
-    # moe_fp8_cv_weight_ag: fp8 variant of _make_cv_gather. Quantize the BF16 param to e4m3 with the
-    # caller-supplied [1,1,n] scale, then all-gather the QVALUE inside the mini shard_map. The
-    # SPMDFullToShardShape boundary is opaque to the algebraic simplifier, so the bf16->e4m3 convert
-    # CANNOT be sunk past the collective (the elision that killed every GSPMD-boundary attempt).
-    # Backward: ct (bf16, from the gmm QArray-drhs) -> psum_scatter bf16 -> /scale = STE weight grad
-    # in BF16 (the ct is NEVER cast to e4m3 -- that overflow was the round-1 NaN).
-    def _make_cv_quant_gather(in_pspec, out_pspec, gather_axis, sched_group):
-      def _quant(w, sc):
-        return jnp.clip(w / sc.astype(w.dtype), -448.0, 448.0).astype(jnp.float8_e4m3fn)
-
-      @jax.custom_vjp
-      def _g(w, sc):  # PRIMAL: plain quantize + gather (what remat recomputes in the backward)
-        return jax.shard_map(
-            lambda x: jax.lax.all_gather(x, "fsdp", axis=gather_axis, tiled=True),
-            mesh=self.mesh, in_specs=(in_pspec,), out_specs=out_pspec, check_vma=False)(_quant(w, sc))
-
-      def _g_fwd(w, sc):  # FORWARD under diff: optionally annotated gather (overlaps attention)
-        if sched_group is None:
-          return _g(w, sc), (sc,)
-        def _fn(x):
-          with _scheduling_group(sched_group):
-            return jax.lax.all_gather(x, "fsdp", axis=gather_axis, tiled=True)
-        qv_full = jax.shard_map(
-            _fn, mesh=self.mesh, in_specs=(in_pspec,), out_specs=out_pspec, check_vma=False)(_quant(w, sc))
-        return qv_full, (sc,)
-
-      def _g_bwd(res, ct):
-        (sc,) = res
-        # The incoming ct is the ALREADY-GLOBAL dL/d(dequantized weight):
-        #  - the gmm backward computes drhs = lhs^T @ ct with NO rhs.scale applied
-        #    (ops._compute_drhs / _drhs_run_tokamax_v2), and with out = x @ (qv*sc), qv = w/sc,
-        #    the w -> qv*sc chain is the identity -> NO /sc here (an extra /sc inflated the
-        #    per-channel grad by 1/sc ~1e2-1e3x -> clipping crushed the step; cluster bug 2);
-        #  - the MAIN shard_map's transpose already psums the per-shard contributions over the
-        #    replicated fsdp axis -> the ct is the summed global gradient. So the transpose of
-        #    "quantize + gather" is just a RESHARD back to the param's storage sharding (a local
-        #    slice, NO collective) -- a psum_scatter here sums <fsdp> identical replicas and
-        #    overcounts the gradient by x128 (numerically verified at x8 on an 8-way test mesh).
-        g = ct.astype(jnp.bfloat16)  # bf16 wire for the gradient; never e4m3
-        g = jax.lax.with_sharding_constraint(g, jax.sharding.NamedSharding(self.mesh, in_pspec))
-        return (g, jnp.zeros_like(sc))
-
-      _g.defvjp(_g_fwd, _g_bwd)
-      return _g
-
     def _cv_scale(w):
       # DYNAMIC per-output-channel scale on the GLOBAL param: max over (exp, k) -> [1,1,n]. The max
       # over the fsdp-sharded dim is a tiny GSPMD all-reduce ([1,1,n], negligible -- and for wo it
@@ -3773,16 +3742,20 @@ class RoutedMoE(nnx.Module):
     # fences the weight-grad feeding the backward psum_scatter -> pins the RS exposed.
     # The distinct group ids already prevent the all-gather-combiner fusion.
     if _fp8cv and not w01_only and not wo_only:
-      # fp8 cv-gather (plain 3-tuple path only; the handwritten/xlayer variants stay bf16).
-      # Tags sub-flag: None disables the scheduling-group annotation (isolate tag cost vs fp8 win).
-      _tags = getattr(cfg, "moe_fp8_cv_weight_ag_tags", True)
-      g0 = _WEIGHT_AG_SCHED_GROUP if _tags else None
-      g1 = _WEIGHT_AG_SCHED_GROUP + 1 if _tags else None
-      g2 = _WEIGHT_AG_SCHED_GROUP + 2 if _tags else None
+      # fp8 path (plain 3-tuple only; the handwritten/xlayer variants stay bf16): quantize the
+      # STORAGE-SHARDED param to e4m3 via _ste_quant (STE custom_vjp: bf16 ct pass-through -- the
+      # sharded ct arriving here IS the final scattered weight grad, no rescale/reduce needed) and
+      # return the SHARDED qvalue. The e4m3 all-gather happens INSIDE the sparse_matmul body (its
+      # autodiff transpose = ONE direct psum_scatter to storage sharding -- the efficient single-RS
+      # weight-grad form; the earlier mini-shard_map gather here left the main boundary replicated,
+      # whose transpose AR + reshard failed to fuse into an RS: two slow RSs @ 22-38 GB/s, +0.35s).
+      # NOTE moe_fp8_cv_weight_ag_tags is DEPRECATED/ignored: the tags variant NaN'd on cluster
+      # round 2 (cvwag2t) and was dominated by no-tags (5.302 vs 5.106); with the in-body gather
+      # there is no pre-attention gather to tag. Do not re-enable without a fresh numerics gate.
       sc0, sc1, sco = _cv_scale(w0), _cv_scale(w1), _cv_scale(wo)
-      w0 = qpl.QArray(qvalue=_make_cv_quant_gather(wi_in, w0_out, 1, g0)(w0, sc0), scale=sc0)
-      w1 = qpl.QArray(qvalue=_make_cv_quant_gather(wi_in, w0_out, 1, g1)(w1, sc1), scale=sc1)
-      wo = qpl.QArray(qvalue=_make_cv_quant_gather(wo_in, wo_out, 2, g2)(wo, sco), scale=sco)
+      w0 = qpl.QArray(qvalue=_ste_quant(w0, sc0), scale=sc0)
+      w1 = qpl.QArray(qvalue=_ste_quant(w1, sc1), scale=sc1)
+      wo = qpl.QArray(qvalue=_ste_quant(wo, sco), scale=sco)
       return (w0, w1, wo)
     if w01_only:
       # Reverse-prefetch gather of the NEXT backward layer's w0/w1 only (no wo). The producer caller

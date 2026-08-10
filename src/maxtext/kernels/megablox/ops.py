@@ -553,12 +553,14 @@ def _gmm_bwd(
   # TODO(tgale, enriqueps, apaske): Fuse this transposition into the tgmm.
   drhs = drhs.swapaxes(1, 2) if transpose_rhs else drhs
   if _orig_rhs_qarray is not None:
-    # The primal rhs entered as a QArray (moe_fp8_boundary_qag), so the VJP cotangent must match its
-    # pytree. Keep the qvalue-leaf cotangent (the weight gradient) in its NATURAL bf16/f32 dtype --
-    # NEVER cast it to e4m3 (that overflowed -> NaN and blew up the weight reduce-scatter). The scale
-    # is forward-only (STE on the quant), so its cotangent is a per-channel zero.
+    # The primal rhs entered as a QArray (moe_fp8_cv_weight_ag / moe_fp8_boundary_qag), so the VJP
+    # cotangent must match its pytree. Cast the qvalue-leaf cotangent (the weight gradient) to BF16:
+    # it is the gradient WIRE dtype -- the in-body all_gather transpose reduce-scatters it to storage
+    # sharding, and an uncast f32 drhs doubles that RS's bytes vs the baseline's bf16 weight-grad RS.
+    # NEVER cast to e4m3 (overflow -> NaN, the round-1 bug). The scale is forward-only (STE on the
+    # quant), so its cotangent is a per-channel zero.
     drhs = qpl.QArray(
-        qvalue=drhs,
+        qvalue=drhs.astype(jnp.bfloat16),
         scale=jnp.zeros_like(_orig_rhs_qarray.scale),
         zero_point=None,
         qtype=_orig_rhs_qarray.qtype,
