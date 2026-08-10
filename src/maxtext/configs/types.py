@@ -867,6 +867,20 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use Ring of Experts for sparse matmul expert parallelism.",
   )
+  moe_fp8_cv_weight_ag: bool = Field(
+      False,
+      description=(
+          "fp8 (e4m3) FSDP weight all-gather for the routed MoE experts on the ring-of-experts "
+          "path: quantize w0/w1/wo to e4m3 with a DYNAMIC per-output-channel [1,1,n] scale "
+          "(straight-through estimator; bf16 weight gradients), pass them into the sparse_matmul "
+          "shard_map STILL STORAGE-SHARDED, and all-gather the qvalue INSIDE the body -- halving "
+          "the weight-AG wire bytes. The explicit in-body gather is elision-proof (a GSPMD "
+          "boundary gather of an e4m3 value gets simplified back to bf16), and its autodiff "
+          "transpose is a single direct reduce-scatter of the bf16 weight grad to storage "
+          "sharding. Requires use_gmm_v2 + use_tokamax_gmm (the QArray rhs path) and an fp8 "
+          "quantization config (e.g. quantization=fp8_full)."
+      ),
+  )
   moe_dispatch_no_expert_sharding: bool = Field(
       False,
       description=(
@@ -1281,6 +1295,14 @@ class RematAndOffload(BaseModel):
   mlpwo: RematLocation = Field(
       RematLocation.REMAT,
       description="Remat policy for the second MLP layer's output.",
+  )
+  moe_fp8_scale: RematLocation = Field(
+      RematLocation.DEVICE,
+      description=(
+          "Remat policy for the moe_fp8_cv_weight_ag dynamic [1,1,n] weight scales (tiny). Default "
+          "'device': saved so the rematted backward loads the scale instead of re-running its "
+          "cross-shard max reduction (a per-layer latency-bound tiny collective) in the bwd scope."
+      ),
   )
   moe_mlpwi_0: RematLocation = Field(
       RematLocation.REMAT,
@@ -3255,6 +3277,7 @@ class MaxTextConfig(
           "indexer_cutoff_threshold",
           "context",
           "mlpwi",
+          "moe_fp8_scale",
           "moe_mlpwi_0",
           "moe_mlpwi_1",
           "moe_mlpwo",
@@ -4266,6 +4289,7 @@ class RLConfig(
           "indexer_cutoff_threshold",
           "context",
           "mlpwi",
+          "moe_fp8_scale",
           "moe_mlpwi_0",
           "moe_mlpwi_1",
           "moe_mlpwo",
