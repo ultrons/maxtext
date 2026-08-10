@@ -1975,9 +1975,12 @@ class RoutedMoE(nnx.Module):
       # (not shard_exp_on_fsdp) so the FSDP embed-sharded weight is gathered as the e4m3 qvalue
       # (half the wire bytes) inside the GMM instead of the bf16 GSPMD boundary gather. Requires a
       # fixed (static) weight scale so only the qvalue rides the wire.
-      if shard_exp_on_fsdp or getattr(self.config, "moe_fp8_ring_weight_ag", False):
+      _ring = getattr(self.config, "moe_fp8_ring_weight_ag", False)
+      if shard_exp_on_fsdp or _ring:
         quantization_rule = qpl.get_current_rule("gmm")
-        if quantization_rule and quantization_rule.weight_calibration_method.startswith("fixed"):
+        # Ring path (Option A) supports a DYNAMIC per-channel weight-AG -> allow any calibration.
+        # shard_exp_on_fsdp still requires the fixed (static) scale of the stock QAG.
+        if quantization_rule and (_ring or quantization_rule.weight_calibration_method.startswith("fixed")):
           return True
       return False
 

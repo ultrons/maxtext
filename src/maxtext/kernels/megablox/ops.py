@@ -184,15 +184,33 @@ def _gmm_fwd(
   # the two -- only the entry type can. The VJP cotangent structure must match the PRIMAL arg.
   rhs_is_qarray_input = isinstance(rhs, qpl.QArray)
 
+  # moe_fp8 DYNAMIC ring weight-AG (Option A): gather the weight as its e4m3 qvalue INSIDE the gmm
+  # with a DYNAMIC per-channel scale. The weight must reach the gather as BF16 (skip the qwix weight
+  # quantize) so we can compute the global (wi) / local (wo) amax. Requires a dynamic (non-"fixed")
+  # weight calibration + a bf16 weight arg + weight_gather_axes (the ring get_wi/wo_gmm_params set it).
+  _dyn_ring_qag = (
+      use_tokamax_backend
+      and use_gmm_v2
+      and quantization_rule is not None
+      and quantization_rule.weight_qtype
+      and bool(weight_gather_axes)
+      and not rhs_is_qarray_input
+      and not str(quantization_rule.weight_calibration_method).startswith("fixed")
+  )
+
   # Quantize activation and weight
   if quantization_rule:
     # pyrefly: ignore[bad-assignment]
     lhs, rhs = _fwd_quantize_activation_and_weight(
-        lhs, rhs, quantization_rule, use_gmm_v2, use_manual_quantization, transpose_rhs
+        lhs, rhs, quantization_rule, use_gmm_v2, use_manual_quantization, transpose_rhs,
+        skip_weight=_dyn_ring_qag,
     )
 
-  # Quantization All-Gather (QAG) for weight: only supported for following conditions
-  if (
+  if _dyn_ring_qag:
+    # pyrefly: ignore[bad-assignment]
+    rhs = _fwd_gather_weight_dynamic(rhs, weight_gather_axes, quantization_rule.weight_qtype)
+  elif (
+      # Static (fixed-scale) QAG: only supported for the following conditions.
       use_tokamax_backend
       and quantization_rule
       and quantization_rule.bwd_qtype
@@ -234,8 +252,13 @@ def _fwd_quantize_activation_and_weight(
     use_gmm_v2: bool,
     use_manual_quantization: bool,
     transpose_rhs: bool,
+    skip_weight: bool = False,
 ) -> tuple[jnp.ndarray | qpl.QArray, jnp.ndarray | qpl.QArray]:
-  """Handles act and weight quantization for GMM forward inputs."""
+  """Handles act and weight quantization for GMM forward inputs.
+
+  `skip_weight=True` leaves the weight unquantized (BF16) so a downstream dynamic weight-AG can
+  compute its own (global/local) per-channel scale from the sharded BF16 weight.
+  """
   if quantization_rule.act_qtype and not isinstance(lhs, qpl.QArray) and not use_gmm_v2:
     lhs = qpl.quantize(  # pyrefly: ignore[bad-assignment]
         lhs,
@@ -245,7 +268,7 @@ def _fwd_quantize_activation_and_weight(
         calibration_method=quantization_rule.act_calibration_method,
     )
 
-  if quantization_rule.weight_qtype and not isinstance(rhs, qpl.QArray):
+  if quantization_rule.weight_qtype and not isinstance(rhs, qpl.QArray) and not skip_weight:
     if not use_manual_quantization:
       rhs = qpl.quantize(  # pyrefly: ignore[bad-assignment]
           rhs,
@@ -271,6 +294,42 @@ def _fwd_gather_weight(rhs: qpl.QArray, weight_gather_axes: List[Tuple[str, int]
     rhs_qvalue = jax.lax.all_gather(rhs.qvalue, axis_name, axis=axis_idx, tiled=True)
     # replace the qvalue with the gathered qvalue in the QArray
     rhs = dataclasses.replace(rhs, qvalue=rhs_qvalue)
+  return rhs
+
+
+def _fwd_gather_weight_dynamic(
+    rhs: jnp.ndarray, weight_gather_axes: List[Tuple[str, int]], weight_qtype: jax.typing.DTypeLike
+) -> qpl.QArray:
+  """Dynamic per-channel fp8 weight-AG (Option A) for the ring config.
+
+  `rhs` is the BF16 weight [exp, k, n], still SHARDED on the gather axis (no GSPMD boundary gather).
+  We compute a DYNAMIC per-output-channel (n = axis 2) scale, quantize to the e4m3 qvalue, and
+  all-gather the qvalue (half the wire bytes vs a bf16 gather). Branch on the gather-axis index:
+
+    axis 1 -- up-proj (wi): gather is the CONTRACTING dim (embed). The per-n(mlp) scale multiplies a
+      sum spanning fsdp shards, so the amax must be GLOBAL: local amax over (exp, local-embed) then
+      pmax over the gather axis. The [1,1,mlp] scale is replicated along the gather axis -> gather the
+      QVALUE ONLY.
+    axis 2 -- down-proj (wo): gather is the OUTPUT dim (embed). Each embed channel is self-contained
+      on its shard, so a LOCAL amax over (exp, mlp) is exact -- NO all-reduce. The per-embed scale is
+      sharded on the gather axis too -> gather BOTH the qvalue and the scale.
+
+  qvalue = clip(w / scale) so w ~= qvalue * scale (qwix convention). The weight enters the gmm
+  custom_vjp as BF16, so stock `_gmm_bwd` computes drhs in BF16 (weight grad never e4m3, no NaN) and
+  the [1,1,n] scale takes the shared branch of `_dlhs_scale_grad_by_rhs_scale` (no per-expert repeat).
+  """
+  e4m3_max = 448.0
+  for axis_name, axis_idx in weight_gather_axes:
+    local_amax = jax.lax.stop_gradient(jnp.max(jnp.abs(rhs), axis=(0, 1), keepdims=True))  # [1,1,n]
+    # axis 1 = contracting gather -> GLOBAL scale (pmax); axis 2 = output gather -> LOCAL scale.
+    amax = jax.lax.pmax(local_amax, axis_name) if axis_idx == 1 else local_amax
+    scale = amax.astype(jnp.float32) / e4m3_max + 1e-20  # [1,1,n], w ~= qvalue * scale
+    qv = jnp.clip(rhs / scale.astype(rhs.dtype), -e4m3_max, e4m3_max).astype(weight_qtype)
+    qv = jax.lax.all_gather(qv, axis_name, axis=axis_idx, tiled=True)
+    if axis_idx != 1:
+      # output-dim gather: the per-output-channel scale is sharded on the gather axis, gather it too.
+      scale = jax.lax.all_gather(scale, axis_name, axis=axis_idx, tiled=True)
+    rhs = qpl.QArray(qvalue=qv, scale=scale)
   return rhs
 
 
