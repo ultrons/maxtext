@@ -26,6 +26,7 @@ from maxtext.kernels.megablox import pallas_mosaic_tpu_v2_gmm_kernel as gmm_v2
 from maxtext.kernels.megablox import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_v2
 from maxtext.layers import quantizations
 import qwix
+from maxtext.kernels.tgmm_block import tgmm_block_fp8
 import qwix.pallas as qpl
 import tokamax
 
@@ -75,6 +76,7 @@ def gmm(
     use_manual_quantization: bool = False,  # used in batchsplit
     use_gmm_v2: bool = False,
     partial_sum: jnp.ndarray | None = None,
+    use_block_fp8_tgmm: bool = False,
 ):
   """Grouped matrix multiplication operation."""
   if interpret is None:
@@ -105,7 +107,7 @@ def gmm(
   gmm_fwd_bwd = lambda *args: _gmm_fwd(*args)[0]  # pylint: disable=C3001
   gmm_fwd_bwd = jax.custom_vjp(
       gmm_fwd_bwd,
-      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17),
   )
   gmm_fwd_bwd.defvjp(_gmm_fwd, functools.partial(_gmm_bwd, lhs.dtype, rhs.dtype))
   return gmm_fwd_bwd(
@@ -126,6 +128,7 @@ def gmm(
       rhs_vma_axes,
       use_gmm_v2,
       partial_sum,
+      use_block_fp8_tgmm,
   )
 
 
@@ -162,6 +165,7 @@ def _gmm_fwd(
     rhs_vma_axes: tuple = tuple(),
     use_gmm_v2: bool = False,
     partial_sum: jnp.ndarray | None = None,
+    use_block_fp8_tgmm: bool = False,
 ) -> tuple[
     jnp.ndarray,
     tuple[
@@ -474,6 +478,7 @@ def _gmm_bwd(
     lhs_vma_axes: tuple,
     rhs_vma_axes: tuple,
     use_gmm_v2: bool,
+    use_block_fp8_tgmm: bool,
     residual: tuple[
         jnp.ndarray | qpl.QArray,
         jnp.ndarray | qpl.QArray,
@@ -510,7 +515,12 @@ def _gmm_bwd(
 
   # 2. Backward Pass Quantization
   if quantization_rule:
-    dlhs_dout, drhs_dout = _bwd_quantize_gradient(dlhs_dout, drhs_dout, quantization_rule)
+    if use_block_fp8_tgmm:
+      # block-fp8 tgmm quantizes drhs_dout ITSELF (per-gm-segment, inside tgmm_block_fp8);
+      # keep the raw cotangent here and quantize only the dlhs side.
+      dlhs_dout, _ = _bwd_quantize_gradient(dlhs_dout, drhs_dout, quantization_rule)
+    else:
+      dlhs_dout, drhs_dout = _bwd_quantize_gradient(dlhs_dout, drhs_dout, quantization_rule)
 
   # 3. DLHS Gradient Execution
   dlhs = _compute_dlhs(
@@ -544,6 +554,7 @@ def _gmm_bwd(
       interpret,
       rhs_vma_axes,
       quantization_rule,
+      use_block_fp8_tgmm=use_block_fp8_tgmm,
   )
 
   # 5. Output Formatting
@@ -822,8 +833,20 @@ def _compute_drhs(
     interpret: bool,
     rhs_vma_axes: tuple,
     quantization_rule: qwix.QtRule | None,
+    use_block_fp8_tgmm: bool = False,
 ) -> jnp.ndarray:
   """Routes execution of DRHS based on backend choices."""
+  if use_block_fp8_tgmm and use_tokamax_backend and use_gmm_v2 and not isinstance(lhs, qpl.QArray):
+    # NVIDIA-analog block-scaled fp8 wgrad: BOTH operands e4m3 with per-gm-segment dynamic
+    # scales, quantized inside the kernel entry from the RAW lhs (x_sorted) and RAW cotangent.
+    return tgmm_block_fp8(
+        lhs,
+        drhs_dout,
+        group_sizes,
+        num_actual_groups,
+        group_offset=group_offset,
+        preferred_element_type=rhs_dtype,
+    )
   if use_tokamax_backend and not use_gmm_v2:
     drhs = _drhs_run_tokamax_v1(drhs_dout, lhs, group_sizes, rhs_dtype, use_manual_quantization)
   elif use_tokamax_backend and use_gmm_v2:

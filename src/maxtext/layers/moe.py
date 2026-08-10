@@ -2011,6 +2011,7 @@ class RoutedMoE(nnx.Module):
             lhs_vma_axes=lhs_vma_axes,
             rhs_vma_axes=rhs_vma_axes,
             use_gmm_v2=self.config.use_gmm_v2,
+            use_block_fp8_tgmm=getattr(self.config, "use_block_fp8_tgmm", False),
             interpret=megablox_interpret,
         )
       else:

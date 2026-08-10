@@ -1050,6 +1050,16 @@ class MoEGeneral(BaseModel):
           "weight_gather_axes stays [] (no in-GMM re-gather). Forward-AG; targets ~184ms exposed weight-AG."
       ),
   )
+  use_block_fp8_tgmm: bool = Field(
+      False,
+      description=(
+          "Run the MoE weight-grad tgmm (dW = x_sorted^T @ dout) with BOTH operands e4m3 and "
+          "per-gm-segment dynamic block scales along the contracting token dim (the NVIDIA MLPerf "
+          "DSv3 fine-block fp8 wgrad recipe mapped to TPU; kernel src/maxtext/kernels/"
+          "tgmm_block.py). The raw cotangent bypasses the qwix bwd quantize on this path (the "
+          "kernel quantizes per segment itself). Requires use_tokamax_gmm + use_gmm_v2."
+      ),
+  )
   moe_sanitize_ragged_buffer: bool = Field(
       False,
       description=(
