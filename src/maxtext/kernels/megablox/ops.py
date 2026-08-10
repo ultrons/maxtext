@@ -178,6 +178,13 @@ def _gmm_fwd(
   - rhs: [g, k, n] if transpose_rhs=False. [g, n, k] if transpose_rhs=True
   """
 
+  # moe_fp8_cv_weight_ag: record whether the PRIMAL rhs arg was already a QArray on entry (a
+  # pre-quantized e4m3 weight built at the MoE gmm call site). The baseline qwix path quantizes rhs
+  # INSIDE this fwd (primal arg is a plain array, residual rhs is a QArray), so the residual's
+  # QArray-ness cannot distinguish the two -- only the entry type can. The VJP cotangent structure
+  # must match the PRIMAL arg.
+  rhs_is_qarray_input = isinstance(rhs, qpl.QArray)
+
   # Quantize activation and weight
   if quantization_rule:
     # pyrefly: ignore[bad-assignment]
@@ -218,7 +225,7 @@ def _gmm_fwd(
         lhs_vma_axes,
     )
 
-  return out, (lhs, rhs, group_sizes, group_offset, partial_sum)  # pyrefly: ignore[bad-return]
+  return out, (lhs, rhs, group_sizes, group_offset, partial_sum, rhs_is_qarray_input)  # pyrefly: ignore[bad-return]
 
 
 def _fwd_quantize_activation_and_weight(
@@ -420,7 +427,11 @@ def _gmm_bwd(
 ) -> tuple[jnp.ndarray, jnp.ndarray, None, None, jnp.ndarray | None, jnp.ndarray | None]:
   """Backward function for throughput GMM VJP."""
   del preferred_element_type
-  lhs, rhs, group_sizes, group_offset, partial_sum_fwd = residual
+  lhs, rhs, group_sizes, group_offset, partial_sum_fwd, rhs_is_qarray_input = residual
+  # moe_fp8_cv_weight_ag: if the PRIMAL rhs was a QArray, _bwd_prepare_inputs unwraps it to
+  # rhs.qvalue below and _compute_drhs yields a plain-array weight gradient -- but the VJP cotangent
+  # must match the QArray pytree. Capture the QArray here and re-wrap drhs at the end.
+  _orig_rhs_qarray = rhs if rhs_is_qarray_input else None
   num_actual_groups = rhs.shape[0]
 
   # Jargon used here:
@@ -481,6 +492,19 @@ def _gmm_bwd(
   #
   # TODO(tgale, enriqueps, apaske): Fuse this transposition into the tgmm.
   drhs = drhs.swapaxes(1, 2) if transpose_rhs else drhs
+  if _orig_rhs_qarray is not None:
+    # The primal rhs entered as a QArray (moe_fp8_cv_weight_ag), so the VJP cotangent must match its
+    # pytree. Cast the qvalue-leaf cotangent (the weight gradient) to BF16: it is the gradient WIRE
+    # dtype -- the in-body all_gather transpose reduce-scatters it to storage sharding, and an
+    # uncast f32 drhs doubles that reduce-scatter's bytes. NEVER cast to e4m3 (overflow -> NaN).
+    # The scale is forward-only (straight-through estimator on the quantize), so its cotangent is a
+    # per-channel zero.
+    drhs = qpl.QArray(
+        qvalue=drhs.astype(jnp.bfloat16),
+        scale=jnp.zeros_like(_orig_rhs_qarray.scale),
+        zero_point=None,
+        qtype=_orig_rhs_qarray.qtype,
+    )
   dpartial_sum = grad if partial_sum_fwd is not None else None
   d_existing_out = None if use_tokamax_backend else grad
 

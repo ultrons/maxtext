@@ -50,6 +50,31 @@ from qwix.contrib.sparsity import sparsity_module
 import qwix.pallas as qpl
 import tokamax
 
+
+@jax.custom_vjp
+def _ste_quant(w, sc):
+  """Straight-through e4m3 quantizer for moe_fp8_cv_weight_ag.
+
+  Forward: e4m3 qvalue = clip(w / sc, +-448). Backward (STE): pass the incoming cotangent straight
+  through to w in BF16 UNCHANGED. The gmm backward computes drhs with NO rhs.scale applied (it is
+  already dL/d(dequantized weight)), and w -> qv*sc is the identity chain, so the STE vjp is a plain
+  pass-through -- a /sc here would inflate the per-channel gradient by 1/sc. This also keeps the
+  weight gradient in bf16 (never e4m3 -- an e4m3 gradient overflows and NaNs the reduce-scatter).
+  """
+  return jnp.clip(w / sc.astype(w.dtype), -448.0, 448.0).astype(jnp.float8_e4m3fn)
+
+
+def _ste_quant_fwd(w, sc):
+  return _ste_quant(w, sc), None
+
+
+def _ste_quant_bwd(_res, g):
+  return (g.astype(jnp.bfloat16), None)
+
+
+_ste_quant.defvjp(_ste_quant_fwd, _ste_quant_bwd)
+
+
 set_xla_metadata = xla_metadata.set_xla_metadata
 
 
@@ -1485,8 +1510,13 @@ class RoutedMoE(nnx.Module):
           return tuple(sorted(a.strip() for a in vma_content.split(",")))
         return tuple()
 
+      # moe_fp8_cv_weight_ag: the kernel may be a qwix QArray (e4m3 qvalue + scale) built at the
+      # gmm call site. VMA lives on the qvalue leaf, and we must NOT astype it to bf16 (that would
+      # dequantize the e4m3 wire); ops.gmm consumes the QArray (rhs=qvalue, rhs_scale=scale) and
+      # dequantizes inside the kernel.
+      _kernel_is_qarray = isinstance(kernel, qpl.QArray)
       lhs_vma_axes = extract_vma(inputs)
-      rhs_vma_axes = extract_vma(kernel)
+      rhs_vma_axes = extract_vma(kernel.qvalue if _kernel_is_qarray else kernel)
       if inputs.shape[0] != expert_assignments.shape[0]:
         raise ValueError("The number of input tokens must match the number of expert assignments!")
 
@@ -1496,7 +1526,8 @@ class RoutedMoE(nnx.Module):
       if padding_amount > 0 and partial_sum is not None:
         partial_sum = jnp.pad(partial_sum, ((0, padding_amount), (0, 0)))
       inputs = inputs.astype(self.dtype)
-      kernel = kernel.astype(self.dtype)
+      if not _kernel_is_qarray:
+        kernel = kernel.astype(self.dtype)
       lhs_quantize_dtype, rhs_quantize_dtype = get_quantization_dtypes()
 
       # Interpret the megablox Pallas kernel only when the TARGET is NOT TPU (CPU or GPU,
@@ -1658,6 +1689,24 @@ class RoutedMoE(nnx.Module):
         decoder_tokens_pspec,
     ) = get_routed_moe_shardings(is_batch_sharded_by_expert, input_ids is not None)
     w0_pspec, w1_pspec, wo_pspec = maybe_aqt_partition(w0_kernel, w0_pspec, w1_kernel, w1_pspec, wo_kernel, wo_pspec)
+
+    # moe_fp8_cv_weight_ag: quantize the routed expert weights to e4m3 with a DYNAMIC
+    # per-output-channel scale and all-gather the QVALUE *inside* the shard_map body. The weights
+    # must therefore enter the shard_map STILL STORAGE-SHARDED (fsdp on the embed dim) -- override
+    # the (gathered-layout) weight in_specs with the storage sharding. Structure rationale:
+    #  - a GSPMD boundary gather of an e4m3 value gets elided (the algebraic simplifier sinks the
+    #    bf16->e4m3 convert past the collective -> gathers bf16); an explicit in-body
+    #    lax.all_gather of an already-e4m3 array cannot be elided;
+    #  - the in-body gather's autodiff transpose is ONE direct psum_scatter of the bf16 weight
+    #    grad to storage sharding (the efficient single-reduce-scatter form), and the boundary
+    #    adds no extra reduction (the input is varying over fsdp, not replicated).
+    _fp8q = getattr(self.config, "moe_fp8_cv_weight_ag", False)
+    if _fp8q:
+      if self.config.prefuse_moe_weights or self.config.num_moe_emb_chunks > 0:
+        raise ValueError("moe_fp8_cv_weight_ag does not support prefuse_moe_weights or moe_emb_chunking.")
+      w0_pspec = self._logical_to_mesh_axes(self.wi_kernel_axes)
+      w1_pspec = self._logical_to_mesh_axes(self.wi_kernel_axes)
+      wo_pspec = self._logical_to_mesh_axes(self.wo_kernel_axes)
 
     def roe_ag_and_route(x, logits, pre_bias_logits, num_ep, expert_shard_id, rngs, input_ids=None):
       # The ring-of-experts strategy first duplicates the inputs to all
@@ -1892,9 +1941,19 @@ class RoutedMoE(nnx.Module):
         _weight_gather,
         partial_accum0=None,
         partial_accum1=None,
+        w0_scale=None,
+        w1_scale=None,
     ):
       """Run the two up-projections (gate + up) and apply the FFN activation."""
       wi_gather_axes, wi_tile_size = get_wi_gmm_params()
+      # moe_fp8_cv_weight_ag: w0/w1 arrive as raw e4m3 qvalues (gathered in-body); build the QArray
+      # at the LAST moment before each gmm_fn call so the ring plumbing never sees a QArray.
+      # stop_gradient on the scale: it is forward-only (STE), and without it the shard_map transpose
+      # psums the (opaque-through-the-gmm-custom_vjp) zero scale cotangent per layer -- tiny
+      # latency-bound collectives re-materialized in the backward remat.
+      if _fp8q:
+        w0 = qpl.QArray(qvalue=w0, scale=jax.lax.stop_gradient(w0_scale), zero_point=None, qtype=jnp.float8_e4m3fn)
+        w1 = qpl.QArray(qvalue=w1, scale=jax.lax.stop_gradient(w1_scale), zero_point=None, qtype=jnp.float8_e4m3fn)
       if self.config.prefuse_moe_weights:
         # Weights are stored as (G,K,2N); w0/w1 are adjacent slices so XLA elides this concat.
         w_fused = jnp.concatenate([w0, w1], axis=-1)
@@ -2123,6 +2182,9 @@ class RoutedMoE(nnx.Module):
         wo_bias,
         sharded_input_ids,
         rngs,
+        w0_scale=None,
+        w1_scale=None,
+        wo_scale=None,
     ):
       batch_size, sequence_length, embed_dim = x.shape
       if self.config.num_moe_emb_chunks > 0:
@@ -2146,10 +2208,16 @@ class RoutedMoE(nnx.Module):
           w0_bias, w1_bias, wo_bias = self.transform_bias(routing.selected_experts, w0_bias, w1_bias, wo_bias)
 
         gmm_fn = get_gmm_for_local_experts(x, routing, route_metadata)
-        output0, output1 = gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather)
+        output0, output1 = gmm_up(
+            x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather, w0_scale=w0_scale, w1_scale=w1_scale
+        )
 
       intermediate_layer = self.apply_ffn_activation(output0, output1)
       wo_gather_axes, wo_tile_size = get_wo_gmm_params()
+      # moe_fp8_cv_weight_ag: wo QArray built at the last moment (global [1,1,embed] scale --
+      # identical on every shard, no consistency issue). stop_gradient as in gmm_up.
+      if _fp8q:
+        wo = qpl.QArray(qvalue=wo, scale=jax.lax.stop_gradient(wo_scale), zero_point=None, qtype=jnp.float8_e4m3fn)
       intermediate_output = gmm_fn(
           intermediate_layer,
           wo,
@@ -2243,6 +2311,9 @@ class RoutedMoE(nnx.Module):
             wo_bias_pspec,
             decoder_tokens_pspec,
             P(),  # Replicate the input key
+            P(),  # w0 fp8 qvalue scale (moe_fp8_cv_weight_ag; [1,1,n] f32, replicated)
+            P(),  # w1 fp8 qvalue scale
+            P(),  # wo fp8 qvalue scale
         ),
         out_specs=(
             self._logical_to_mesh_axes(
@@ -2269,11 +2340,21 @@ class RoutedMoE(nnx.Module):
         wo_bias,
         sharded_input_ids,
         rngs,
+        w0_scale,
+        w1_scale,
+        wo_scale,
     ):
       # The expert weights (w0/w1/wo) are all-gathered over FSDP once at this
       # shard_map entry (implicitly, via the `embed_tensor_transpose` pspec which
       # drops fsdp -> GSPMD inserts the boundary all-gather) and reused across all
       # chunks of the ring-of-experts pipeline below.
+      # moe_fp8_cv_weight_ag: the weights instead arrive STORAGE-SHARDED e4m3 qvalues; gather them
+      # here, ONCE, explicitly (elision-proof; single direct weight-grad reduce-scatter transpose),
+      # reused across all chunks. The QArray is built at the last moment before each gmm call.
+      if _fp8q:
+        w0 = jax.lax.all_gather(w0, "fsdp", axis=1, tiled=True)  # [exp, embed_full, mlp]
+        w1 = jax.lax.all_gather(w1, "fsdp", axis=1, tiled=True)
+        wo = jax.lax.all_gather(wo, "fsdp", axis=2, tiled=True)  # [exp, mlp, embed_full]
       n_chunks = self.config.num_moe_token_chunks
       if n_chunks <= 1 or not self.config.use_ring_of_experts:
         return _moe_body(
@@ -2288,6 +2369,9 @@ class RoutedMoE(nnx.Module):
             wo_bias,
             sharded_input_ids,
             rngs,
+            w0_scale=w0_scale,
+            w1_scale=w1_scale,
+            wo_scale=wo_scale,
         )
 
       # Chunked ring-of-experts pipeline: split the per-shard tokens along the
@@ -2322,6 +2406,9 @@ class RoutedMoE(nnx.Module):
             wo_bias,
             None if sharded_input_ids is None else sharded_input_ids[:, sl],
             rngs,
+            w0_scale=w0_scale,
+            w1_scale=w1_scale,
+            wo_scale=wo_scale,
         )
         if self.config.moe_chunk_barrier:
           _prev = out_c
@@ -2365,6 +2452,27 @@ class RoutedMoE(nnx.Module):
     gate_logits = self._maybe_shard_with_logical(gate_logits, gate_logits_axes)
     pre_bias_logits = self._maybe_shard_with_logical(pre_bias_logits, pre_bias_logits_axes)
 
+    def _cv_scale(w):
+      # DYNAMIC per-output-channel scale on the GLOBAL param: max over (exp, k) -> [1,1,n]. The max
+      # over the fsdp-sharded dim is a tiny GSPMD all-reduce; for wo it crosses no shard at all.
+      # stop_gradient: forward-only (STE backward). checkpoint_name: SAVE the tiny scale under
+      # remat_policy=custom (key moe_fp8_scale, default 'device') so the rematted backward LOADS it
+      # instead of re-running the cross-shard max inside the checkpoint scope.
+      sc = jax.lax.stop_gradient(
+          jnp.max(jnp.abs(w), axis=(0, 1), keepdims=True).astype(jnp.float32) / 448.0 + 1e-20
+      )
+      return adc.checkpoint_name(sc, "moe_fp8_scale")
+
+    if _fp8q:
+      _w0sc = _cv_scale(w0_kernel)
+      _w1sc = _cv_scale(w1_kernel)
+      _wosc = _cv_scale(wo_kernel)
+      w0_kernel = _ste_quant(w0_kernel, _w0sc)  # e4m3 qvalue, KEEPS the storage sharding
+      w1_kernel = _ste_quant(w1_kernel, _w1sc)
+      wo_kernel = _ste_quant(wo_kernel, _wosc)
+    else:
+      _w0sc = _w1sc = _wosc = jnp.float32(1.0)
+
     w0_kernel = self._maybe_shard_with_pspec(w0_kernel, w0_pspec)
     w1_kernel = self._maybe_shard_with_pspec(w1_kernel, w1_pspec)
     wo_kernel = self._maybe_shard_with_pspec(wo_kernel, wo_pspec)
@@ -2387,6 +2495,9 @@ class RoutedMoE(nnx.Module):
         wo_bias,
         input_ids,
         self.rngs,
+        _w0sc,
+        _w1sc,
+        _wosc,
     )
 
   def reshape_and_update_weights(self, weights, indices):
