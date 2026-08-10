@@ -45,6 +45,7 @@ from maxtext.kernels.ragged.ragged_sort import compute_ring_sort_indices
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_sort
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_unsort
 from maxtext.kernels.ring_ag import ring_all_gather
+from maxtext.kernels.ring_ag import ring_reduce_scatter
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
@@ -107,6 +108,32 @@ def _ring_ct_rs_bwd(mesh, ep_name, collective_id, _res, ct):
 
 
 _ring_ct_reduce_scatter.defvjp(_ring_ct_rs_fwd, _ring_ct_rs_bwd)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4))
+def _ring_combine_rs(output, mesh, ep_name, rs_collective_id, ag_collective_id):
+  """The combine reduce-scatter with BOTH directions on TC ring Pallas kernels
+  (moe_ring_combine_rs, composes with/requires moe_ring_cotangent_ag).
+
+  FORWARD: the bidirectional ring reduce-scatter kernel (== psum_scatter, rel=0 validated; per-hop
+  f32-staged add like the XLA ring, but the hop ORDER may differ -> bf16 reduce-order noise, not
+  bit-exact). BACKWARD: the ring all-gather on the cotangent (as _ring_ct_reduce_scatter).
+  REMAT: no save is needed -- the dump census shows the combine is not part of the backward remat
+  recompute (it stops at the mlpwo/moe_mlpwo checkpoint save upstream), so the forward Pallas DMA
+  never re-runs in a rematted region.
+  """
+  return ring_reduce_scatter(output, mesh, ep_name, 0, rs_collective_id)
+
+
+def _ring_combine_rs_fwd(output, mesh, ep_name, rs_collective_id, ag_collective_id):
+  return _ring_combine_rs(output, mesh, ep_name, rs_collective_id, ag_collective_id), None
+
+
+def _ring_combine_rs_bwd(mesh, ep_name, rs_collective_id, ag_collective_id, _res, ct):
+  return (ring_all_gather(ct, mesh, (ep_name,), 0, ag_collective_id),)
+
+
+_ring_combine_rs.defvjp(_ring_combine_rs_fwd, _ring_combine_rs_bwd)
 
 set_xla_metadata = xla_metadata.set_xla_metadata
 
@@ -319,6 +346,7 @@ _DIRECT_TOKEN_AG_COLLECTIVE_ID = 40  # moe_direct_token_ag: backward-recompute E
 _DIRECT_FWD_TOKEN_AG_COLLECTIVE_ID = 45  # moe_fwd_direct_token_ag: FORWARD EP token dispatch all-gather
 _DIRECT_COMBINE_AG_COLLECTIVE_ID = 50  # moe_direct_combine_ag: backward combine-cotangent all-gather (== .626)
 _RING_CT_AG_COLLECTIVE_ID = 55  # moe_ring_cotangent_ag: backward combine-cotangent RING all-gather
+_RING_RS_COLLECTIVE_ID = 56  # moe_ring_combine_rs: FORWARD combine RING reduce-scatter
 
 
 def _scheduling_group(group_id):
@@ -2682,6 +2710,17 @@ class RoutedMoE(nnx.Module):
           # manbwd RECOMPUTE; tagging its transpose all-gather (_drs_bwd == all-gather.626) lets the
           # scheduler overlap it with the co-tagged splash host restore copies. None otherwise.
           output = _direct_reduce_scatter(output, self.mesh, "expert", 7, self._splash_offload_sched_group())
+        elif getattr(self.config, "moe_ring_combine_rs", False) and self._expert_parallelism_name == "expert":
+          # moe_ring_combine_rs: BOTH directions on TC ring kernels -- forward = the ring RS twin
+          # (== psum_scatter rel=0), backward = the ring cotangent AG. No remat save needed: the
+          # dump census shows the combine is NOT re-run in the backward remat (the recompute stops
+          # at the mlpwo/moe_mlpwo save before it), so the fwd Pallas kernel never fires in a
+          # rematted region (the remat+Pallas-DMA rule holds without a save).
+          if not getattr(self.config, "moe_ring_cotangent_ag", False):
+            raise ValueError("moe_ring_combine_rs requires moe_ring_cotangent_ag=True.")
+          output = _ring_combine_rs(
+              output, self.mesh, "expert", _RING_RS_COLLECTIVE_ID, _RING_CT_AG_COLLECTIVE_ID
+          )
         elif getattr(self.config, "moe_ring_cotangent_ag", False) and self._expert_parallelism_name == "expert":
           # moe_ring_cotangent_ag: forward = the SAME plain psum_scatter (untouched); ONLY the
           # backward cotangent all-gather moves onto the TC ring kernel (see _ring_ct_reduce_scatter).

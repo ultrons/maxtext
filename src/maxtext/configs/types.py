@@ -1039,6 +1039,17 @@ class MoEGeneral(BaseModel):
           "weight_gather_axes stays [] (no in-GMM re-gather). Forward-AG; targets ~184ms exposed weight-AG."
       ),
   )
+  moe_ring_combine_rs: bool = Field(
+      False,
+      description=(
+          "Run the FORWARD ring-combine reduce-scatter on the bidirectional TC ring RS kernel "
+          "(== psum_scatter, rel=0 validated; bf16 reduce-order may differ from the XLA ring) and "
+          "the backward cotangent all-gather on the ring AG kernel. Requires "
+          "moe_ring_cotangent_ag=True. No remat save needed: the combine is not part of the "
+          "backward remat recompute (it stops at the mlpwo save upstream), so the forward Pallas "
+          "kernel never re-runs in a rematted region."
+      ),
+  )
   moe_ring_cotangent_ag: bool = Field(
       False,
       description=(

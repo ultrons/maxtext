@@ -20,6 +20,7 @@ import jax
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+import jax.numpy as jnp
 
 MESH = pl.DeviceIdType.MESH
 
@@ -193,3 +194,123 @@ def ring_all_gather(x, mesh, gather_axes, gather_dim, collective_id, *, bidi=Tru
       compiler_params=pltpu.CompilerParams(collective_id=collective_id),
       cost_estimate=pl.CostEstimate(flops=0, bytes_accessed=2 * full_bytes, transcendentals=0),
   )(x)
+
+
+def _rs_bidi_kernel(acc_ref, out_ref, rvA_ref, rvB_ref, av, rv, sa, ra, sb, rb, *,
+                    axis, n, chunk, all_axes, gather_dim, ftile, rtile):
+  """Bidirectional ring reduce-scatter body (vendored from perf-drills reduce_scatter.py,
+  build_rs_ring_bidi -- v7x-validated rel=0 vs psum_scatter). acc_ref aliases the input (the full
+  per-device partial); F is split in half: upper half reduced over the +dir ring, lower half over
+  the -dir ring, concurrently. The per-hop add is VMEM-staged in [rtile x ftile] tiles and
+  accumulated in f32 (cast back to the wire dtype per hop, like the XLA ring psum_scatter)."""
+  d = lax.axis_index(axis)
+  right = _neighbor(all_axes, axis, +1)
+  left = _neighbor(all_axes, axis, -1)
+  nd = acc_ref.ndim
+  F = acc_ref.shape[-1]
+  Fh = F // 2
+  nft = Fh // ftile
+  nrt = chunk // rtile
+  bsem = pltpu.get_barrier_semaphore()
+  pl.semaphore_signal(bsem, 1, device_id=right, device_id_type=MESH)
+  pl.semaphore_signal(bsem, 1, device_id=left, device_id_type=MESH)
+  pl.semaphore_wait(bsem, 2)
+
+  def blk(ci, f0):
+    idx = [pl.ds(0, acc_ref.shape[i]) for i in range(nd)]
+    idx[gather_dim] = pl.ds(ci * chunk, chunk)
+    idx[-1] = pl.ds(f0, Fh)
+    return tuple(idx)
+
+  def add_into(ci, f0, rvref):
+    def _t(t, _):
+      rs_ = (t // nft) * rtile
+      fs = (t % nft) * ftile
+      ai = [pl.ds(0, acc_ref.shape[i]) for i in range(nd)]
+      ai[gather_dim] = pl.ds(ci * chunk + rs_, rtile)
+      ai[-1] = pl.ds(f0 + fs, ftile)
+      ri = [pl.ds(0, rvref.shape[i]) for i in range(nd)]
+      ri[gather_dim] = pl.ds(rs_, rtile)
+      ri[-1] = pl.ds(fs, ftile)
+      pltpu.sync_copy(acc_ref.at[tuple(ai)], av)
+      pltpu.sync_copy(rvref.at[tuple(ri)], rv)
+      av[...] = (av[...].astype(jnp.float32) + rv[...].astype(jnp.float32)).astype(av.dtype)
+      pltpu.sync_copy(av, acc_ref.at[tuple(ai)])
+      return _
+    lax.fori_loop(0, nrt * nft, _t, None)
+
+  for k in range(n - 1):
+    cA = pltpu.make_async_remote_copy(   # +dir hop k: send acc[(d-k)%n, 0:Fh] -> right
+        acc_ref.at[blk(lax.rem(d - k + n, n), 0)], rvA_ref, sa, ra,
+        device_id=right, device_id_type=MESH)
+    cB = pltpu.make_async_remote_copy(   # -dir hop k: send acc[(d+k)%n, Fh:F] -> left
+        acc_ref.at[blk(lax.rem(d + k, n), Fh)], rvB_ref, sb, rb,
+        device_id=left, device_id_type=MESH)
+    cA.start(); cB.start(); cA.wait(); cB.wait()
+    add_into(lax.rem(d - k - 1 + n, n), 0, rvA_ref)
+    add_into(lax.rem(d + k + 1, n), Fh, rvB_ref)
+
+  # After n-1 hops the +dir ring leaves chunk (d+1)%n's upper half fully reduced here, and the -dir
+  # ring chunk (d-1)%n's lower half. One extra rotation hop each -> device d receives its OWN chunk
+  # d (both halves) into out_ref. Matches psum_scatter (device d <- shard d).
+  upA = lax.rem(d + 1, n)
+  upB = lax.rem(d - 1 + n, n)
+  oA = [pl.ds(0, out_ref.shape[i]) for i in range(nd)]
+  oA[-1] = pl.ds(0, Fh)
+  oB = [pl.ds(0, out_ref.shape[i]) for i in range(nd)]
+  oB[-1] = pl.ds(Fh, Fh)
+  fA = pltpu.make_async_remote_copy(acc_ref.at[blk(upA, 0)], out_ref.at[tuple(oA)], sa, ra,
+                                    device_id=right, device_id_type=MESH)
+  fB = pltpu.make_async_remote_copy(acc_ref.at[blk(upB, Fh)], out_ref.at[tuple(oB)], sb, rb,
+                                    device_id=left, device_id_type=MESH)
+  fA.start(); fB.start(); fA.wait(); fB.wait()
+
+
+def ring_reduce_scatter(x, mesh, axis, gather_dim, collective_id, *, ftile=512, rtile=256):
+  """In-shard_map bidirectional ring reduce-scatter of the per-device FULL partial `x` over mesh
+  axis `axis`, tiled on `gather_dim`. Semantics ==
+  ``jax.lax.psum_scatter(x, axis, scatter_dimension=gather_dim, tiled=True)`` (rel=0 validated on
+  v7x; per-hop f32-staged add cast back to the wire dtype, like the XLA ring).
+
+  MUST be called INSIDE a shard_map spanning `mesh`. `collective_id` must be DISTINCT from every
+  other concurrently in-flight Pallas collective's id."""
+  n = mesh.shape[axis]
+  all_axes = tuple(mesh.axis_names)
+  assert x.shape[gather_dim] % n == 0, (x.shape, gather_dim, n)
+  assert x.shape[-1] % 2 == 0, x.shape
+  chunk = x.shape[gather_dim] // n
+  Fh = x.shape[-1] // 2
+  ftile = min(ftile, Fh)
+  rtile = min(rtile, chunk)
+  assert chunk % rtile == 0 and Fh % ftile == 0, (chunk, rtile, Fh, ftile)
+  oshape = list(x.shape); oshape[gather_dim] = chunk
+  cshape = list(x.shape); cshape[gather_dim] = chunk; cshape[-1] = Fh
+  vshape = list(x.shape); vshape[gather_dim] = rtile; vshape[-1] = ftile
+  HBM = pltpu.MemorySpace.HBM
+
+  def kern(inp_ref, acc_ref, out_ref, rvA_ref, rvB_ref, av, rv, sa, ra, sb, rb):
+    _rs_bidi_kernel(acc_ref, out_ref, rvA_ref, rvB_ref, av, rv, sa, ra, sb, rb,
+                    axis=axis, n=n, chunk=chunk, all_axes=all_axes, gather_dim=gather_dim,
+                    ftile=ftile, rtile=rtile)
+
+  full_bytes = 1
+  for d_ in x.shape:
+    full_bytes *= d_
+  full_bytes *= x.dtype.itemsize
+  o = pl.pallas_call(
+      kern,
+      out_shape=(jax.ShapeDtypeStruct(tuple(x.shape), x.dtype),   # acc (aliased from input)
+                 jax.ShapeDtypeStruct(tuple(oshape), x.dtype),     # the reduced shard (real output)
+                 jax.ShapeDtypeStruct(tuple(cshape), x.dtype),     # +dir recv scratch
+                 jax.ShapeDtypeStruct(tuple(cshape), x.dtype)),    # -dir recv scratch
+      in_specs=[pl.BlockSpec(memory_space=HBM)],
+      out_specs=[pl.BlockSpec(memory_space=HBM)] * 4,
+      scratch_shapes=[pltpu.VMEM(tuple(vshape), x.dtype), pltpu.VMEM(tuple(vshape), x.dtype),
+                      pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA,
+                      pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA],
+      input_output_aliases={0: 0},
+      compiler_params=pltpu.CompilerParams(collective_id=collective_id),
+      cost_estimate=pl.CostEstimate(flops=2 * full_bytes // max(x.dtype.itemsize, 1),
+                                    bytes_accessed=2 * full_bytes, transcendentals=0),
+  )(x)
+  return o[1]
