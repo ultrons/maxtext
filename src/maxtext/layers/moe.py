@@ -2519,6 +2519,16 @@ class RoutedMoE(nnx.Module):
           x, logits, pre_bias_logits, rngs, input_ids=sharded_input_ids,
           saved_sort=saved_sort, sort_save_cell=sort_save_cell,
       )
+      # moe_x_sorted: tag the SORTED expert input + its small routing/metadata bundle for the remat
+      # policy. With moe_x_sorted=device the backward LOADS these instead of re-running route() --
+      # killing the rematted dispatch token all-gather + SC ragged sort/gather (the up-proj wgrad
+      # needs x_sorted anyway). The routing/metadata leaves (indices, group sizes, weights -- tiny)
+      # must be saved too, else the sort kernel re-runs just to reproduce them for the gmm/unsort
+      # backward. Tags are inert under the default moe_x_sorted=remat.
+      _cn = lambda t: adc.checkpoint_name(t, "moe_x_sorted") if isinstance(t, jax.Array) else t
+      x = _cn(x)
+      routing = jax.tree.map(_cn, routing)
+      route_metadata = jax.tree.map(_cn, route_metadata)
 
       if self.config.mlp_bias:
         w0_bias, w1_bias, wo_bias = self.transform_bias(routing.selected_experts, w0_bias, w1_bias, wo_bias)

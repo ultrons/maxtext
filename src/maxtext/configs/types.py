@@ -1571,6 +1571,17 @@ class RematAndOffload(BaseModel):
       RematLocation.REMAT,
       description="Remat policy for the second MLP layer's output.",
   )
+  moe_x_sorted: RematLocation = Field(
+      RematLocation.REMAT,
+      description=(
+          "Remat policy for the sorted MoE expert input (x_sorted, post-dispatch/ragged-sort, per "
+          "chunk) plus its small routing/metadata bundle. 'device' saves them across the remat "
+          "boundary so the BACKWARD does not re-run the dispatch token all-gather + SC ragged "
+          "sort/gather; the up/down gmm re-runs from the saved tensor. Cost: ~940MB/layer bf16 at "
+          "pdbs=1 (x is bf16 pre-kernel; gmm_v2 quantizes the lhs in-kernel). Default 'remat' = "
+          "recompute (today's behavior)."
+      ),
+  )
   moe_fp8_scale: RematLocation = Field(
       RematLocation.DEVICE,
       description=(
@@ -3594,6 +3605,7 @@ class MaxTextConfig(
           "context",
           "mlpwi",
           "moe_fp8_scale",
+          "moe_x_sorted",
           "moe_mlpwi_0",
           "moe_mlpwi_1",
           "moe_mlpwo",
@@ -4597,6 +4609,7 @@ class RLConfig(
           "context",
           "mlpwi",
           "moe_fp8_scale",
+          "moe_x_sorted",
           "moe_mlpwi_0",
           "moe_mlpwi_1",
           "moe_mlpwo",
