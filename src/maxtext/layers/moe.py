@@ -2599,10 +2599,24 @@ class RoutedMoE(nnx.Module):
       # (amax=Inf -> inv=0 -> Inf*0=NaN; probe receipt in test_amax_edges.py). One masked write
       # over the buffer per chunk.
       if getattr(self.config, "moe_sanitize_ragged_buffer", False):
-        _lgs = routing.local_group_sizes if routing.local_group_sizes is not None else routing.group_sizes
-        _valid_rows = jnp.sum(_lgs).astype(jnp.int32)
+        # Zero rows OUTSIDE [shard_output_start, shard_output_end) -- the unsort's own range
+        # arithmetic (global group-offset cumsum sliced at this shard's expert range). Correct for
+        # BOTH buffer modes: rbf=-1 keeps GLOBAL slot positions (valid rows are a mid-buffer range,
+        # NOT front-packed -- the earlier `rows < sum(sizes)` predicate was a silent NO-OP there),
+        # and rbf>0 front-packs (start=0). Invalid slots are SKIPPED by the SC kernel's validity
+        # compaction (never written -> stale HBM), and stale Inf/NaN x absmax act-cal = NaN wgrads.
+        if not self.config.use_ring_of_experts or route_metadata is None or route_metadata.expert_shard_id is None:
+          raise ValueError(
+              "moe_sanitize_ragged_buffer requires the ring-of-experts path with EP shard metadata"
+              " (a sanitizer that cannot derive the valid range must fail loudly, not no-op)."
+          )
+        _go = jnp.cumulative_sum(routing.group_sizes.astype(jnp.int32), include_initial=True)
+        _lE = self.config.num_experts // self.get_expert_parallelism_size()
+        _sid = route_metadata.expert_shard_id
+        _start = _go[_sid * _lE]
+        _end = _go[(_sid + 1) * _lE]
         _row_ids = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
-        x = jnp.where(_row_ids < _valid_rows, x, jnp.zeros((), x.dtype))
+        x = jnp.where((_row_ids >= _start) & (_row_ids < _end), x, jnp.zeros((), x.dtype))
 
       if self.config.mlp_bias:
         w0_bias, w1_bias, wo_bias = self.transform_bias(routing.selected_experts, w0_bias, w1_bias, wo_bias)
