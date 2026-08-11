@@ -81,6 +81,47 @@ def _ste_quant_bwd(_res, g):
 
 _ste_quant.defvjp(_ste_quant_fwd, _ste_quant_bwd)
 
+import os as _os
+_CV_DEBUG_FINITE = _os.environ.get("MOE_FP8_CV_DEBUG_FINITE", "0") == "1"
+
+
+def _finw(tag, x):
+  """FWD finite watchpoint (MOE_FP8_CV_DEBUG_FINITE=1): prints the non-finite count. Identity."""
+  if _CV_DEBUG_FINITE and x is not None:
+    xf = x.astype(jnp.float32)
+    # count non-finites DIRECTLY in f32: jnp.size() is a Python int that overflows int32 for
+    # the [32768,7168]-class global tensors when passed as a traced debug-print argument.
+    nf = jnp.sum((~jnp.isfinite(xf)).astype(jnp.float32))
+    jax.debug.print("FINW fwd {t}: nonfinite={n}", t=tag, n=nf, ordered=False)
+  return x
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
+def _finw_ct(tag, x):
+  """BWD finite watchpoint: identity whose backward prints the cotangent's non-finite count."""
+  return x
+
+
+def _finw_ct_fwd(tag, x):
+  return x, None
+
+
+def _finw_ct_bwd(tag, _res, ct):
+  ctf = ct.astype(jnp.float32)
+  nf = jnp.sum((~jnp.isfinite(ctf)).astype(jnp.float32))
+  jax.debug.print("FINW bwd {t}: nonfinite={n}", t=tag, n=nf, ordered=False)
+  return (ct,)
+
+
+_finw_ct.defvjp(_finw_ct_fwd, _finw_ct_bwd)
+
+
+def _finw_pair(tag, x):
+  """Both directions: fwd value + bwd cotangent at this point."""
+  if not _CV_DEBUG_FINITE:
+    return x
+  return _finw_ct(tag, _finw(tag, x))
+
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3))
 def _ring_ct_reduce_scatter(output, mesh, ep_name, collective_id):
@@ -2622,7 +2663,9 @@ class RoutedMoE(nnx.Module):
         w0_bias, w1_bias, wo_bias = self.transform_bias(routing.selected_experts, w0_bias, w1_bias, wo_bias)
 
       gmm_fn = get_gmm_for_local_experts(x, routing, route_metadata)
+      x = _finw_pair("x_up_in", x)  # (7) bwd = the dlhs gmm output
       intermediate_layer = gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather, w0_scale, w1_scale)
+      intermediate_layer = _finw_pair("up_hidden", intermediate_layer)  # (3a)
 
       wo_gather_axes, wo_tile_size = get_wo_gmm_params()
       # moe_fp8_cv_weight_ag (_fp8wo): wo arrives as an e4m3 qvalue gathered by the cv-gather; build
@@ -2646,6 +2689,7 @@ class RoutedMoE(nnx.Module):
       if self.config.mlp_bias:
         intermediate_output = intermediate_output + wo_bias
       intermediate_output = adc.checkpoint_name(adc.checkpoint_name(intermediate_output, "mlpwo"), "moe_mlpwo")
+      intermediate_output = _finw_pair("down_out", intermediate_output)  # (3b) fwd; (5) bwd = ct entering combine
 
       if (
           self.config.use_ring_of_experts
@@ -2903,6 +2947,8 @@ class RoutedMoE(nnx.Module):
         w0 = jax.lax.all_gather(w0, "fsdp", axis=1, tiled=True)  # [exp, embed_full, mlp]
         w1 = jax.lax.all_gather(w1, "fsdp", axis=1, tiled=True)
         wo = jax.lax.all_gather(wo, "fsdp", axis=2, tiled=True)  # [exp, mlp, embed_full]
+        w0 = _finw_pair("w0_qv_full", w0)  # (2) fwd gathered qvalue; (6/8) bwd = tgmm wgrad ct
+        wo = _finw_pair("wo_qv_full", wo)
       # (moe_fp8_boundary_qag: w0/w1 arrive boundary-gathered e4m3; same last-moment QArray plumbing.)
       # The expert weights (w0/w1/wo) are all-gathered over FSDP once at this
       # shard_map entry (implicitly, via the `embed_tensor_transpose` pspec which
@@ -3865,10 +3911,11 @@ class RoutedMoE(nnx.Module):
       # NOTE moe_fp8_cv_weight_ag_tags is DEPRECATED/ignored: the tags variant NaN'd on cluster
       # round 2 (cvwag2t) and was dominated by no-tags (5.302 vs 5.106); with the in-body gather
       # there is no pre-attention gather to tag. Do not re-enable without a fresh numerics gate.
+      w0 = _finw_pair("w0_param", w0)  # (10) bwd = the optimizer-visible grad
       sc0, sc1, sco = _cv_scale(w0), _cv_scale(w1), _cv_scale(wo)
-      w0 = qpl.QArray(qvalue=_ste_quant(w0, sc0), scale=sc0)
+      w0 = qpl.QArray(qvalue=_finw_pair("w0_qv_sharded", _ste_quant(w0, sc0)), scale=sc0)  # (1)fwd/(9)bwd
       w1 = qpl.QArray(qvalue=_ste_quant(w1, sc1), scale=sc1)
-      wo = qpl.QArray(qvalue=_ste_quant(wo, sco), scale=sco)
+      wo = qpl.QArray(qvalue=_finw_pair("wo_qv_sharded", _ste_quant(wo, sco)), scale=sco)
       return (w0, w1, wo)
     if w01_only:
       # Reverse-prefetch gather of the NEXT backward layer's w0/w1 only (no wo). The producer caller
