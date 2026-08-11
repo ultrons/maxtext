@@ -566,6 +566,39 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       target_bias.value = target_bias.value + jnp.array(moe_bias_updates[0]).transpose()
 
   lm_loss = xent_sum / (total_weights + EPS)
+
+  # MOE_FP8_SCALE_TELEMETRY=1: per-step per-channel-absmax stats for the routed MoE weights at
+  # layers {0, mid, last} -- the quantity the absmax weight calibration computes. Answers how often
+  # the dynamic weight scale actually moves (e4m3 bins are ~6-12% relative; AdamW steps ~0.1-1%),
+  # i.e. whether weight-amax can be amortized (recompute every N steps). ~27 scalar series.
+  _fp8_scale_telemetry = {}
+  if os.environ.get("MOE_FP8_SCALE_TELEMETRY", "0") == "1":
+    from jax import tree_util as _jtu
+
+    def _leaf_name(path):
+      return "/".join(str(getattr(k, "key", getattr(k, "name", k))) for k in path)
+
+    # NNX path: TrainStateNNX has no .params -- pull the Param variables off the merged model.
+    _ptree = state.params if hasattr(state, "params") else nnx.state(state.model, nnx.Param)
+    for _path, _leaf in _jtu.tree_flatten_with_path(_ptree)[0]:
+      _n = _leaf_name(_path)
+      for _w in ("wi_0", "wi_1", "wo"):
+        # scanned routed expert weights: [num_layers, exp, k, n]
+        if _n.endswith(_w) and hasattr(_leaf, "ndim") and _leaf.ndim == 4:
+          _L = _leaf.shape[0]
+          for _li, _ltag in ((0, "l0"), (_L // 2, "lmid"), (_L - 1, "llast")):
+            _amax = jnp.max(jnp.abs(_leaf[_li].astype(jnp.float32)), axis=(0, 1))  # per-N channel
+            _fp8_scale_telemetry[f"fp8_scale/{_w}_{_ltag}_mean"] = jnp.mean(_amax)
+            _fp8_scale_telemetry[f"fp8_scale/{_w}_{_ltag}_p99"] = jnp.percentile(_amax, 99)
+            _fp8_scale_telemetry[f"fp8_scale/{_w}_{_ltag}_max"] = jnp.max(_amax)
+      # one attention projection (the qwix dense path): first 'query' kernel found, 3D scanned
+      if "quer" in _n and _n.endswith("kernel") and hasattr(_leaf, "ndim") and _leaf.ndim >= 3          and "fp8_scale/attn_q_l0_mean" not in _fp8_scale_telemetry:
+        _amax = jnp.max(jnp.abs(_leaf[0].astype(jnp.float32)),
+                        axis=tuple(range(_leaf.ndim - 2)))  # per-out-channel
+        _fp8_scale_telemetry["fp8_scale/attn_q_l0_mean"] = jnp.mean(_amax)
+        _fp8_scale_telemetry["fp8_scale/attn_q_l0_p99"] = jnp.percentile(_amax, 99)
+        _fp8_scale_telemetry["fp8_scale/attn_q_l0_max"] = jnp.max(_amax)
+
   scalar_metrics = {
       "learning/loss": loss,
       "learning/lm_loss": lm_loss,
@@ -573,6 +606,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "learning/z_loss": z_loss,
       "learning/moe_lb_loss": moe_lb_loss,
       "learning/indexer_loss": indexer_loss,
+      **_fp8_scale_telemetry,
       "learning/mtp_loss": mtp_loss,
       "learning/total_weights": total_weights,
   }

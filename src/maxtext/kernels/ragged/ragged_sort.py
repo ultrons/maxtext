@@ -533,6 +533,16 @@ def ring_ragged_unsort(
           bytes_accessed_override=gather_bytes_accessed_override,
           use_single_sparsecore=use_single_sparsecore,
       )
+      # sanitize-v3 (the cv-wag real-data NaN door): the SC ragged_gather writes ONLY rows in
+      # [gather_start, gather_end) -- its validity compaction SKIPS the rest, leaving stale HBM in
+      # this cotangent buffer (the delta operand of the weight-grad tgmm, which contracts over ALL
+      # rows: stale Inf/NaN x finite = NaN weight grads; allocation-layout-dependent, hence the
+      # print-perturbable heisenbug). The PACKED mode below has always masked its tail -- this
+      # mirrors that mask for the full-buffer mode. Must run BEFORE the chunked scatter-back,
+      # which would otherwise scatter the stale rows into the full buffer.
+      _row = jnp.arange(grad_sorted_tokens.shape[0], dtype=jnp.int32)
+      _valid = (_row >= gather_start) & (_row < gather_end)
+      grad_sorted_tokens = jnp.where(_valid[:, None], grad_sorted_tokens, 0.0)
       if buffer_size > n:
         # CHUNKED-INPUT combine (decouple_combine_rs_chunks): topk_argsort_revert_indices is a
         # TOKEN-axis SLICE of the full revert permutation, so grad_sorted_tokens has only n rows
