@@ -610,7 +610,16 @@ def _bwd_prepare_inputs(
       # NOTE: rhs.scale is for the contracting dimension (N) in DLHS, but gmm_v2
       # only supports scaling the output dimension. Thus, we must scale dlhs_dout
       # beforehand.
-      dlhs_dout = _dlhs_scale_grad_by_rhs_scale(dlhs_dout, rhs, group_sizes, transpose_rhs)
+      import os as _os
+      if _os.environ.get("MOE_FP8_CV_DEBUG_CONST_DLHS_SCALE", "0") == "1":
+        # BISECT PROBE (cv-wag real-data NaN): replace the dynamic per-channel rhs-scale multiply
+        # on the dlhs cotangent with its MEAN as a constant -- isolates whether the dlhs-scale
+        # application is the data-dependent door. Env-gated (not a config flag) so the probe needs
+        # no config plumbing; debug only.
+        _const = jnp.mean(rhs.scale).astype(dlhs_dout.dtype)
+        dlhs_dout = dlhs_dout * _const
+      else:
+        dlhs_dout = _dlhs_scale_grad_by_rhs_scale(dlhs_dout, rhs, group_sizes, transpose_rhs)
       rhs = rhs.qvalue
 
   # GMM2 FWD performs lhs quantization inside kernel, lhs is stored as unquantized dtype
