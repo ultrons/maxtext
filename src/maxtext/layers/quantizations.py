@@ -792,7 +792,9 @@ def get_fp8_full_qwix_rule_w_sparsity(config: Config):
           module_path="decoder/.*layers.*",
           weight_qtype=jnp.float8_e4m3fn,
           act_qtype=jnp.float8_e4m3fn,
-          bwd_qtype=jnp.float8_e5m2,
+          # bwd_quantization_dtype: e5m2 (default) or e4m3 (NVIDIA MLPerf DSv3 uses e4m3 grads;
+          # qwix derives the clip range from finfo(qtype), so +-448 clipping comes with e4m3).
+          bwd_qtype=jnp.float8_e4m3fn if config.bwd_quantization_dtype == "e4m3" else jnp.float8_e5m2,
           weight_calibration_method=config.weight_quantization_calibration_method,
           act_calibration_method=config.act_quantization_calibration_method,
           bwd_calibration_method=config.bwd_quantization_calibration_method,

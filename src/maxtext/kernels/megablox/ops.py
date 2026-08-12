@@ -26,6 +26,7 @@ from maxtext.kernels.megablox import pallas_mosaic_tpu_v2_gmm_kernel as gmm_v2
 from maxtext.kernels.megablox import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_v2
 from maxtext.layers import quantizations
 import qwix
+from maxtext.kernels.tgmm_block import tgmm_block_fp8
 import qwix.pallas as qpl
 import tokamax
 
@@ -75,6 +76,7 @@ def gmm(
     use_manual_quantization: bool = False,  # used in batchsplit
     use_gmm_v2: bool = False,
     partial_sum: jnp.ndarray | None = None,
+    use_block_fp8_tgmm: bool = False,
 ):
   """Grouped matrix multiplication operation."""
   if interpret is None:
@@ -105,7 +107,7 @@ def gmm(
   gmm_fwd_bwd = lambda *args: _gmm_fwd(*args)[0]  # pylint: disable=C3001
   gmm_fwd_bwd = jax.custom_vjp(
       gmm_fwd_bwd,
-      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17),
   )
   gmm_fwd_bwd.defvjp(_gmm_fwd, functools.partial(_gmm_bwd, lhs.dtype, rhs.dtype))
   return gmm_fwd_bwd(
@@ -126,6 +128,7 @@ def gmm(
       rhs_vma_axes,
       use_gmm_v2,
       partial_sum,
+      use_block_fp8_tgmm,
   )
 
 
@@ -162,6 +165,7 @@ def _gmm_fwd(
     rhs_vma_axes: tuple = tuple(),
     use_gmm_v2: bool = False,
     partial_sum: jnp.ndarray | None = None,
+    use_block_fp8_tgmm: bool = False,
 ) -> tuple[
     jnp.ndarray,
     tuple[
@@ -178,15 +182,39 @@ def _gmm_fwd(
   - rhs: [g, k, n] if transpose_rhs=False. [g, n, k] if transpose_rhs=True
   """
 
+  # moe_fp8_boundary_qag: record whether the PRIMAL rhs arg was already a QArray on entry (pre-quantized
+  # e4m3 weight built at the ring gmm call site). Baseline qwix quantizes rhs INSIDE this fwd (primal
+  # arg is a plain array, residual rhs is a QArray), so the residual's QArray-ness cannot distinguish
+  # the two -- only the entry type can. The VJP cotangent structure must match the PRIMAL arg.
+  rhs_is_qarray_input = isinstance(rhs, qpl.QArray)
+
+  # moe_fp8 DYNAMIC ring weight-AG (Option A): gather the weight as its e4m3 qvalue INSIDE the gmm
+  # with a DYNAMIC per-channel scale. The weight must reach the gather as BF16 (skip the qwix weight
+  # quantize) so we can compute the global (wi) / local (wo) amax. Requires a dynamic (non-"fixed")
+  # weight calibration + a bf16 weight arg + weight_gather_axes (the ring get_wi/wo_gmm_params set it).
+  _dyn_ring_qag = (
+      use_tokamax_backend
+      and use_gmm_v2
+      and quantization_rule is not None
+      and quantization_rule.weight_qtype
+      and bool(weight_gather_axes)
+      and not rhs_is_qarray_input
+      and not str(quantization_rule.weight_calibration_method).startswith("fixed")
+  )
+
   # Quantize activation and weight
   if quantization_rule:
     # pyrefly: ignore[bad-assignment]
     lhs, rhs = _fwd_quantize_activation_and_weight(
-        lhs, rhs, quantization_rule, use_gmm_v2, use_manual_quantization, transpose_rhs
+        lhs, rhs, quantization_rule, use_gmm_v2, use_manual_quantization, transpose_rhs,
+        skip_weight=_dyn_ring_qag,
     )
 
-  # Quantization All-Gather (QAG) for weight: only supported for following conditions
-  if (
+  if _dyn_ring_qag:
+    # pyrefly: ignore[bad-assignment]
+    rhs = _fwd_gather_weight_dynamic(rhs, weight_gather_axes, quantization_rule.weight_qtype)
+  elif (
+      # Static (fixed-scale) QAG: only supported for the following conditions.
       use_tokamax_backend
       and quantization_rule
       and quantization_rule.bwd_qtype
@@ -218,7 +246,7 @@ def _gmm_fwd(
         lhs_vma_axes,
     )
 
-  return out, (lhs, rhs, group_sizes, group_offset, partial_sum)  # pyrefly: ignore[bad-return]
+  return out, (lhs, rhs, group_sizes, group_offset, partial_sum, rhs_is_qarray_input)  # pyrefly: ignore[bad-return]
 
 
 def _fwd_quantize_activation_and_weight(
@@ -228,8 +256,13 @@ def _fwd_quantize_activation_and_weight(
     use_gmm_v2: bool,
     use_manual_quantization: bool,
     transpose_rhs: bool,
+    skip_weight: bool = False,
 ) -> tuple[jnp.ndarray | qpl.QArray, jnp.ndarray | qpl.QArray]:
-  """Handles act and weight quantization for GMM forward inputs."""
+  """Handles act and weight quantization for GMM forward inputs.
+
+  `skip_weight=True` leaves the weight unquantized (BF16) so a downstream dynamic weight-AG can
+  compute its own (global/local) per-channel scale from the sharded BF16 weight.
+  """
   if quantization_rule.act_qtype and not isinstance(lhs, qpl.QArray) and not use_gmm_v2:
     lhs = qpl.quantize(  # pyrefly: ignore[bad-assignment]
         lhs,
@@ -239,7 +272,7 @@ def _fwd_quantize_activation_and_weight(
         calibration_method=quantization_rule.act_calibration_method,
     )
 
-  if quantization_rule.weight_qtype and not isinstance(rhs, qpl.QArray):
+  if quantization_rule.weight_qtype and not isinstance(rhs, qpl.QArray) and not skip_weight:
     if not use_manual_quantization:
       rhs = qpl.quantize(  # pyrefly: ignore[bad-assignment]
           rhs,
@@ -265,6 +298,42 @@ def _fwd_gather_weight(rhs: qpl.QArray, weight_gather_axes: List[Tuple[str, int]
     rhs_qvalue = jax.lax.all_gather(rhs.qvalue, axis_name, axis=axis_idx, tiled=True)
     # replace the qvalue with the gathered qvalue in the QArray
     rhs = dataclasses.replace(rhs, qvalue=rhs_qvalue)
+  return rhs
+
+
+def _fwd_gather_weight_dynamic(
+    rhs: jnp.ndarray, weight_gather_axes: List[Tuple[str, int]], weight_qtype: jax.typing.DTypeLike
+) -> qpl.QArray:
+  """Dynamic per-channel fp8 weight-AG (Option A) for the ring config.
+
+  `rhs` is the BF16 weight [exp, k, n], still SHARDED on the gather axis (no GSPMD boundary gather).
+  We compute a DYNAMIC per-output-channel (n = axis 2) scale, quantize to the e4m3 qvalue, and
+  all-gather the qvalue (half the wire bytes vs a bf16 gather). Branch on the gather-axis index:
+
+    axis 1 -- up-proj (wi): gather is the CONTRACTING dim (embed). The per-n(mlp) scale multiplies a
+      sum spanning fsdp shards, so the amax must be GLOBAL: local amax over (exp, local-embed) then
+      pmax over the gather axis. The [1,1,mlp] scale is replicated along the gather axis -> gather the
+      QVALUE ONLY.
+    axis 2 -- down-proj (wo): gather is the OUTPUT dim (embed). Each embed channel is self-contained
+      on its shard, so a LOCAL amax over (exp, mlp) is exact -- NO all-reduce. The per-embed scale is
+      sharded on the gather axis too -> gather BOTH the qvalue and the scale.
+
+  qvalue = clip(w / scale) so w ~= qvalue * scale (qwix convention). The weight enters the gmm
+  custom_vjp as BF16, so stock `_gmm_bwd` computes drhs in BF16 (weight grad never e4m3, no NaN) and
+  the [1,1,n] scale takes the shared branch of `_dlhs_scale_grad_by_rhs_scale` (no per-expert repeat).
+  """
+  e4m3_max = 448.0
+  for axis_name, axis_idx in weight_gather_axes:
+    local_amax = jax.lax.stop_gradient(jnp.max(jnp.abs(rhs), axis=(0, 1), keepdims=True))  # [1,1,n]
+    # axis 1 = contracting gather -> GLOBAL scale (pmax); axis 2 = output gather -> LOCAL scale.
+    amax = jax.lax.pmax(local_amax, axis_name) if axis_idx == 1 else local_amax
+    scale = amax.astype(jnp.float32) / e4m3_max + 1e-20  # [1,1,n], w ~= qvalue * scale
+    qv = jnp.clip(rhs / scale.astype(rhs.dtype), -e4m3_max, e4m3_max).astype(weight_qtype)
+    qv = jax.lax.all_gather(qv, axis_name, axis=axis_idx, tiled=True)
+    if axis_idx != 1:
+      # output-dim gather: the per-output-channel scale is sharded on the gather axis, gather it too.
+      scale = jax.lax.all_gather(scale, axis_name, axis=axis_idx, tiled=True)
+    rhs = qpl.QArray(qvalue=qv, scale=scale)
   return rhs
 
 
@@ -409,6 +478,7 @@ def _gmm_bwd(
     lhs_vma_axes: tuple,
     rhs_vma_axes: tuple,
     use_gmm_v2: bool,
+    use_block_fp8_tgmm: bool,
     residual: tuple[
         jnp.ndarray | qpl.QArray,
         jnp.ndarray | qpl.QArray,
@@ -420,8 +490,14 @@ def _gmm_bwd(
 ) -> tuple[jnp.ndarray, jnp.ndarray, None, None, jnp.ndarray | None, jnp.ndarray | None]:
   """Backward function for throughput GMM VJP."""
   del preferred_element_type
-  lhs, rhs, group_sizes, group_offset, partial_sum_fwd = residual
+  lhs, rhs, group_sizes, group_offset, partial_sum_fwd, rhs_is_qarray_input = residual
   num_actual_groups = rhs.shape[0]
+  # moe_fp8_boundary_qag: if the PRIMAL rhs arg was a QArray (pre-quantized e4m3 weight built at the
+  # ring gmm call site), _bwd_prepare_inputs unwraps it to rhs.qvalue below, so _compute_drhs yields a
+  # plain-array weight gradient -- but the VJP cotangent must match the QArray pytree. Capture the
+  # QArray here and re-wrap drhs at the end with a ZERO scale cotangent (forward-only fp8: the
+  # deterministic per-tensor scale carries no gradient). Baseline (rhs_is_qarray_input=False): no wrap.
+  _orig_rhs_qarray = rhs if rhs_is_qarray_input else None
 
   # Jargon used here:
   #  - lhs: input activation in forward pass, possibly quantized.
@@ -439,7 +515,12 @@ def _gmm_bwd(
 
   # 2. Backward Pass Quantization
   if quantization_rule:
-    dlhs_dout, drhs_dout = _bwd_quantize_gradient(dlhs_dout, drhs_dout, quantization_rule)
+    if use_block_fp8_tgmm:
+      # block-fp8 tgmm quantizes drhs_dout ITSELF (per-gm-segment, inside tgmm_block_fp8);
+      # keep the raw cotangent here and quantize only the dlhs side.
+      dlhs_dout, _ = _bwd_quantize_gradient(dlhs_dout, drhs_dout, quantization_rule)
+    else:
+      dlhs_dout, drhs_dout = _bwd_quantize_gradient(dlhs_dout, drhs_dout, quantization_rule)
 
   # 3. DLHS Gradient Execution
   dlhs = _compute_dlhs(
@@ -473,6 +554,7 @@ def _gmm_bwd(
       interpret,
       rhs_vma_axes,
       quantization_rule,
+      use_block_fp8_tgmm=use_block_fp8_tgmm,
   )
 
   # 5. Output Formatting
@@ -481,6 +563,19 @@ def _gmm_bwd(
   #
   # TODO(tgale, enriqueps, apaske): Fuse this transposition into the tgmm.
   drhs = drhs.swapaxes(1, 2) if transpose_rhs else drhs
+  if _orig_rhs_qarray is not None:
+    # The primal rhs entered as a QArray (moe_fp8_cv_weight_ag / moe_fp8_boundary_qag), so the VJP
+    # cotangent must match its pytree. Cast the qvalue-leaf cotangent (the weight gradient) to BF16:
+    # it is the gradient WIRE dtype -- the in-body all_gather transpose reduce-scatters it to storage
+    # sharding, and an uncast f32 drhs doubles that RS's bytes vs the baseline's bf16 weight-grad RS.
+    # NEVER cast to e4m3 (overflow -> NaN, the round-1 bug). The scale is forward-only (STE on the
+    # quant), so its cotangent is a per-channel zero.
+    drhs = qpl.QArray(
+        qvalue=drhs.astype(jnp.bfloat16),
+        scale=jnp.zeros_like(_orig_rhs_qarray.scale),
+        zero_point=None,
+        qtype=_orig_rhs_qarray.qtype,
+    )
   dpartial_sum = grad if partial_sum_fwd is not None else None
   d_existing_out = None if use_tokamax_backend else grad
 
@@ -515,7 +610,16 @@ def _bwd_prepare_inputs(
       # NOTE: rhs.scale is for the contracting dimension (N) in DLHS, but gmm_v2
       # only supports scaling the output dimension. Thus, we must scale dlhs_dout
       # beforehand.
-      dlhs_dout = _dlhs_scale_grad_by_rhs_scale(dlhs_dout, rhs, group_sizes, transpose_rhs)
+      import os as _os
+      if _os.environ.get("MOE_FP8_CV_DEBUG_CONST_DLHS_SCALE", "0") == "1":
+        # BISECT PROBE (cv-wag real-data NaN): replace the dynamic per-channel rhs-scale multiply
+        # on the dlhs cotangent with its MEAN as a constant -- isolates whether the dlhs-scale
+        # application is the data-dependent door. Env-gated (not a config flag) so the probe needs
+        # no config plumbing; debug only.
+        _const = jnp.mean(rhs.scale).astype(dlhs_dout.dtype)
+        dlhs_dout = dlhs_dout * _const
+      else:
+        dlhs_dout = _dlhs_scale_grad_by_rhs_scale(dlhs_dout, rhs, group_sizes, transpose_rhs)
       rhs = rhs.qvalue
 
   # GMM2 FWD performs lhs quantization inside kernel, lhs is stored as unquantized dtype
@@ -738,8 +842,20 @@ def _compute_drhs(
     interpret: bool,
     rhs_vma_axes: tuple,
     quantization_rule: qwix.QtRule | None,
+    use_block_fp8_tgmm: bool = False,
 ) -> jnp.ndarray:
   """Routes execution of DRHS based on backend choices."""
+  if use_block_fp8_tgmm and use_tokamax_backend and use_gmm_v2 and not isinstance(lhs, qpl.QArray):
+    # NVIDIA-analog block-scaled fp8 wgrad: BOTH operands e4m3 with per-gm-segment dynamic
+    # scales, quantized inside the kernel entry from the RAW lhs (x_sorted) and RAW cotangent.
+    return tgmm_block_fp8(
+        lhs,
+        drhs_dout,
+        group_sizes,
+        num_actual_groups,
+        group_offset=group_offset,
+        preferred_element_type=rhs_dtype,
+    )
   if use_tokamax_backend and not use_gmm_v2:
     drhs = _drhs_run_tokamax_v1(drhs_dout, lhs, group_sizes, rhs_dtype, use_manual_quantization)
   elif use_tokamax_backend and use_gmm_v2:

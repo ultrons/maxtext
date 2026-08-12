@@ -1,0 +1,15 @@
+# qk_diag_skip test image. Identical to Dockerfile.baseline (same xlayer-hierrs-nl base
+# + this worktree's src/maxtext overlay) PLUS one extra layer: overlay the patched
+# tokamax splash_attention_kernel.py that adds SplashConfig.qk_diag_skip/qk_diag_grid
+# (skips fully-masked causal-diagonal QK sub-tiles in the fused dkv backward; bit-exact).
+#
+# A/B control: build Dockerfile.baseline (unpatched tokamax) for the flag-off control.
+# With qk_diag_skip=false this image is HLO-identical to the baseline (kernel routes its
+# original QK matmul via the else-branch; attention_op guards the kwargs on field presence).
+FROM gcr.io/cloud-tpu-multipod-dev/integrate_v2:xlayer-hierrs-nl
+RUN rm -rf /deps/src/maxtext
+COPY src/maxtext/ /deps/src/maxtext/
+# In-image tokamax path (from: python3 -c "import tokamax._src.ops.experimental.tpu.
+# splash_attention.splash_attention_kernel as k; print(k.__file__)"):
+COPY docker/tokamax_splash_attention_kernel.py \
+     /usr/local/lib/python3.12/site-packages/tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_kernel.py

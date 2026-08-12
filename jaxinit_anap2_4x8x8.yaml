@@ -1,0 +1,78 @@
+# PROBE: jax.distributed.initialize on auto-nap2 (classic NAP, CONTIGUOUS placement) at 4x8x8.
+# Discriminates superslice failure: contiguous INIT_OK => superslice was scatter; same TearDownMesh => ghostfish HW.
+# Classic method (topology label + placement policy + reservation), NO TAS composition annotations.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: siv-probe-4x8x8
+  namespace: default
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          kueue.x-k8s.io/queue-name: multislice-queue
+      spec:
+        parallelism: 64
+        completions: 64
+        backoffLimit: 0
+        completionMode: Indexed
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: 4x8x8
+          spec:
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 4x8x8
+              cloud.google.com/placement-policy-name: bodaborg-tpu7x-256-placement-policy
+              cloud.google.com/reservation-name: ghostfish-y6kzjgh4shlno
+            tolerations:
+            - { key: google.com/tpu, operator: Equal, value: present, effect: NoSchedule }
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/integrate_v2:1410-upstream-ac9498b64
+              imagePullPolicy: IfNotPresent
+              command: ["bash","-c"]
+              args:
+              - |
+                set -u
+                IFS=',' read -ra HOSTS <<< "$TPU_WORKER_HOSTNAMES"
+                N=${#HOSTS[@]}
+                echo "WID=$TPU_WORKER_ID NODE=$NODE_NAME TOPO=$TPU_TOPOLOGY barrier waiting $N peers..."
+                stable=0
+                for a in $(seq 1 200); do
+                  ok=1; for h in "${HOSTS[@]}"; do getent hosts "$h" >/dev/null 2>&1 || { ok=0; break; }; done
+                  if [ $ok -eq 1 ]; then stable=$((stable+1)); else stable=0; fi
+                  [ $stable -ge 2 ] && { echo "WID=$TPU_WORKER_ID DNS stable at $a"; break; }
+                  sleep 2
+                done
+                echo "WID=$TPU_WORKER_ID settling 120s..."; sleep 120
+                python3 -c '
+                import time,os
+                t0=time.time(); import jax
+                wid=os.environ.get("TPU_WORKER_ID"); node=os.environ.get("NODE_NAME")
+                print("WID",wid,"NODE",node,"calling initialize...",flush=True)
+                jax.distributed.initialize(initialization_timeout=900)
+                print("WID",wid,"NODE",node,"RESULT_INIT_OK dt=%.1f"%(time.time()-t0),"global=",jax.device_count(),flush=True)
+                import jax.numpy as jnp
+                s=float(jnp.sum(jax.pmap(lambda a: jax.lax.psum(a,"i"),axis_name="i")(jnp.ones(jax.local_device_count()))))
+                print("WID",wid,"RESULT_COLLECTIVE_OK psum=",s,flush=True)
+                '
+                echo "PYEXIT=$? WID=$TPU_WORKER_ID NODE=$NODE_NAME"
+                sleep 180
+              env:
+              - { name: PYTHONUNBUFFERED, value: "1" }
+              - name: NODE_NAME
+                valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+              resources:
+                limits: { google.com/tpu: "4" }
+                requests: { google.com/tpu: "4" }
