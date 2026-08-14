@@ -1222,3 +1222,42 @@ methodological miss, because the miss is the reusable part.
   the rbf=2 record is 0.63s: TC-bound at 3.94s ceiling, VPU now 1.65s (was 2.18s), relayout 138ms,
   SC 936ms exposed.
 - The two flags are now effectively one; keep them separate only until a real-data curve confirms.
+
+### moe_bwd_share_cotangent VERDICT [2026-08-14] — real but 6x smaller at the step than at the op
+- **Change (commit c59a59fcb):** the dlhs gmm and the drhs tgmm read ONE cotangent array instead of
+  two. drhs[g,k,n] = sum_m lhs[m,k]*grad[m,n] and s is constant within a group, so feeding the
+  already-scaled grad*s scales the result by exactly s; divide it back out on the SMALL [g,k,n]
+  weight gradient. Identity verified exact in numpy (max|err| 5e-15) for shared [1,n] and
+  per-expert [g,n] scale layouts BEFORE spending a cluster slot.
+- **MEASURED (siv-cn-ikqs2, rbf=-1): 4.811s / 1703 TPS-chip, loss 8.784** (vs siv-cn-ikqd2 4.884 on
+  identical flags without sharing). **Step −0.073s.**
+- **The op-level prize landed as projected; the step win did not.** Projected ~390ms of self-time
+  from removing 3.76 GB of the fusion's 11.3 GB. MEASURED: the buffer-shaped
+  `broadcast_multiply_fusion.90` (1174ms) is GONE -- replaced by `select_multiply_fusion.3` at
+  735ms, i.e. **−439ms self-time, projection accurate**. VPU lane 1.65s -> 1.52s (−130ms). But only
+  **73ms reached the step**: ~83% of that traffic was already overlapped.
+- **The reusable number: on this stack, VPU self-time converts to step time at roughly 1:6 for
+  already-overlapped ops.** Do not price a VPU-op removal at its self-time. (Contrast: the original
+  in-kernel-quant win moved −522ms VPU and delivered −592ms step, ~1:1, because it also removed the
+  sanitizer's serialized write and the amax off the critical path.)
+- **Lane state after (siv-cn-ikqs2):** step 4.81s, TC-bound 3.82s ceiling (compute 2.15s + vpu 1.52s
+  + relayout 153ms), SC 2.96s with 985ms exposed, 1.26x headroom. Non-matmul TC work now 35% of the
+  step (was 45% at the dense rbf=-1 baseline).
+
+**rbf=-1 LADDER, final:**
+
+| arm | config | s/step | TPS/chip |
+|---|---|---|---|
+| siv-cn-rbfoff2 | dense quant + sanitizer (required) | 5.474 | 1497 |
+| siv-cn-ikqd1 | in-kernel drhs only | 5.129 | 1597 |
+| siv-cn-ikqd2 | in-kernel both, f32 acc | 4.884 | 1677 |
+| **siv-cn-ikqs2** | **+ shared cotangent (SHIP)** | **4.811** | **1703** |
+
+- **Total rbf=-1 improvement: 5.474 -> 4.811 = −0.66s / +14% TPS, and the sanitizer is no longer
+  needed.** Gap to the rbf=2 record (4.251) is now 0.56s, down from 1.22s.
+- Next candidates, in order of measured size: `select_multiply_fusion.3` 735ms (the remaining
+  masked-scale pass), the 985ms exposed SC, relayout 153ms. All three are smaller than they look
+  per the 1:6 rule above -- price them by A/B, not by self-time.
+- Infra: 3rd gang-formation init hang of the day (siv-cn-ikqs1, 17min in xla_bridge init, no compile
+  start). Babysitter now watches for compile-start markers so a real stall trips at 14min while a
+  healthy 10-15min compile is left alone.
