@@ -528,6 +528,25 @@ def _gmm_bwd(
       and bool(quantization_rule.bwd_qtype)
   )
 
+  # moe_bwd_share_cotangent: when the dlhs cotangent stays BF16 (both in-kernel flags on), the drhs
+  # tgmm can consume that SAME already-scaled array instead of a second raw BF16 copy of the
+  # cotangent. Measured motivation (siv-cn-ikqd2 profile): materializing both variants makes
+  # broadcast_multiply_fusion.90 emit FOUR bf16[131072,7168] buffers -- 11.3 GB/invocation, the
+  # step's #1 op at 1174ms and HBM-bound. Sharing drops it to two.
+  #   drhs[g,k,n] = sum_m lhs[m,k] * grad[m,n];  feeding grad[m,n]*s[.,n] scales the result by
+  #   exactly s[.,n] (s is constant within a group), so dividing the SMALL [g,k,n] weight gradient
+  #   by s recovers drhs. Skipped when weight_gather_axes is set: _drhs_scatter_weight may shard the
+  #   n dim, which would misalign the scale vector.
+  _share_scale = None
+  if (
+      inkernel_drhs
+      and bwd_inkernel_quant_dlhs
+      and use_gmm_v2
+      and isinstance(rhs, qpl.QArray)
+      and not weight_gather_axes
+  ):
+    _share_scale = _squeeze_rhs_scale_2d(rhs.scale, transpose_rhs)  # [1, n] or [g, n]
+
   # 1. Scale Application & QArray Unwrapping
   dlhs_dout, drhs_dout, lhs, rhs = _bwd_prepare_inputs(
       grad, lhs, rhs, group_sizes, use_gmm_v2, transpose_rhs, quantization_rule,
@@ -559,6 +578,11 @@ def _gmm_bwd(
       # block-fp8 tgmm / in-kernel tgmm quantize drhs_dout THEMSELVES (per-gm-segment inside
       # tgmm_block_fp8, per-gm-tile inside tgmm_v2); keep the raw cotangent for the drhs side.
       dlhs_dout, _ = _bwd_quantize_gradient(dlhs_dout, drhs_dout, quantization_rule, skip_dlhs=skip_dlhs_quant)
+      if _share_scale is not None and not isinstance(dlhs_dout, qpl.QArray):
+        # Share the one scaled BF16 cotangent with the tgmm; unscale its output below.
+        drhs_dout = dlhs_dout
+      else:
+        _share_scale = None
     else:
       dlhs_dout, drhs_dout = _bwd_quantize_gradient(
           dlhs_dout, drhs_dout, quantization_rule, skip_dlhs=skip_dlhs_quant
@@ -599,6 +623,15 @@ def _gmm_bwd(
       use_block_fp8_tgmm=use_block_fp8_tgmm,
       inkernel_quant=inkernel_drhs,
   )
+
+  if _share_scale is not None:
+    # The tgmm consumed the cotangent already multiplied by the per-output-channel weight scale, so
+    # its result carries that same factor (s is constant within a group). Divide it back out here,
+    # on the SMALL [g, k, n] weight gradient rather than on the full ragged cotangent buffer.
+    # f32 for the divide: drhs is bf16 and s can be small enough that a bf16 reciprocal loses bits.
+    _s = _share_scale.astype(jnp.float32)
+    _s = jnp.where(_s == 0, 1.0, _s)  # a zero scale means a zero numerator; leave it untouched
+    drhs = (drhs.astype(jnp.float32) / _s[:, None, :]).astype(drhs.dtype)
 
   # 5. Output Formatting
   # NOTE: If the rhs transposition is fused into the forward pass we need to
@@ -782,6 +815,15 @@ def _dlhs_run_tokamax_v1(
   )
 
 
+def _squeeze_rhs_scale_2d(rhs_scale: jnp.ndarray, transpose_rhs: bool = False) -> jnp.ndarray:
+  """Squeezes a [g, 1, n] / [1, 1, n] rhs scale to 2D [g, n] / [1, n]."""
+  if rhs_scale.ndim == 3:
+    squeeze_axis = 2 if transpose_rhs else 1
+    if rhs_scale.shape[squeeze_axis] == 1:
+      rhs_scale = rhs_scale.squeeze(axis=squeeze_axis)
+  return rhs_scale
+
+
 def _dlhs_scale_grad_by_rhs_scale(
     grad: jnp.ndarray,
     rhs: qpl.QArray,
@@ -792,13 +834,8 @@ def _dlhs_scale_grad_by_rhs_scale(
 
   Scaling is applied before the V2 GMM DLHS kernel.
   """
-  rhs_scale = rhs.scale
-
   # 1. Squeeze the scale to 2D [g, n] based on transpose_rhs
-  if rhs_scale.ndim == 3:
-    squeeze_axis = 2 if transpose_rhs else 1
-    if rhs_scale.shape[squeeze_axis] == 1:
-      rhs_scale = rhs_scale.squeeze(axis=squeeze_axis)
+  rhs_scale = _squeeze_rhs_scale_2d(rhs.scale, transpose_rhs)
 
   # 2. Apply scale (handle shared vs per-expert scales)
   if rhs_scale.shape[0] == 1:
