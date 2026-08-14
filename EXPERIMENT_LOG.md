@@ -1261,3 +1261,48 @@ methodological miss, because the miss is the reusable part.
 - Infra: 3rd gang-formation init hang of the day (siv-cn-ikqs1, 17min in xla_bridge init, no compile
   start). Babysitter now watches for compile-start markers so a real stall trips at 14min while a
   healthy 10-15min compile is left alone.
+
+### Weight-grad RS bench VERDICT [2026-08-14] — at speed; HIDING is the only lever worth having
+Isolated bench of reduce-scatter.31 at the production mesh + shape (`rs_bench_prod.py`,
+`xpk_rs_bench.sh`, run siv-cn-rsb4, trace gs://sivaibhav-exp/1410-a2a/rsbench-prof).
+
+- **SUBMESH (measured, from device coords):** `fsdp=128` occupies `[x=1, y=8, z=8, core=2]` -- two
+  full torus dims plus the on-chip core pair, **3 physical dims**. `ep=8` takes `x`. Printed from the
+  mesh device coordinates, not inferred from a bandwidth that divides nicely. Mesh built to match
+  production exactly: dims (1,128,1,8), axis order data/fsdp/fsdp_transpose/expert,
+  allow_split_physical_axes=FALSE (the ep-as-dp rule).
+- **DEVICE time, apples-to-apples (both from xla_shell on a trace):**
+
+  | | total | firings | per firing | BW (bytes_acc 946.9 MB) |
+  |---|---|---|---|---|
+  | isolated (nothing else on device) | 278.52 ms | 80 | **3.481 ms** | **272 GB/s** |
+  | in-model (siv-cn-ikqs2) | 980.30 ms | 232 | **4.225 ms** | **224 GB/s** |
+
+- **VERDICT: the collective is at speed.** In-model runs only **1.21x** slower than fully isolated,
+  and isolated hits 272 GB/s = **73% of the 373 GB/s two-dim bidirectional ceiling** (4 x 93.3 GB/s),
+  well above the 187 GB/s single-axis ceiling in perf-drills. It is EXPOSED, not slow.
+- **Prize sizing (per step, 4.81s step):**
+  - hide it entirely: **~226 ms** (its full exposed stall)
+  - perfect kernel (272 -> 373 GB/s): ~50 ms
+  - remove all contention (224 -> 272 GB/s): ~40 ms
+  So **hiding is ~4.5x the next-best lever**, and replacing it with the perf-drills concurrent
+  multi-axis RS kernel is NOT worth it -- that kernel targets the single-axis 187 ceiling we are
+  already past.
+- **=> The manual-backward + scheduling-group route is the right target for this op.** Not a kernel
+  rewrite.
+
+**TWO INSTRUMENT ERRORS THIS SESSION, both mine, both the same shape:**
+1. Quoted `list_collectives`' "21.8 GB/s" for this RS and built a contention story on it. Its byte
+   model uses 147 MB -- neither input, output, nor their sum. The user caught it with arithmetic:
+   bytes_accessed (in+out) = 946.9 MB / 3.374 ms = ~280 GB/s. **Never quote a tool's BW without
+   checking what byte count it divided by.**
+2. First bench reported WALL time (8.3 ms) and I nearly compared it to the profiler's DEVICE time.
+   Wrong instrument for the question. Fixed by tracing and reading the span with the same tool that
+   produced the in-model number.
+Also: `list_collectives`' derived "Time/iter" (3.372 ms) disagrees with total/count (4.225 ms) for
+the same op -- **use total/count, not the derived column.**
+
+**Infra lesson:** `JobCreationFailed` (GKE Warden, missing TPU topology labels) is TRANSIENT while the
+slice composes -- every successful run today emitted it on the way up. The real health signal is the
+`slices.accelerator.gke.io` STATE (ACTIVATING -> ACTIVE). Bailing on the warning killed a healthy job
+(rsb3, possibly ikqrbf2). Babysitters must watch the slice object, not the warning.
