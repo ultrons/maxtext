@@ -390,6 +390,28 @@ _RING_CT_AG_COLLECTIVE_ID = 55  # moe_ring_cotangent_ag: backward combine-cotang
 _RING_RS_COLLECTIVE_ID = 56  # moe_ring_combine_rs: FORWARD combine RING reduce-scatter
 
 
+def _gmm_qwix_rule(config):
+  """The qwix "gmm" rule, valid INSIDE or OUTSIDE qwix's interception context.
+
+  `qpl.get_current_rule` is a stub that returns None unless qwix's provider has monkeypatched it,
+  which it only does while intercepting the model call. The moe_handwritten_bwd path RECOMPUTES the
+  forward from inside a custom_vjp backward, where that context is gone -- so the gmm raised
+  "Expect a QtRule for quantized training. But get quantization_rule=None". Rebuild the identical
+  rule from config in that case (same builder qwix itself was handed), and pass it to
+  `mblx.gmm(qwix_rule=...)`, the explicit-rule path already used by batchsplit.
+  """
+  rule = qpl.get_current_rule("gmm")
+  if rule is not None:
+    return rule
+  if not (getattr(config, "use_qwix_quantization", False) and getattr(config, "quantization", "")):
+    return None
+  rules = quantizations.get_quantization_rule(config) or []
+  for r in rules:
+    if "gmm" in (getattr(r, "op_names", None) or ()):
+      return r
+  return None
+
+
 def _scheduling_group(group_id):
   """Tag enclosed ops with an XLA `_scheduling_group_id`.
 
@@ -2047,6 +2069,9 @@ class RoutedMoE(nnx.Module):
             lhs_quantize_dtype=lhs_quantize_dtype,
             rhs_quantize_dtype=rhs_quantize_dtype,
             use_qwix_quantization=bool(self.config.quantization) and self.config.use_qwix_quantization,
+            # Explicit rule: the moe_handwritten_bwd recompute runs outside qwix's interception
+            # context, where get_current_rule() is a stub returning None.
+            qwix_rule=_gmm_qwix_rule(self.config),
             use_tokamax_backend=self.config.use_tokamax_gmm,
             weight_gather_axes=weight_gather_axes,
             lhs_vma_axes=lhs_vma_axes,
@@ -2079,7 +2104,7 @@ class RoutedMoE(nnx.Module):
       # fixed (static) weight scale so only the qvalue rides the wire.
       _ring = getattr(self.config, "moe_fp8_ring_weight_ag", False)
       if shard_exp_on_fsdp or _ring:
-        quantization_rule = qpl.get_current_rule("gmm")
+        quantization_rule = _gmm_qwix_rule(self.config)
         # Ring path (Option A) supports a DYNAMIC per-channel weight-AG -> allow any calibration.
         # shard_exp_on_fsdp still requires the fixed (static) scale of the stock QAG.
         if quantization_rule and (_ring or quantization_rule.weight_calibration_method.startswith("fixed")):
@@ -2130,7 +2155,7 @@ class RoutedMoE(nnx.Module):
       # w0, w1, wo needs to be un sharded on fsdp / fsdp_transpose axis, so use
       # mlp_no_fsdp axis
       if self.config.shard_exp_on_fsdp:
-        quantization_rule = qpl.get_current_rule("gmm")
+        quantization_rule = _gmm_qwix_rule(self.config)
         if quantization_rule and quantization_rule.weight_calibration_method.startswith("fixed"):
           # special sharding when using static scaling for weights in quantization with shard_exp_on_fsdp
           w0_pspec = self._logical_to_mesh_axes(self.wi_kernel_axes)
