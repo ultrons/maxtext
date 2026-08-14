@@ -1185,3 +1185,40 @@ unchunked GMMs, chunk 4–8 both pipelines. Profiles → xprof :9010 compare dro
   `tpu-accelerator-topology-constraints` while ss-kueue-operator sat at `1 CREATED`), one hit the
   gang-formation init hang ending in the `TearDownMesh` HAL abort (dies in make_tpu_client, pre-compile).
   Both cured by delete+relaunch. Babysitters now carry a stalled-init detector (18min, 0 steps -> bail).
+
+### CORRECTION to the entry above [2026-08-14] — the dlhs half is NEEDED; my profile inference was wrong
+Two follow-up arms overturned the mechanism I wrote above. Recording both the correction and the
+methodological miss, because the miss is the reusable part.
+
+- **What I claimed:** from op-family accounting in the ikqrbf3 profile I concluded the dlhs half was
+  net-negative by ~678ms. The observation was real: `_dlhs_scale_grad_by_rhs_scale`'s multiply had been
+  FUSED INTO the XLA quantize (fused form writes fp8, 1 B/elem); dropping the quantize makes it
+  materialize bf16 (2 B/elem) and the kernel re-reads 2x. Op pair went 1128ms -> 1806ms, MEASURED.
+- **What the controlled A/B says (siv-cn-ikqd1, drhs-half only, rbf=-1): 5.129s** -- WORSE than both
+  halves (4.882) and barely better than dense (5.474). **The dlhs half is worth -0.247s, not +0.678s.**
+- **The miss:** I compared op-family self-times ACROSS two arms and read a causal delta out of it. Self
+  time is not step time -- the +678ms of un-fused bf16 multiply is largely absorbed by overlap, while
+  what the dlhs quantize removal actually buys (its own amax + a serialized VPU pass on the critical
+  path) is not visible in a self-time table. **Op accounting proposes; only a same-image A/B with the
+  single flag flipped disposes.** This is the CLAUDE.md "a measured win validates the change, not the
+  mechanism" rule, hit from the other direction: a measured op delta did not validate a mechanism.
+- **acc_dtype confound, resolved.** gmm_v2 defaults acc_dtype to bf16 whenever it quantizes the lhs
+  in-kernel, so ikqrbf3's 4.882 ran the dlhs GRADIENT accumulator in bf16. Pinned to f32
+  (commit a5415ab9f) and re-ran: **siv-cn-ikqd2 = 4.884s** -- identical within noise. The win is NOT
+  an accumulator downgrade; keep the f32 pin (same speed, safe numerics). Caught by advisor review,
+  not by any gate I had -- 20 synthetic steps cannot see an accumulator change.
+
+**FINAL rbf=-1 ladder (all loss 8.783-8.784):**
+
+| arm | config | s/step | TPS/chip |
+|---|---|---|---|
+| siv-cn-rbfoff2 | dense quant + sanitizer (required) | 5.474 | 1497 |
+| siv-cn-ikqd1 | in-kernel drhs only | 5.129 | 1597 |
+| siv-cn-ikqrbf3 | in-kernel both, bf16 acc | 4.882 | 1678 |
+| **siv-cn-ikqd2** | **in-kernel both, f32 acc pin (KEEP)** | **4.884** | **1677** |
+
+- **Ship state:** `moe_bwd_inkernel_quant=true moe_bwd_inkernel_quant_dlhs=true` at rbf=-1 = 4.884s,
+  **-0.59s / +12% TPS vs dense, sanitizer not needed**. At rbf=2 still skip (+0.05s). Residual gap to
+  the rbf=2 record is 0.63s: TC-bound at 3.94s ceiling, VPU now 1.65s (was 2.18s), relayout 138ms,
+  SC 936ms exposed.
+- The two flags are now effectively one; keep them separate only until a real-data curve confirms.
