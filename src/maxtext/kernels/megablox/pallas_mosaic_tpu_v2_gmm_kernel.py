@@ -1116,16 +1116,29 @@ def make_gmm_configs(
   )
 
   lhs_q_dtype = None
-  if maybe_quantize_lhs and rhs_cfgs.should_dequantize_after_matmul:
+  # moe_bwd_inkernel_quant: in-kernel lhs quantization normally requires a SCALED quantized rhs
+  # (rhs_scale present). Also allow it when the rhs is an UNSCALED fp8 qvalue -- the backward dlhs
+  # gmm passes the weight's e4m3 qvalue with its per-contraction-channel scale pre-applied to the
+  # cotangent, so no rhs_scale operand exists to trigger the quantized path. Never quantize a lhs
+  # that is already 8-bit (a pre-quantized operand must not be re-quantized).
+  lhs_is_wide = jax.dtypes.itemsize_bits(jnp.dtype(lhs.dtype)) > 8
+  rhs_unscaled_fp8 = (
+      not has_scale
+      and jnp.issubdtype(jnp.dtype(rhs.dtype), jnp.floating)
+      and jax.dtypes.itemsize_bits(jnp.dtype(rhs.dtype)) == 8
+  )
+  if maybe_quantize_lhs and lhs_is_wide and (rhs_cfgs.should_dequantize_after_matmul or rhs_unscaled_fp8):
     # Choose lhs quantization dtype based on TPU hardware support.
-    is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)  # pyrefly: ignore[bad-argument-type]
+    # (rhs.dtype == rhs_quant_dtype whenever has_scale; on the unscaled-fp8 path rhs_quant_dtype
+    # is None, so key off rhs.dtype directly.)
+    is_rhs_float = jnp.issubdtype(jnp.dtype(rhs.dtype), jnp.floating)
     tpu_info = pltpu.get_tpu_info()
     # Check if there is hardware compute support for rhs dtype group.
     if tpu_info.fp8_ops_per_second > 0:
       # Special handling for 4-bit integer rhs as it can be converted to fp8
       # without a numeric issues. Note that this is not the case for 4-bit
       # floating rhs as conversion to int8 will cause numeric issues.
-      is_rhs_4bits = jax.dtypes.itemsize_bits(rhs_quant_dtype) == 4  # pyrefly: ignore[bad-argument-type]
+      is_rhs_4bits = jax.dtypes.itemsize_bits(jnp.dtype(rhs.dtype)) == 4
       if is_rhs_float or is_rhs_4bits:
         lhs_q_dtype = jnp.float8_e4m3fn.dtype
     if tpu_info.int8_ops_per_second > 0:

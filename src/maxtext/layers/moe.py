@@ -2053,6 +2053,7 @@ class RoutedMoE(nnx.Module):
             rhs_vma_axes=rhs_vma_axes,
             use_gmm_v2=self.config.use_gmm_v2,
             use_block_fp8_tgmm=getattr(self.config, "use_block_fp8_tgmm", False),
+            bwd_inkernel_quant=getattr(self.config, "moe_bwd_inkernel_quant", False),
             interpret=megablox_interpret,
         )
       else:

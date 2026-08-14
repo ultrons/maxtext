@@ -1060,6 +1060,21 @@ class MoEGeneral(BaseModel):
           "kernel quantizes per segment itself). Requires use_tokamax_gmm + use_gmm_v2."
       ),
   )
+  moe_bwd_inkernel_quant: bool = Field(
+      False,
+      description=(
+          "Quantize the MoE backward-gmm operands INSIDE the ragged kernels instead of with dense "
+          "XLA-level qpl.quantize ops. The dense quantize/amax ops process every row of the ragged "
+          "buffer at its STATIC size (worst-case at ragged_buffer_factor=-1); the in-kernel path "
+          "touches only the valid group_sizes rows/tiles. dlhs: the cotangent is quantized "
+          "in-kernel by gmm_v2 (per-row per-512-block e4m3). drhs: tgmm_v2 quantizes BOTH "
+          "operands in-kernel (per-gm-tile-per-channel e4m3), subsuming the per-row x_sorted "
+          "re-quantize, the drhs_dout*=lhs.scale multiply, and the per-N cotangent quantize. "
+          "Always e4m3 regardless of bwd_quantization_dtype, with finer scale granularity than "
+          "the XLA path. Requires use_tokamax_gmm + use_gmm_v2 + fp8 qwix training (and an fp8 "
+          "weight qvalue for the dlhs side); falls back to the XLA quantize otherwise."
+      ),
+  )
   moe_sanitize_ragged_buffer: bool = Field(
       False,
       description=(
