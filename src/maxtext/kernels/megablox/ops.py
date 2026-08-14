@@ -78,6 +78,7 @@ def gmm(
     partial_sum: jnp.ndarray | None = None,
     use_block_fp8_tgmm: bool = False,
     bwd_inkernel_quant: bool = False,
+    bwd_inkernel_quant_dlhs: bool = False,
 ):
   """Grouped matrix multiplication operation."""
   if interpret is None:
@@ -108,7 +109,7 @@ def gmm(
   gmm_fwd_bwd = lambda *args: _gmm_fwd(*args)[0]  # pylint: disable=C3001
   gmm_fwd_bwd = jax.custom_vjp(
       gmm_fwd_bwd,
-      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18),
+      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19),
   )
   gmm_fwd_bwd.defvjp(_gmm_fwd, functools.partial(_gmm_bwd, lhs.dtype, rhs.dtype))
   return gmm_fwd_bwd(
@@ -131,6 +132,7 @@ def gmm(
       partial_sum,
       use_block_fp8_tgmm,
       bwd_inkernel_quant,
+      bwd_inkernel_quant_dlhs,
   )
 
 
@@ -169,6 +171,7 @@ def _gmm_fwd(
     partial_sum: jnp.ndarray | None = None,
     use_block_fp8_tgmm: bool = False,
     bwd_inkernel_quant: bool = False,
+    bwd_inkernel_quant_dlhs: bool = False,
 ) -> tuple[
     jnp.ndarray,
     tuple[
@@ -483,6 +486,7 @@ def _gmm_bwd(
     use_gmm_v2: bool,
     use_block_fp8_tgmm: bool,
     bwd_inkernel_quant: bool,
+    bwd_inkernel_quant_dlhs: bool,
     residual: tuple[
         jnp.ndarray | qpl.QArray,
         jnp.ndarray | qpl.QArray,
@@ -538,8 +542,13 @@ def _gmm_bwd(
     # touches every buffer row (rbf-inflated ones included); the in-kernel path touches only valid
     # tiles. Requires the weight qvalue to actually BE fp8 -- otherwise the kernel would silently
     # run an unquantized bf16 matmul, so fall back to the XLA quantize in that case.
+    # MEASURED net-negative (siv-cn-ikqrbf3 profile): the dlhs cotangent's rhs-scale multiply
+    # (_dlhs_scale_grad_by_rhs_scale) is FUSED INTO this quantize, so dropping the quantize does
+    # not remove work -- it makes the multiply materialize bf16 (2 B/elem, +678ms at rbf=-1)
+    # where the fused form wrote fp8 (1 B/elem), and the kernel then re-reads 2x the bytes.
+    # Opt-in only, for A/B; the drhs half below is the one that pays.
     skip_dlhs_quant = (
-        bwd_inkernel_quant
+        bwd_inkernel_quant_dlhs
         and use_tokamax_backend
         and use_gmm_v2
         and not isinstance(rhs, qpl.QArray)
@@ -829,6 +838,10 @@ def _dlhs_run_tokamax_v2(
       tile_info=custom_dlhs_tiling,
       preferred_element_type=lhs_dtype,  # pyrefly: ignore[bad-argument-type]
       group_offset=group_offset,
+      # Pin the accumulator. gmm_v2 defaults acc_dtype to bf16 whenever it quantizes the lhs
+      # in-kernel; the gradient accumulator must stay f32 (which is what every pre-existing dlhs
+      # path already got, since a pre-quantized fp8 lhs leaves quant_dtype unset).
+      acc_dtype=jnp.float32.dtype,
   )
 
   if isinstance(dlhs_dout, qpl.QArray):

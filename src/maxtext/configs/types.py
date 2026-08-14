@@ -1075,6 +1075,17 @@ class MoEGeneral(BaseModel):
           "weight qvalue for the dlhs side); falls back to the XLA quantize otherwise."
       ),
   )
+  moe_bwd_inkernel_quant_dlhs: bool = Field(
+      False,
+      description=(
+          "Additionally skip the dense XLA quantize of the DLHS cotangent (needs "
+          "moe_bwd_inkernel_quant). MEASURED NET-NEGATIVE and off by default: the cotangent's "
+          "rhs-scale multiply (_dlhs_scale_grad_by_rhs_scale) is FUSED INTO that quantize, so "
+          "removing the quantize does not remove work -- the multiply materializes bf16 "
+          "(2 B/elem, +678ms at ragged_buffer_factor=-1, profile siv-cn-ikqrbf3) where the fused "
+          "form wrote fp8 (1 B/elem), and the kernel then re-reads twice the bytes. Kept for A/B."
+      ),
+  )
   moe_sanitize_ragged_buffer: bool = Field(
       False,
       description=(

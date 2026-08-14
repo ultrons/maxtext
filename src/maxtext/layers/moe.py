@@ -2054,6 +2054,7 @@ class RoutedMoE(nnx.Module):
             use_gmm_v2=self.config.use_gmm_v2,
             use_block_fp8_tgmm=getattr(self.config, "use_block_fp8_tgmm", False),
             bwd_inkernel_quant=getattr(self.config, "moe_bwd_inkernel_quant", False),
+            bwd_inkernel_quant_dlhs=getattr(self.config, "moe_bwd_inkernel_quant_dlhs", False),
             interpret=megablox_interpret,
         )
       else:
