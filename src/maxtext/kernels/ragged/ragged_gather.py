@@ -30,6 +30,7 @@ def main_kernel(
     in_hbm_ref: jax.Ref,
     indices_hbm_ref: jax.Ref,
     weights_hbm_ref: jax.Ref,
+    col_scale_hbm_ref: jax.Ref,
     # Outputs.
     out_hbm_ref: jax.Ref,
     # Scratch.
@@ -38,11 +39,13 @@ def main_kernel(
     out_vmem_ref: jax.Ref,
     indices_vmem_ref: jax.Ref,
     weights_vmem_ref: jax.Ref,
+    col_scale_vmem_ref: jax.Ref,
     sem_ref: jax.Ref,
     *,
     core_axis_name: str,
     subcore_axis_name: str,
     has_weights: bool,
+    has_col_scale: bool,
 ):
   """Core ragged gather operation with per-row weighting."""
   tpu_info = pltpu.get_tpu_info()
@@ -105,6 +108,14 @@ def main_kernel(
             weights_hbm_ref.at[pl.ds(row_tile_start, num_simd_lanes)],
             weights_vmem_ref,
         )
+
+    if has_col_scale:
+      # Per-OUTPUT-CHANNEL scale for this column tile. VMEM index c corresponds to HBM column
+      # col_tile_start + c, which is exactly how col_slice indexes the data below.
+      pltpu.sync_copy(
+          col_scale_hbm_ref.at[pl.ds(col_tile_start, col_size)],
+          col_scale_vmem_ref,
+      )
 
     # HBM to VMEM transfer.
     indices = indices_vmem_ref[...]
@@ -199,6 +210,10 @@ def main_kernel(
               data = out_vmem_ref[row_vmem, col_slice]
               data_f32 = jax.lax.bitcast_convert_type(data, jnp.float32)
               data_f32 = data_f32 * weights[row_vmem]
+              if has_col_scale:
+                # Each lane is a distinct column, so the per-channel scale is a plain vector
+                # multiply across the lanes -- no extra HBM traffic, it rides the existing pass.
+                data_f32 = data_f32 * col_scale_vmem_ref[col_slice]
               out_vmem_ref[row_vmem, col_slice] = jax.lax.bitcast_convert_type(data_f32, jnp.uint32)
         else:
           # bf16 path: data is packed, packing=2. Each packed row contains 2
@@ -222,6 +237,10 @@ def main_kernel(
                 elem_f32 = jnp.bitwise_left_shift(elem, 16)
                 elem_f32 = jax.lax.bitcast_convert_type(elem_f32, jnp.float32)
                 elem_f32 = elem_f32 * weights[row_src]
+                if has_col_scale:
+                  # Lanes are columns here too (sub selects the row), so the per-channel scale
+                  # applies as a vector across the lane axis.
+                  elem_f32 = elem_f32 * col_scale_vmem_ref[col_slice]
                 # Convert back: bitcast float32 -> uint32, shift right 16 to
                 # get bf16 bits, then shift left to target position.
                 elem_u32 = jax.lax.bitcast_convert_type(elem_f32, jnp.uint32)
@@ -370,6 +389,7 @@ def ragged_gather(
     end: jax.Array,
     weights: jax.Array | None = None,
     has_weights: bool = False,
+    col_scale: jax.Array | None = None,
     enforce_fallback: bool = False,
     flops_override: int = -1,
     bytes_accessed_override: int = -1,
@@ -387,6 +407,10 @@ def ragged_gather(
       kernel, avoiding an extra HBM read-write pass.
     has_weights: Static bool flag indicating whether ``weights`` should be
       applied. Must be ``True`` when ``weights`` is not ``None``.
+    col_scale: Optional 1D ``[hidden_size]`` float32 array of per-COLUMN (per output
+      channel) scales. Applied inside the kernel on the same unpack/repack pass that
+      applies ``weights``, so it costs no extra HBM traffic. Folding a downstream
+      per-channel multiply in here removes a whole full-buffer elementwise pass.
     enforce_fallback: Static bool flag. When ``True``, unconditionally use the
       JAX reference implementation instead of the SparseCore kernel.
       When ``False`` (default), use the SparseCore kernel and raise any error.
@@ -419,13 +443,20 @@ def ragged_gather(
 
   # Guard against eager initialization on non-TPU hardware (e.g. during CPU tests).
   # pltpu.get_tpu_info() expects TPU hardware and will crash if executed on CPU.
+  has_col_scale = col_scale is not None
+
+  def _with_col_scale(out):
+    if not has_col_scale:
+      return out
+    return (out.astype(jnp.float32) * col_scale.astype(jnp.float32)).astype(out.dtype)
+
   if enforce_fallback or jax.devices()[0].platform != "tpu":
-    return _fallback_implementation(x, indices, weights, has_weights)
+    return _with_col_scale(_fallback_implementation(x, indices, weights, has_weights))
 
   sc_info = pltpu.get_tpu_info().sparse_core
   if sc_info is None:
     # Sparse core is not available. Use JAX reference.
-    return _fallback_implementation(x, indices, weights, has_weights)
+    return _with_col_scale(_fallback_implementation(x, indices, weights, has_weights))
 
   hidden_size = x.shape[-1]
   out_size = indices.size
@@ -448,6 +479,17 @@ def ragged_gather(
 
   aligned_hidden_size = pl.cdiv(hidden_size, col_size) * col_size
 
+  if has_col_scale:
+    assert col_scale.ndim == 1 and col_scale.shape[0] == hidden_size, (
+        f"col_scale must be 1D [hidden_size]={hidden_size}, got {col_scale.shape}"
+    )
+    # Pad with 1.0 so the tail columns of the last tile are a no-op.
+    col_scale = jnp.pad(
+        col_scale.astype(jnp.float32), (0, aligned_hidden_size - hidden_size), constant_values=1.0
+    )
+  else:
+    col_scale = jnp.ones((aligned_hidden_size,), dtype=jnp.float32)
+
   vector_mesh = plsc.VectorSubcoreMesh(
       num_cores=num_sc_cores,
       num_subcores=sc_info.num_subcores,
@@ -460,6 +502,7 @@ def ragged_gather(
           core_axis_name=vector_mesh.core_axis_name,
           subcore_axis_name=vector_mesh.subcore_axis_name,
           has_weights=has_weights,
+          has_col_scale=has_col_scale,
       ),
       out_type=jax.ShapeDtypeStruct((out_size + out_pad_size, aligned_hidden_size), dtype),
       compiler_params=pltpu.CompilerParams(
@@ -481,8 +524,9 @@ def ragged_gather(
           pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
           pltpu.VMEM((num_simd_lanes,), jnp.int32),
           pltpu.VMEM((num_simd_lanes,), jnp.float32),
+          pltpu.VMEM((col_size,), jnp.float32),
           pltpu.SemaphoreType.DMA((2,)),
       ],
       mesh=vector_mesh,
       name="sc_ragged_gather",
-  )(start, end, x, indices, weights)[:out_size, :hidden_size]
+  )(start, end, x, indices, weights, col_scale)[:out_size, :hidden_size]

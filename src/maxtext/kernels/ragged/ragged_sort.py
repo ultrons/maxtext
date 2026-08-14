@@ -540,9 +540,23 @@ def ring_ragged_unsort(
       # print-perturbable heisenbug). The PACKED mode below has always masked its tail -- this
       # mirrors that mask for the full-buffer mode. Must run BEFORE the chunked scatter-back,
       # which would otherwise scatter the stale rows into the full buffer.
-      _row = jnp.arange(grad_sorted_tokens.shape[0], dtype=jnp.int32)
-      _valid = (_row >= gather_start) & (_row < gather_end)
-      grad_sorted_tokens = jnp.where(_valid[:, None], grad_sorted_tokens, 0.0)
+      #
+      # MOE_UNSORT_BWD_MASK=0 drops the mask; MOE_UNSORT_BWD_POISON=1 fills the unwritten rows
+      # with NaN instead of 0. The poison mode is how "is the mask still needed?" becomes a proof
+      # rather than a lottery: those rows hold whatever HBM happened to contain, so a run that is
+      # merely clean with the mask removed only says this allocation was lucky. Poisoning them
+      # deterministically means a finite run proves no consumer reads them. Always pair with a
+      # dense-quant positive control, which must NaN -- otherwise the probe proves nothing because
+      # the poison never reached a consumer in the first place.
+      import os as _os
+
+      _mask_on = _os.environ.get("MOE_UNSORT_BWD_MASK", "1") == "1"
+      _poison = _os.environ.get("MOE_UNSORT_BWD_POISON", "0") == "1"
+      if _mask_on or _poison:
+        _row = jnp.arange(grad_sorted_tokens.shape[0], dtype=jnp.int32)
+        _valid = (_row >= gather_start) & (_row < gather_end)
+        _fill = jnp.asarray(jnp.nan if _poison else 0.0, grad_sorted_tokens.dtype)
+        grad_sorted_tokens = jnp.where(_valid[:, None], grad_sorted_tokens, _fill)
       if buffer_size > n:
         # CHUNKED-INPUT combine (decouple_combine_rs_chunks): topk_argsort_revert_indices is a
         # TOKEN-axis SLICE of the full revert permutation, so grad_sorted_tokens has only n rows
