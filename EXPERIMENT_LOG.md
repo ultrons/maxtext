@@ -1140,3 +1140,48 @@ unchunked GMMs, chunk 4–8 both pipelines. Profiles → xprof :9010 compare dro
 - DAY ARC: 15.33 -> 14.10 = **−1.23s (−8.0%)**, −0.44s under the old all-time 14.54. Throughline:
   EXPOSED-COLLECTIVE PLACEMENT (move SC-offloaded EP AGs to TC) is the lever; compute-FLOP wins are
   overlap-absorbed; scheduling-ORDERING (co-schedule groups) hits walls (cycle/serialize).
+
+### moe_bwd_inkernel_quant VERDICT [2026-08-14] — rbf-dependent lever, retires the rbf=-1 NaN hazard
+- **Motivation (from the rbf profile A/B):** `compare_profiles` of the record (siv-cn-xsretest, rbf=2,
+  4.251s) vs siv-cn-rbfoff2 (rbf=-1, 5.474s) attributed the +1.22s to **VPU +962ms / MXU only +194ms**.
+  The ragged kernels skip empty groups fine (m_32768 -> m_131072 cost the MXU almost nothing); the tax
+  was every *dense* elementwise op sized by the buffer's STATIC shape: fp8 clamp_convert on
+  [131072,7168] (~565ms), the sanitizer's bf16 select (~400ms, 1.7ms x232 vs 2us at rbf=2), abs_reduce
+  amax over bf16[131072] (~160ms).
+- **Change (commit dafb04634):** quantize the backward operands INSIDE the ragged kernels.
+  dlhs: skip the XLA cotangent quantize; gmm_v2's quantized-matmul path now also fires for a wide lhs +
+  UNSCALED fp8 rhs (per-row per-512-block e4m3 in VMEM). drhs: tgmm_v2 `quantize_operands` quantizes
+  BOTH operands per-gm-tile-per-channel with the scale outer-product applied per tile (the tgmm_block
+  algebra fused into the tile loop) -- subsumes 3 dense ops (x_sorted re-quantize, drhs_dout*=lhs.scale,
+  per-N cotangent quantize).
+- **MEASURED (8x8x8 pdbs=1 synthetic, image 1410-up2-dafb04634, all loss 8.784 at step 19):**
+
+  | arm | rbf | quant | sanitizer | s/step | TPS/chip |
+  |---|---|---|---|---|---|
+  | siv-cn-xsretest (RECORD) | 2 | dense | off | 4.251 | 1927 |
+  | siv-cn-ikqon | 2 | in-kernel | off | 4.303 | 1904 |
+  | siv-cn-rbfoff2 | -1 | dense | **on (required)** | 5.474 | 1497 |
+  | siv-cn-ikqrbf3 | -1 | in-kernel | **OFF** | 4.882 | 1678 |
+
+- **VERDICT: the lever's value is buffer-size-dependent.** At rbf=2 it is +0.05s (net-negative, inside
+  noise but not a win): the dense quantize family was only ~250ms there, and the tgmm now reads bf16
+  operands (2x the bytes of the pre-quantized e4m3 it used to read), which eats the savings. At rbf=-1
+  it is **-0.59s (+12% TPS)**, recovering ~48% of the 1.22s rbf penalty.
+- **SECOND RESULT (arguably the bigger one): the rbf=-1 stale-row NaN hazard is GONE.** ikqrbf3 ran
+  clean for 20 steps with `moe_sanitize_ragged_buffer` OFF, where the same stack with dense quant
+  NaN'd at step 1 (siv-cn-rbfoff). Mechanism: the NaN door was the dense per-row amax ingesting
+  uninitialized HBM rows (amax=Inf -> inv=0 -> Inf*0=NaN). Every quantize is now group_sizes-bounded,
+  so no reduce ever reads the buffer tail. The sanitizer flag becomes unnecessary at rbf=-1 rather
+  than merely masking the issue.
+- **Loss bit-identical 8.784 across all four arms** -- finer per-tile e4m3 scales are numerically
+  neutral at this horizon (20 steps, synthetic). Real-data curve check still owed before any default flip.
+- **Residual gap rbf=-1 vs rbf=2 is now 0.63s** (was 1.22s). The remainder is the 4x-larger
+  reduce-scatters (RS.31 987->1126ms, RS.35 466->596, RS.33 392->588; mostly hidden, SC lane +48ms
+  exposed), relayout +132ms, and the tgmm's bf16 operand reads over 4x rows.
+- **DON'T flip on at rbf=2.** Keep the record stack as-is; this flag is for rbf=-1 configs (real-data
+  runs where rbf=2 truncation-drop under imbalanced routing is an open accuracy question, and where
+  rbf=2 currently hits the gmm_v2 init-fatal on real routing).
+- Infra note: 2 launches lost to flakes before ikqrbf3 -- one jobset never composed its slice (Warden
+  `tpu-accelerator-topology-constraints` while ss-kueue-operator sat at `1 CREATED`), one hit the
+  gang-formation init hang ending in the `TearDownMesh` HAL abort (dies in make_tpu_client, pre-compile).
+  Both cured by delete+relaunch. Babysitters now carry a stalled-init detector (18min, 0 steps -> bail).
