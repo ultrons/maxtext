@@ -1306,3 +1306,34 @@ the same op -- **use total/count, not the derived column.**
 slice composes -- every successful run today emitted it on the way up. The real health signal is the
 `slices.accelerator.gke.io` STATE (ACTIVATING -> ACTIVE). Bailing on the warning killed a healthy job
 (rsb3, possibly ikqrbf2). Babysitters must watch the slice object, not the warning.
+
+### unsort-bwd mask VERDICT [2026-08-15] — REDUNDANT under in-kernel quant (adversarial proof)
+The sanitize-v3 mask in `_ring_ragged_unsort_bwd` (commit a48d01d58) zeroes the rows the SC
+ragged_gather skips. Question: still needed now that every quantize is group_sizes-bounded?
+
+**A clean run with the mask removed would prove nothing** -- those rows hold whatever HBM contained,
+and the original NaN was allocation-dependent (print-perturbable). So instead: `MOE_UNSORT_BWD_POISON=1`
+fills them with **NaN** deterministically. Finite => no consumer reads them.
+
+| arm | quant | poison | result |
+|---|---|---|---|
+| siv-cn-poisctl2 (POSITIVE CONTROL) | dense | on | **NaN at step 1** (loss 12.271 at step 0, then nan) |
+| siv-cn-poistest (TEST) | in-kernel (ship) | on | **20 steps FINITE**, loss 8.783, 4.816 s/step |
+
+- **The control is what makes this a proof.** It NaNs on the first step that has a backward, so the
+  poison demonstrably reaches a consumer when one exists. The test arm's finiteness is therefore
+  evidence about the code, not about this allocation's luck.
+- **VERDICT: the mask is REDUNDANT with moe_bwd_inkernel_quant.** The dense per-row amax was the only
+  consumer that read the skipped rows; in-kernel quant bounds every reduce by group_sizes, and the
+  tgmm inner kernel masks each tile to its own group range (`jnp.where` SELECTS, so a NaN in the
+  false branch is discarded, not multiplied).
+- Test-arm step time 4.816 s == the ship config's 4.811 s, i.e. the poison itself is free (same
+  masked-write shape), so this arm doubles as a same-image reproduction of the ship number.
+
+**NEXT (the actual prize):** removing the mask alone only deletes the `select` half of
+`select_multiply_fusion.3` -- the pass still runs for the scale multiply. The 735ms goes away only if
+the per-channel scale ALSO moves into the producing SC kernel. `ragged_gather(col_scale=)` is built
+(commit 27f43573f; rides the existing unpack/multiply/repack pass, no extra HBM traffic). Remaining:
+thread `wo_scale` moe.py -> `_ring_ragged_unsort_bwd` -> gather, and suppress
+`_dlhs_scale_grad_by_rhs_scale` so it is not applied twice (keep the `_share_scale` drhs unscale).
+Projected ~120 ms/step at the measured 1:6 VPU-to-step conversion.
