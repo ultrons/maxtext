@@ -1457,3 +1457,29 @@ the tgmm; leave the gmm path simple.
   global amax. We keep per-token to stay at the per-channel floor this recipe committed to.
 - **Do NOT re-materialize a bf16 copy for the tgmm:** that rebuilds the second full-buffer array the
   shared-cotangent lever deleted (−0.212 s), so it is self-defeating.
+
+### c4 500-step curve on the CURRENT TIP [2026-08-15] — eval 4.600, ties the dense-fp8 recipe
+siv-cn-ctwc4: real routing, rbf=-1, sanitizer AND unsort mask OFF, in-kernel quant + shared cotangent
++ folded wo-scale + e4m3 cotangent wire. Image 1410-up2-ctw2.
+
+| run | eval@100 | @200 | @300 | @400 | train@499 |
+|---|---|---|---|---|---|
+| c4bf16 (reference) | | | | **4.593** | 4.510 |
+| fullstack500 (dense fp8 + sanitizer) | | | | 4.600 | 4.517 |
+| ikqc4 (in-kernel + shared) | 6.106 | 5.203 | 4.796 | **4.597** | |
+| **ctwc4 (current tip)** | 6.166 | 5.211 | 4.798 | **4.600** | 4.517 |
+
+- **Verdict: acceptable.** Ties the dense-fp8 recipe (4.600) that was already judged fine, +0.007 vs bf16.
+- **But the trend is the adversarial review's finding E, visible in data:** the tip is +0.003 WORSE than
+  ikqc4 at eval@400 and worse at every eval checkpoint (+0.060/+0.008/+0.002/+0.003). The two levers
+  added since ikqc4 (wo-scale folded into the gather, e4m3 ct wire) each ADD a rounding rather than
+  relocating one -- the reviewer showed the "quantized downstream anyway" justification is false under
+  in-kernel quant, whose granularity (per-row-per-512-block, per-gm-tile-per-channel) is finer than
+  and orthogonal to a per-token scale. The curve agrees with the code reading.
+- **No NaN over 500 steps of REAL routing** with both safety mechanisms off. That exercises the mask
+  removal on imbalanced routing (the case the synthetic poison probe could not). NOT proof against
+  review finding C (the tgmm reciprocal-overflow NaN is data-dependent), but it is the strongest
+  evidence we have.
+- **Open call:** the e4m3 ct wire buys 0.086 s (4.599 -> 4.513) for ~0.003 eval. Cheap, but it is the
+  first lever in this campaign that is NOT numerically free, so it should be a deliberate choice
+  rather than folded into the default.
