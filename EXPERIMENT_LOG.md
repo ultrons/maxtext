@@ -1337,3 +1337,34 @@ the per-channel scale ALSO moves into the producing SC kernel. `ragged_gather(co
 thread `wo_scale` moe.py -> `_ring_ragged_unsort_bwd` -> gather, and suppress
 `_dlhs_scale_grad_by_rhs_scale` so it is not applied twice (keep the `_share_scale` drhs unscale).
 Projected ~120 ms/step at the measured 1:6 VPU-to-step conversion.
+
+### moe_fold_wo_scale_in_gather + mask removal VERDICT [2026-08-15] — NEW BEST 4.599s / 1781 TPS-chip
+- **Change:** delete `select_multiply_fusion.3` (735ms self-time, two bf16[131072,7168] outputs) by
+  removing BOTH halves of what it computed. (a) the validity mask -- proven redundant by the
+  NaN-poison probe (commit 6d48b88e1), removed via `MOE_UNSORT_BWD_MASK=0`; (b) the wo
+  per-output-channel scale -- folded into the producing SC kernel via
+  `ring_ragged_unsort(bwd_col_scale=)` -> `ragged_gather(col_scale=)`, riding the
+  unpack/multiply/repack pass the per-row routing weights already run (no extra HBM traffic).
+  The wo gmm skips its own `_dlhs_scale_grad_by_rhs_scale` (`dlhs_scale_preapplied`, gated on
+  `is_wo`) or the scale would be squared; the `_share_scale` drhs unscale is unchanged.
+- **MEASURED (siv-cn-fold1, image 1410-up2-fold):** **4.599 s/step, 1781 TPS-chip, loss 8.784**
+  (step 17/18/19 = 8.874/8.825/8.784, DIGIT-IDENTICAL to the ship config -- the scale rewiring is
+  numerically exact; a squared or dropped scale would diverge visibly).
+- **Δ vs ship (4.811): −0.212 s, +78 TPS-chip.**
+- **RECEIPT the fusion is gone:** `find select_multiply` -> "matches no op in this window";
+  `broadcast_multiply_fusion` is back to a trivial `bf16[4096]`. No buffer-shaped elementwise pass
+  survives in the MoE backward. VPU lane **1.52s -> 1.33s**; non-matmul TC work 35% -> **32%** of
+  the step; best-overlap ceiling 3.82 -> **3.63s**.
+- **The 1:6 rule UNDER-predicted this one (projected ~120ms, got 212ms).** Deleting a pass outright
+  is worth more than the overlap-absorbed fraction suggests, because the removed work was partly on
+  the critical path (the ceiling itself moved −0.19s). Refine: 1:6 prices SHRINKING an overlapped
+  op; DELETING one that also feeds the binder pays closer to 1:1 on the ceiling move.
+- Gates: flag-off AOT byte-identical to baseline (83298018464/187317760); flag-on code size DIFFERS
+  (187307008) => it actually engages. `No constant handler for DynamicJaxprTracer` on the first
+  attempt = the wo scale captured by CLOSURE in the custom_vjp bwd; forward tracers must reach a
+  custom_vjp backward via RESIDUALS (commit 4509ddf58).
+
+**rbf=-1 LADDER (all loss 8.783-8.784):** 5.474 dense+sanitizer (1497) -> 5.129 drhs-only (1597)
+-> 4.884 in-kernel both (1677) -> 4.811 +shared cotangent (1703) -> **4.599 +fold+no-mask (1781)**.
+Total **−0.875 s / +19% TPS**, sanitizer AND mask both retired. Gap to the rbf=2 record (4.251) is
+now **0.35 s**, from 1.22 s.
