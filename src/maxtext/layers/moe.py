@@ -184,12 +184,17 @@ def _fp8_wire_all_gather(ct, mesh, ep_name, collective_id):
 
   if _os.environ.get("MOE_FP8_CT_WIRE", "0") != "1":
     return ring_all_gather(ct, mesh, (ep_name,), 0, collective_id)
-  _f32 = ct.astype(jnp.float32)
-  _scale = jnp.max(jnp.abs(_f32), axis=-1, keepdims=True) / 448.0 + 1e-20
-  _q = jnp.clip(_f32 / _scale, -448.0, 448.0).astype(jnp.float8_e4m3fn)
+  # Keep the elementwise work in the NARROW dtype. The first cut ran amax/divide/dequant through
+  # f32 (4 B/elem) over [tokens, 7168], and that added VPU+HBM cost is why the measured win was
+  # 86ms against the ~165ms the halved wire bytes alone predict. Only the amax and the reciprocal
+  # need f32 range; the per-element divide and the dequant multiply are fine in bf16, halving the
+  # bytes those passes touch.
+  _scale = (jnp.max(jnp.abs(ct.astype(jnp.float32)), axis=-1, keepdims=True) / 448.0 + 1e-20)
+  _inv = (1.0 / _scale).astype(ct.dtype)  # reciprocal once in f32, apply in bf16
+  _q = jnp.clip(ct * _inv, -448.0, 448.0).astype(jnp.float8_e4m3fn)
   _qg = ring_all_gather(_q, mesh, (ep_name,), 0, collective_id)
   _sg = jax.lax.all_gather(_scale.astype(jnp.float32), axis_name=ep_name, axis=0, tiled=True)
-  return (_qg.astype(jnp.float32) * _sg).astype(ct.dtype)
+  return _qg.astype(ct.dtype) * _sg.astype(ct.dtype)
 
 
 def _ring_combine_rs_fwd(output, mesh, ep_name, rs_collective_id, ag_collective_id):
