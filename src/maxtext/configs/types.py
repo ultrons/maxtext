@@ -1086,6 +1086,18 @@ class MoEGeneral(BaseModel):
           "form wrote fp8 (1 B/elem), and the kernel then re-reads twice the bytes. Kept for A/B."
       ),
   )
+  moe_fp8_token_ag_wire: bool = Field(
+      False,
+      description=(
+          "Send the FORWARD EP token all-gather in e4m3 with a PER-TOKEN scale, dequant immediately "
+          "after. Wire-only: the GMM still quantizes activations in-kernel, so this RELOCATES a "
+          "rounding rather than adding one, while halving the ICI bytes and the AG kernel's HBM "
+          "traffic (the pair cost 333 ms/step in bf16 -- larger than the weight-grad RS). ring_ag "
+          "sizes transfers from x.dtype.itemsize, so no kernel change is needed to move fp8. Uses a "
+          "per-token scale rather than the global amax of moe_fp8_dispatch_wire, which is coarser "
+          "than the GMM's per-row-per-512-block and below this campaign's per-channel floor."
+      ),
+  )
   moe_wgrad_rs_sched_group: int = Field(
       0,
       description=(

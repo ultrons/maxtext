@@ -2273,7 +2273,27 @@ class RoutedMoE(nnx.Module):
           # binder) onto the TC ICI DMAs. The small routing logits stay on the plain collective. Its
           # custom_vjp gives the same psum_scatter transpose, so numerics == lax.all_gather. Symmetric to
           # moe_direct_token_ag (which does the BACKWARD recompute); this does the FORWARD dispatch.
-          x = _direct_all_gather(x, self.mesh, self._expert_parallelism_name, _DIRECT_FWD_TOKEN_AG_COLLECTIVE_ID)
+          # moe_fp8_token_ag_wire: send the FORWARD token all-gather in e4m3 (PER-TOKEN scale) and
+          # dequant right after. Wire-only -- the GMM still quantizes in-kernel exactly as before, so
+          # this relocates a rounding rather than adding one, and halves both the ICI bytes and the
+          # kernel's HBM traffic (ring_ag sizes transfers from x.dtype.itemsize, so it needs no
+          # change to move fp8). PER-TOKEN, not the global scale moe_fp8_dispatch_wire uses: a
+          # global amax over [tokens, embed] is far coarser than the GMM's per-row-per-512-block and
+          # below the per-channel floor this campaign committed to.
+          if getattr(self.config, "moe_fp8_token_ag_wire", False):
+            _t_amax = jnp.max(jnp.abs(x.astype(jnp.float32)), axis=-1, keepdims=True)
+            _t_scale = (_t_amax / 448.0 + 1e-20).astype(jnp.float32)
+            _xq = jnp.clip(x.astype(jnp.float32) / _t_scale, -448.0, 448.0).astype(jnp.float8_e4m3fn)
+            _xq = _direct_all_gather(
+                _xq, self.mesh, self._expert_parallelism_name, _DIRECT_FWD_TOKEN_AG_COLLECTIVE_ID
+            )
+            # The per-token scales ride along on their own (tiny) gather: [tokens,1] vs [tokens,7168].
+            _sc = _direct_all_gather(
+                _t_scale, self.mesh, self._expert_parallelism_name, _DIRECT_FWD_TOKEN_AG_COLLECTIVE_ID + 40
+            )
+            x = (_xq.astype(jnp.float32) * _sc).astype(x.dtype)
+          else:
+            x = _direct_all_gather(x, self.mesh, self._expert_parallelism_name, _DIRECT_FWD_TOKEN_AG_COLLECTIVE_ID)
           logits, pre_bias_logits = tuple(
               jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True)
               for z in (logits, pre_bias_logits)
