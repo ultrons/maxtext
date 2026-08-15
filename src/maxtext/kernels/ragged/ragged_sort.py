@@ -362,6 +362,7 @@ def ring_ragged_unsort(
       group_sizes_local,
       topk_argsort_revert_indices,
       topk_weights_flat,
+      col_scale,
   ):
     """Unsort and scatter activations."""
     return _ring_ragged_unsort_fwd(
@@ -369,6 +370,7 @@ def ring_ragged_unsort(
         group_sizes_local,
         topk_argsort_revert_indices,
         topk_weights_flat,
+        col_scale,
     )[0]
 
   @jax.named_scope("ragged-unsort-fwd")
@@ -377,6 +379,7 @@ def ring_ragged_unsort(
       group_sizes_local,
       topk_argsort_revert_indices,
       topk_weights_flat,
+      col_scale,
   ):
     """Executes unsorting sending tokens back."""
     group_offsets = jnp.cumulative_sum(group_sizes_local, include_initial=True)
@@ -461,6 +464,7 @@ def ring_ragged_unsort(
         shard_output_start,
         shard_output_end,
         buffer_size,
+        col_scale,
     )
 
     return out, res
@@ -483,6 +487,7 @@ def ring_ragged_unsort(
         shard_output_start,
         shard_output_end,
         buffer_size,
+        col_scale,
     ) = res
     g_hidden_states_local = g_out
 
@@ -533,7 +538,7 @@ def ring_ragged_unsort(
           # the unpack/multiply/repack pass the per-row weights already run, so it costs no extra
           # HBM traffic -- and it removes a whole full-buffer elementwise pass downstream
           # (select_multiply_fusion.3). The consumer must then NOT apply the scale again.
-          col_scale=bwd_col_scale,
+          col_scale=col_scale,
           enforce_fallback=enforce_gather_fallback,
           flops_override=gather_flops_override,
           bytes_accessed_override=gather_bytes_accessed_override,
@@ -614,7 +619,7 @@ def ring_ragged_unsort(
       limit = jnp.minimum(shard_output_end - shard_output_start, buffer_size)
       mask = jnp.arange(buffer_size) < limit
       grad_sorted_tokens = jnp.where(mask[:, None], grad_sorted_tokens, 0.0)
-    return grad_sorted_tokens, None, None, None
+    return grad_sorted_tokens, None, None, None, None
 
   _ring_ragged_unsort.defvjp(_ring_ragged_unsort_fwd, _ring_ragged_unsort_bwd)
 
@@ -626,6 +631,7 @@ def ring_ragged_unsort(
       group_sizes_local,
       topk_argsort_revert_indices,
       topk_weights_flat,
+      bwd_col_scale,
   )
 
 
