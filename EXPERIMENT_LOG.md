@@ -1387,3 +1387,29 @@ now **0.35 s**, from 1.22 s.
   worth ~50ms, not worth it), isolation is worth ~40ms, and placement-by-annotation is NEGATIVE. Its
   ~217ms exposure is structural. Park it; spend the effort on the wire experiments instead.
 - Flag kept at default 0 (off) for the record; the probe value is the measurement, not the feature.
+
+### MOE_FP8_CT_WIRE VERDICT [2026-08-15] — NEW BEST 4.513 s / 1815 TPS-chip (−0.086 s)
+- e4m3 wire + PER-TOKEN scale on the combine-cotangent ring AG (`_ring_ct_rs_bwd`,
+  `_ring_combine_rs_bwd`). **RECEIPT it engaged:** the shard_map payload label is now
+  `f8e4m3fn[8,2048,7168]` (was `bf16[...]`) -- half the wire bytes, no kernel change (ring_all_gather
+  sizes from x.dtype.itemsize).
+- **MEASURED (siv-cn-ctw1): 4.513 s, 1815 TPS-chip.** Loss 8.875/8.825/8.784 vs fold1's
+  8.874/8.825/8.784 -- ONE 1e-3 tick at step 17, identical by 19. That tiny drift is the correct
+  signature: we DID re-round the cotangent, and it converges away. Argument holds -- the value is
+  quantized to e4m3 downstream anyway (it becomes the wo gmm's dlhs_dout under bwd e4m3), so this
+  RELOCATES a rounding rather than adding one.
+- **Win is 86ms, NOT the ~165ms the halved bytes alone predict.** The gap is the quantize/dequant
+  VPU cost we added: a per-token amax + clip + convert over [2048,7168] per call, then a dequant
+  back to bf16. So this lever is (wire saving) minus (elementwise cost).
+- **=> The next move is NOT packing the scale.** The scale gather is 8.2 KB = 0.056% of the payload;
+  packing it (bitcast f32 into 4 e4m3 slots + pad cols, 1.8% overhead, one collective) only helps if
+  it is latency-exposed, and the top-10 exposed table shows no new small AG. The bigger residual is
+  the DEQUANT: we convert back to bf16 only for the consumer to re-quantize. Handing the e4m3
+  qvalue + scale STRAIGHT to the wo gmm backward would delete both the dequant and the downstream
+  re-quantize. That is the follow-up worth building.
+- Note `all-reduce.236` (checkpoint/reduce_max, 102.9 KB @ 0.4 GB/s -- latency-bound) grew 75->116ms;
+  pre-existing (the cv-wag weight amax), but now a visible small-collective cost worth a look.
+
+**LADDER (rbf=-1, all loss 8.783-8.784):** 5.474 -> 5.129 -> 4.884 -> 4.811 -> 4.599 -> **4.513**
+(1497 -> 1815 TPS-chip). Total **−0.961 s / +21%**; sanitizer + unsort mask retired; gap to the
+rbf=2 record (4.251) now **0.26 s**, from 1.22 s.
