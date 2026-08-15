@@ -1509,3 +1509,26 @@ correct BY CONSTRUCTION rather than by accidental precondition.
   fixed,-1,1` yet cv-wag computes a DYNAMIC per-channel amax for the MoE expert weights. Our
   "static" recipe is static for attention and dynamic for the experts. Worth confirming, because it
   changes what the static-vs-dynamic c4 comparison actually measured.
+
+### direct-RS trio VERDICT [2026-08-15] — CLOSED in ONE arm: structure cost +0.548 s at EP=8
+- **Arm 2 (structure only, flag-only, no code): `moe_direct_rs=true`, bf16.** siv-cn-drs1 =
+  **5.056 s / 1620 TPS-chip vs 4.508 / 1817 baseline = +0.548 s.** Loss 8.874/8.825/8.783 (one tick,
+  expected -- direct-to-owner has a different reduce order than XLA's psum_scatter).
+- **=> Arm 3 (direct + fp8) is DEAD, do not build it.** The user predicted direct-RS might be slower
+  at rank-8; it is, by 0.548 s. The fp8 wire on that collective could at best halve its bytes, which
+  is nowhere near enough to pay back the structure change. Building the fp8 kernel first and
+  measuring the pair together would have produced a confusing net number and cost a day.
+- **The control arm was the whole experiment.** Structure and wire were confounded; isolating
+  structure with a flag that already existed answered it for one cluster slot and zero code. Keep
+  this ordering: when a lever changes TWO things, measure the one that needs no code FIRST.
+- Reconciles the split prior: `moe_direct_rs` was −0.21 s on the 14.x composed superslice (4x8x8) and
+  "optimal" in an even older context. Neither transferred. At 8x8x8 / EP=8 / rbf=-1 / fp8 it is
+  strongly negative. **Direct-to-owner RS is config-dependent and currently LOSES here.**
+- **Token RS stays on XLA psum_scatter in bf16.** With ring re-quantizing partial sums at all 7 hops
+  (~10% compounding) and direct-to-owner costing +0.548 s, there is no viable fp8 path for this
+  collective. LEVER CLOSED.
+
+**Remaining open levers:** (1) wi weight-amax amortization (needs train-state plumbing); (2) forward
+GMM accumulator -- likely bf16 by gmm_v2 default, never checked, sits under the largest matmuls;
+(3) the hardcoded 512 in-kernel quant block size, never swept; (4) re-derive the tgmm per-row-scale
+Mosaic blocker (reviewer notes tgmm:371 already reshapes to trailing-1 and compiles).
