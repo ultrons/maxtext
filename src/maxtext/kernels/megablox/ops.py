@@ -542,14 +542,31 @@ def _gmm_bwd(
   #   by s recovers drhs. Skipped when weight_gather_axes is set: _drhs_scatter_weight may shard the
   #   n dim, which would misalign the scale vector.
   _share_scale = None
-  if (
-      inkernel_drhs
-      and bwd_inkernel_quant_dlhs
+  _pre_scaled = (
+      isinstance(rhs, qpl.QArray)
       and use_gmm_v2
-      and isinstance(rhs, qpl.QArray)
       and not weight_gather_axes
-  ):
-    _share_scale = _squeeze_rhs_scale_2d(rhs.scale, transpose_rhs)  # [1, n] or [g, n]
+      and (
+          # sharing: we hand the tgmm the already-scaled dlhs cotangent
+          (inkernel_drhs and bwd_inkernel_quant_dlhs)
+          # fold: the SC gather already multiplied `grad` by the wo scale. `grad` feeds BOTH
+          # dlhs_dout AND drhs_dout, and dlhs_scale_preapplied only suppresses the dlhs multiply --
+          # so without this the WEIGHT gradient is silently scaled by s (~1e-3) and still trains.
+          or dlhs_scale_preapplied
+      )
+  )
+  if _pre_scaled:
+    _share_scale = _squeeze_rhs_scale_2d(rhs.scale, transpose_rhs)
+    # The unscale factors out of the m-contraction only if s is constant within each group.
+    # _dlhs_scale_grad_by_rhs_scale builds the per-expert case with jnp.repeat(group_sizes), which
+    # FRONT-PACKS -- false at rbf=-1 where valid rows sit at global slot positions. Only the shared
+    # [1, n] layout is sound here; fail loudly rather than corrupt the weight gradient.
+    if _share_scale.shape[0] != 1:
+      raise NotImplementedError(
+          "shared/pre-scaled cotangent requires a SHARED [1, n] rhs scale; got "
+          f"{_share_scale.shape}. A per-expert scale does not factor out of the tgmm's "
+          "m-contraction under the front-packing jnp.repeat."
+      )
 
   # 1. Scale Application & QArray Unwrapping
   dlhs_dout, drhs_dout, lhs, rhs = _bwd_prepare_inputs(
@@ -635,7 +652,11 @@ def _gmm_bwd(
     # on the SMALL [g, k, n] weight gradient rather than on the full ragged cotangent buffer.
     # f32 for the divide: drhs is bf16 and s can be small enough that a bf16 reciprocal loses bits.
     _s = _share_scale.astype(jnp.float32)
-    _s = jnp.where(_s == 0, 1.0, _s)  # a zero scale means a zero numerator; leave it untouched
+    # NOTE: substituting 1.0 is a guard against div-by-zero, NOT a no-op. If a channel's weight
+    # scale were ever exactly 0 (e.g. a sparsity-pruned channel), its TRUE gradient is generally
+    # nonzero and this would zero it permanently. _cv_scale is amax/448 + 1e-20 (strictly positive)
+    # and the fixed calibration is nonzero, so this is unreachable today.
+    _s = jnp.where(_s == 0, 1.0, _s)
     drhs = (drhs.astype(jnp.float32) / _s[:, None, :]).astype(drhs.dtype)
 
   # 5. Output Formatting

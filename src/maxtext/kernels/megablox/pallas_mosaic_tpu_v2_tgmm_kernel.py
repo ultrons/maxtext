@@ -356,10 +356,15 @@ def tgmm_inner_kernel(
       rhs_f = rhs_masked.astype(jnp.float32)
       lhs_scale = jnp.max(jnp.abs(lhs_f), axis=0) / dtype_max  # [tile_k] f32
       rhs_scale = jnp.max(jnp.abs(rhs_f), axis=0) / dtype_max  # [tile_n] f32
-      # A zero scale (all-zero column / empty tile) would give 0 * inf = NaN; force those
-      # columns to quantize to 0 instead.
-      lhs_inv = jnp.where(lhs_scale == 0, 0.0, 1.0 / lhs_scale)
-      rhs_inv = jnp.where(rhs_scale == 0, 0.0, 1.0 / rhs_scale)
+      # A near-zero scale would give 0 * inf = NaN. An `== 0` guard is NOT enough: for any column
+      # whose amax is nonzero but below ~1.3e-36, `1/scale` OVERFLOWS f32 to inf, the guard does not
+      # fire, and every exactly-zero element in that column becomes 0*inf = NaN. Masked rows are set
+      # to exactly 0 above, so MORE masked rows = more NaN sites -- imbalanced (real) routing makes
+      # small groups and mostly-masked tiles, so it is strictly more exposed than a balanced
+      # synthetic router. Guard on the smallest scale with a finite reciprocal instead.
+      _recip_min = jnp.float32(1.0) / jnp.finfo(jnp.float32).max
+      lhs_inv = jnp.where(lhs_scale > _recip_min, 1.0 / lhs_scale, 0.0)
+      rhs_inv = jnp.where(rhs_scale > _recip_min, 1.0 / rhs_scale, 0.0)
       lhs_q = (lhs_f * lhs_inv.reshape(1, -1)).astype(q_dtype)
       rhs_q = (rhs_f * rhs_inv.reshape(1, -1)).astype(q_dtype)
       acc = jax.lax.dot_general(

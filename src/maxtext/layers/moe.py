@@ -189,12 +189,15 @@ def _fp8_wire_all_gather(ct, mesh, ep_name, collective_id):
   # 86ms against the ~165ms the halved wire bytes alone predict. Only the amax and the reciprocal
   # need f32 range; the per-element divide and the dequant multiply are fine in bf16, halving the
   # bytes those passes touch.
+  # Quantize and dequantize must use the SAME multiplier. Dividing by bf16(1/s) and multiplying by
+  # f32 s leaves s*bf16(1/s) != 1 -- a systematic per-row bias up to ~2^-9 that does NOT average out
+  # over the row, unlike the e4m3 element noise. Round-trip through one bf16 scale instead.
   _scale = (jnp.max(jnp.abs(ct.astype(jnp.float32)), axis=-1, keepdims=True) / 448.0 + 1e-20)
-  _inv = (1.0 / _scale).astype(ct.dtype)  # reciprocal once in f32, apply in bf16
-  _q = jnp.clip(ct * _inv, -448.0, 448.0).astype(jnp.float8_e4m3fn)
+  _sb = _scale.astype(ct.dtype)
+  _q = jnp.clip(ct / _sb, -448.0, 448.0).astype(jnp.float8_e4m3fn)
   _qg = ring_all_gather(_q, mesh, (ep_name,), 0, collective_id)
-  _sg = jax.lax.all_gather(_scale.astype(jnp.float32), axis_name=ep_name, axis=0, tiled=True)
-  return _qg.astype(ct.dtype) * _sg.astype(ct.dtype)
+  _sg = jax.lax.all_gather(_sb, axis_name=ep_name, axis=0, tiled=True)
+  return _qg.astype(ct.dtype) * _sg
 
 
 def _ring_combine_rs_fwd(output, mesh, ep_name, rs_collective_id, ag_collective_id):

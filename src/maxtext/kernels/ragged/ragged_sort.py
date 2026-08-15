@@ -596,6 +596,16 @@ def ring_ragged_unsort(
           "handles the packed mode over the full permutation)."
       )
     else:
+      if col_scale is not None:
+        # The packed/truncated branch never applied col_scale, while the wo gmm still skipped its
+        # own _dlhs_scale_grad_by_rhs_scale -- the cotangent would be short a factor of wo_scale.
+        # Fail loudly rather than train on a silently mis-scaled gradient.
+        raise NotImplementedError(
+            "moe_fold_wo_scale_in_gather (bwd_col_scale) is only implemented for the FULL-buffer "
+            "unsort backward (ragged_buffer_factor<=0). The packed/truncated branch does not apply "
+            "col_scale, and the consumer gmm skips its own scale multiply, so the wo dlhs cotangent "
+            "would be missing a factor of wo_scale."
+        )
       # Slice the inverse permutation to match the packed local buffer.
       padded_idx_inv = jnp.pad(idx_inv, (0, buffer_size))
       sliced_idx_inv = jax.lax.dynamic_slice_in_dim(padded_idx_inv, shard_output_start, buffer_size, axis=0)
