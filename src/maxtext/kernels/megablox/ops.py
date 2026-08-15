@@ -79,6 +79,7 @@ def gmm(
     use_block_fp8_tgmm: bool = False,
     bwd_inkernel_quant: bool = False,
     bwd_inkernel_quant_dlhs: bool = False,
+    dlhs_scale_preapplied: bool = False,
 ):
   """Grouped matrix multiplication operation."""
   if interpret is None:
@@ -109,7 +110,7 @@ def gmm(
   gmm_fwd_bwd = lambda *args: _gmm_fwd(*args)[0]  # pylint: disable=C3001
   gmm_fwd_bwd = jax.custom_vjp(
       gmm_fwd_bwd,
-      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19),
+      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20),
   )
   gmm_fwd_bwd.defvjp(_gmm_fwd, functools.partial(_gmm_bwd, lhs.dtype, rhs.dtype))
   return gmm_fwd_bwd(
@@ -133,6 +134,7 @@ def gmm(
       use_block_fp8_tgmm,
       bwd_inkernel_quant,
       bwd_inkernel_quant_dlhs,
+      dlhs_scale_preapplied,
   )
 
 
@@ -172,6 +174,7 @@ def _gmm_fwd(
     use_block_fp8_tgmm: bool = False,
     bwd_inkernel_quant: bool = False,
     bwd_inkernel_quant_dlhs: bool = False,
+    dlhs_scale_preapplied: bool = False,
 ) -> tuple[
     jnp.ndarray,
     tuple[
@@ -487,6 +490,7 @@ def _gmm_bwd(
     use_block_fp8_tgmm: bool,
     bwd_inkernel_quant: bool,
     bwd_inkernel_quant_dlhs: bool,
+    dlhs_scale_preapplied: bool,
     residual: tuple[
         jnp.ndarray | qpl.QArray,
         jnp.ndarray | qpl.QArray,
@@ -551,6 +555,7 @@ def _gmm_bwd(
   dlhs_dout, drhs_dout, lhs, rhs = _bwd_prepare_inputs(
       grad, lhs, rhs, group_sizes, use_gmm_v2, transpose_rhs, quantization_rule,
       skip_lhs_quant=inkernel_drhs,
+      skip_dlhs_rhs_scale=dlhs_scale_preapplied,
   )
 
   # 2. Backward Pass Quantization
@@ -667,6 +672,7 @@ def _bwd_prepare_inputs(
     transpose_rhs: bool,
     quantization_rule: qwix.QtRule | None,
     skip_lhs_quant: bool = False,
+    skip_dlhs_rhs_scale: bool = False,
 ) -> tuple[jnp.ndarray | qpl.QArray, jnp.ndarray | qpl.QArray, jnp.ndarray, jnp.ndarray]:
   """Prepares backward operands."""
 
@@ -695,6 +701,10 @@ def _bwd_prepare_inputs(
         # no config plumbing; debug only.
         _const = jnp.mean(rhs.scale).astype(dlhs_dout.dtype)
         dlhs_dout = dlhs_dout * _const
+      elif skip_dlhs_rhs_scale:
+        # moe_fold_wo_scale_in_gather: the SC unsort-bwd gather already emitted this cotangent
+        # multiplied by rhs.scale (its col_scale), so applying it again here would square it.
+        pass
       else:
         dlhs_dout = _dlhs_scale_grad_by_rhs_scale(dlhs_dout, rhs, group_sizes, transpose_rhs)
       rhs = rhs.qvalue

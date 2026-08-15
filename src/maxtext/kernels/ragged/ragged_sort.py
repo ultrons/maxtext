@@ -312,6 +312,7 @@ def ring_ragged_unsort(
     use_single_sparsecore=False,
     full_num_slots=None,
     slot_window=None,
+    bwd_col_scale=None,
 ):
   """Dual of :func:`ring_ragged_sort`.
 
@@ -528,6 +529,11 @@ def ring_ragged_unsort(
           gather_end[None],
           weights=weight_for_sorted,
           has_weights=True,
+          # bwd_col_scale: fold the consumer's per-output-channel scale into THIS kernel. It rides
+          # the unpack/multiply/repack pass the per-row weights already run, so it costs no extra
+          # HBM traffic -- and it removes a whole full-buffer elementwise pass downstream
+          # (select_multiply_fusion.3). The consumer must then NOT apply the scale again.
+          col_scale=bwd_col_scale,
           enforce_fallback=enforce_gather_fallback,
           flops_override=gather_flops_override,
           bytes_accessed_override=gather_bytes_accessed_override,

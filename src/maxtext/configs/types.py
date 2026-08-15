@@ -1086,6 +1086,20 @@ class MoEGeneral(BaseModel):
           "form wrote fp8 (1 B/elem), and the kernel then re-reads twice the bytes. Kept for A/B."
       ),
   )
+  moe_fold_wo_scale_in_gather: bool = Field(
+      False,
+      description=(
+          "Fold the wo weight's per-output-channel quant scale into the SparseCore unsort-BACKWARD "
+          "ragged_gather (its col_scale), so the gather emits the already-scaled cotangent. Deletes "
+          "a full-buffer elementwise pass downstream (select_multiply_fusion.3, 735ms self-time at "
+          "ragged_buffer_factor=-1) at no extra HBM traffic -- the scale rides the unpack/multiply/"
+          "repack pass the per-row routing weights already run. The wo gmm then SKIPS its own "
+          "_dlhs_scale_grad_by_rhs_scale (dlhs_scale_preapplied) or the scale would be squared. "
+          "Pair with MOE_UNSORT_BWD_MASK=0: the mask is redundant under moe_bwd_inkernel_quant "
+          "(proven by the NaN-poison probe + dense-quant positive control), and the pass only "
+          "disappears if BOTH the mask and the scale leave it."
+      ),
+  )
   moe_sanitize_ragged_buffer: bool = Field(
       False,
       description=(

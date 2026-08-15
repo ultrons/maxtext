@@ -1477,8 +1477,16 @@ class RoutedMoE(nnx.Module):
       sequence_length,
       use_custom_sort_vjp=True,
       group_sizes=None,
+      bwd_col_scale=None,
   ):
-    """Unpermute tokens to original order and combine weights."""
+    """Unpermute tokens to original order and combine weights.
+
+    `bwd_col_scale` ([hidden] f32, moe_fold_wo_scale_in_gather): the wo weight's per-output-channel
+    quant scale. The BACKWARD gather here produces exactly the cotangent that the wo gmm's backward
+    would otherwise multiply by this scale (_dlhs_scale_grad_by_rhs_scale) in a separate
+    full-buffer XLA pass. Folding it into the gather kernel removes that pass; the gmm must then
+    skip its own multiply (dlhs_scale_preapplied) or the scale is applied twice.
+    """
 
     if self.config.use_ragged_sort and self.config.use_ring_of_experts:
       local_num_experts = self.config.num_experts // self.get_expert_parallelism_size()
@@ -1501,6 +1509,7 @@ class RoutedMoE(nnx.Module):
           gather_bytes_accessed_override=self.config.ragged_gather_cost_estimate_bytes_accessed,
           gather_reduce_bytes_accessed_override=self.config.ragged_gather_reduce_cost_estimate_bytes_accessed,
           use_single_sparsecore=self.config.ragged_sort_use_single_sparsecore,
+          bwd_col_scale=bwd_col_scale,
       )
     else:
       unsort_intermediate = _sort_activations(
@@ -2001,7 +2010,7 @@ class RoutedMoE(nnx.Module):
         rhs_quantize_dtype = quant_dg.fwd.dg_quantizer.rhs.numerics.get_dtype()
       return lhs_quantize_dtype, rhs_quantize_dtype
 
-    def gmm(inputs, kernel, tiling, group_sizes, expert_assignments, weight_gather_axes, group_offset):
+    def gmm(inputs, kernel, tiling, group_sizes, expert_assignments, weight_gather_axes, group_offset, is_wo=False):
       def extract_vma(tensor):
         # Parses the varying mesh axes from JAX's type string for a tensor inside shard_map.
         # jax.typeof(t) renders as e.g. 'f32[128,256]{V:(expert, fsdp)}'; this extracts
@@ -2080,6 +2089,9 @@ class RoutedMoE(nnx.Module):
             use_block_fp8_tgmm=getattr(self.config, "use_block_fp8_tgmm", False),
             bwd_inkernel_quant=getattr(self.config, "moe_bwd_inkernel_quant", False),
             bwd_inkernel_quant_dlhs=getattr(self.config, "moe_bwd_inkernel_quant_dlhs", False),
+            # Only the WO gmm's dlhs cotangent comes from the unsort-bwd gather, so only it can
+            # have had its per-output-channel scale pre-applied there.
+            dlhs_scale_preapplied=(is_wo and getattr(self.config, "moe_fold_wo_scale_in_gather", False)),
             interpret=megablox_interpret,
         )
       else:
@@ -2708,6 +2720,7 @@ class RoutedMoE(nnx.Module):
           _wo,
           tiling=wo_tile_size,
           weight_gather_axes=wo_gather_axes,
+          is_wo=True,
       )
       if self.get_tensor_parallelism_size() > 1:
         intermediate_output = jax.lax.psum_scatter(
@@ -2796,6 +2809,14 @@ class RoutedMoE(nnx.Module):
             sequence_length=sequence_length,
             use_custom_sort_vjp=self.config.use_custom_sort_vjp,
             group_sizes=routing.group_sizes,
+            # moe_fold_wo_scale_in_gather: hand the wo per-output-channel scale to the SC gather so
+            # its BACKWARD emits the already-scaled cotangent, deleting the downstream full-buffer
+            # scale pass. Requires the gmm to skip _dlhs_scale_grad_by_rhs_scale (wired below).
+            bwd_col_scale=(
+                jnp.ravel(jax.lax.stop_gradient(wo_scale)).astype(jnp.float32)
+                if (getattr(self.config, "moe_fold_wo_scale_in_gather", False) and wo_scale is not None)
+                else None
+            ),
         )
 
         # Sum up the partial outputs across the expert shards.
