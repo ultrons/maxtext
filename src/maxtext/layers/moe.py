@@ -2992,9 +2992,33 @@ class RoutedMoE(nnx.Module):
       # Gathered once, reused across all chunks. The QArray is still built at the LAST moment before
       # each gmm_fn call; the scales (w0_scale/w1_scale/wo_scale) thread alongside.
       if _fp8cv_in:
-        w0 = jax.lax.all_gather(w0, "fsdp", axis=1, tiled=True)  # [exp, embed_full, mlp]
-        w1 = jax.lax.all_gather(w1, "fsdp", axis=1, tiled=True)
-        wo = jax.lax.all_gather(wo, "fsdp", axis=2, tiled=True)  # [exp, mlp, embed_full]
+        # moe_wgrad_rs_sched_group: own the transpose so the weight-grad reduce-scatter can be
+        # tagged into an XLA scheduling group (it is EXPOSED at ~217ms/step, and measured at
+        # speed -- 272 GB/s isolated -- so placement, not a faster kernel, is the lever).
+        # PROBE: whether a custom_vjp is even legal here. The primal output is e4m3 while the
+        # weight-grad cotangent is deliberately bf16 (e4m3 overflows to NaN), and custom_vjp
+        # type-checks that pair where raw autodiff tolerates it. The layer-level manbwd wrapper
+        # DID hit exactly this. If this AOT compiles, the wall does not apply at this site.
+        _wg_grp = getattr(self.config, "moe_wgrad_rs_sched_group", 0)
+        if _wg_grp:
+          def _make_wag(axis, grp):
+            @jax.custom_vjp
+            def _g(w):
+              return jax.lax.all_gather(w, "fsdp", axis=axis, tiled=True)
+            def _g_fwd(w):
+              return jax.lax.all_gather(w, "fsdp", axis=axis, tiled=True), None
+            def _g_bwd(_res, ct):
+              with _scheduling_group(grp):
+                return (jax.lax.psum_scatter(ct, "fsdp", scatter_dimension=axis, tiled=True),)
+            _g.defvjp(_g_fwd, _g_bwd)
+            return _g
+          w0 = _make_wag(1, _wg_grp)(w0)
+          w1 = _make_wag(1, _wg_grp + 1)(w1)
+          wo = _make_wag(2, _wg_grp + 2)(wo)
+        else:
+          w0 = jax.lax.all_gather(w0, "fsdp", axis=1, tiled=True)  # [exp, embed_full, mlp]
+          w1 = jax.lax.all_gather(w1, "fsdp", axis=1, tiled=True)
+          wo = jax.lax.all_gather(wo, "fsdp", axis=2, tiled=True)  # [exp, mlp, embed_full]
         w0 = _finw_pair("w0_qv_full", w0)  # (2) fwd gathered qvalue; (6/8) bwd = tgmm wgrad ct
         wo = _finw_pair("wo_qv_full", wo)
       # (moe_fp8_boundary_qag: w0/w1 arrive boundary-gathered e4m3; same last-moment QArray plumbing.)

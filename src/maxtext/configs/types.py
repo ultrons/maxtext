@@ -1086,6 +1086,18 @@ class MoEGeneral(BaseModel):
           "form wrote fp8 (1 B/elem), and the kernel then re-reads twice the bytes. Kept for A/B."
       ),
   )
+  moe_wgrad_rs_sched_group: int = Field(
+      0,
+      description=(
+          "PROBE (0 = off): own the FSDP weight all-gather's transpose via custom_vjp so the "
+          "weight-grad reduce-scatter can be tagged with an XLA _scheduling_group_id and overlapped. "
+          "The RS is EXPOSED (~217ms/step) but measured AT SPEED (272 GB/s isolated, 73% of the "
+          "two-dim bidirectional ceiling), so placement is the lever, not a faster kernel. Open "
+          "question this flag answers: custom_vjp type-checks the e4m3 primal against the "
+          "deliberately-bf16 weight-grad cotangent, which raw autodiff tolerates -- the layer-level "
+          "handwritten-bwd wrapper hit exactly that. If this compiles, the wall does not apply here."
+      ),
+  )
   moe_fold_wo_scale_in_gather: bool = Field(
       False,
       description=(
