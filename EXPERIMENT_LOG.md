@@ -1585,3 +1585,39 @@ Mosaic blocker (reviewer notes tgmm:371 already reshapes to trailing-1 and compi
 - **Step time on real data with MTP: 6.4-6.9 s** vs 4.508 s synthetic/no-MTP. Unexplained +42%;
   MTP adds a 62nd layer and its own loss, real routing replaces random, chunks=1 replaces 2. Profile
   was captured (skip 5, 2 steps). NOT yet attributed -- do not quote a cause.
+
+### CONVERGENCE ACHIEVED — siv-cn-conv1 hit target_eval_loss=3.60 at step 192 [2026-08-15]
+`Training stopped: Target loss self.config.target_eval_loss=3.6 is achieved.` EXIT_CODE=0.
+**eval loss 3.599 at step 192**, from `lm_loss 5.350` at step 0. Training wall time ~41 min
+(first step 22:33:34, stop 23:14:30) on 8x8x8 = 512 chips / **1024 devices**.
+
+- **Config:** fp8 ship stack (`moe_bwd_inkernel_quant` + `_dlhs`, `moe_fold_wo_scale_in_gather`,
+  cv-wag e4m3, ring cotangent AG, `moe_x_sorted=device`), **rbf=-1**, chunks=2, MTP
+  (`mtp_num_layers=1`), grouped routing (`n_routing_groups=8 topk_routing_group=4`), real
+  c4/en:3.0.5 pre-tokenized `ids` + llama3 tiktoken, reference LR schedule verbatim, pdbs=1.
+  Restored from the pristine `ckpt0424-fsdp` (reshard-on-read).
+- **eval curve:** 5.52(s7) 5.18(17) 5.27(27) 5.00(37) 4.98(47) 4.84(57) 4.71(67) 4.56(77) 4.39(87)
+  4.29(97) 4.14(107) 3.99(117) ... 3.641(187) 3.635 3.622 3.621 3.616 **3.599(192)**.
+- **BATCH ARITHMETIC (corrected by the user):** the reference batch is **64M tokens** = 16384 seqs
+  at seqlen 4096. conv1 ran `global_batch_size_to_train_on: 1024` seqs = **4.19M tokens/step, 1/16
+  of the reference** (my earlier "half" was wrong -- it came from a recalled 2048-seq figure).
+  192 steps x 4.19M = **~805M tokens to target**.
+- **v7x chips vs cores:** 512 chips = 1024 devices; `per_device_batch_size` is per CORE. This is the
+  factor that made the batch look smaller than it was.
+- Step time 11.7 s/iteration INCLUDING a per-step eval (`eval_interval=1 eval_steps=1`); train-only
+  is not separable from the log because JAX async dispatch hides the split. NOT attributed.
+- One SIGTERM (EXIT_CODE=143) at step 24 from cluster contention; auto-restarted from its own step-0
+  checkpoint and ran clean to target.
+
+### 16x16x16 (4096-chip) slice composition FAILED first try
+`siv-cn-conv4k`: `SliceCreationFailed` -- `AttachMIGsToMMIG failed: ... Currently used multi-MIG
+must be detached first before the new one can be set.` Infra-level node/multi-MIG conflict, NOT a
+config error, and it does not self-heal (sat failed 25 min). Fix = delete + relaunch (conv1 had just
+released its 128 nodes). Note `JobCreationFailed` from the Warden webhook appears alongside and IS
+the usual transient -- the authoritative signal is `kubectl get slices.accelerator.gke.io` STATE.
+
+### conv4k design (4096 chips = 8192 devices, pdbs=2)
+`ici_fsdp_parallelism=1024 ici_expert_parallelism=8`, pdbs=2 -> **16384 seqs = 67.1M tokens/step =
+the reference 64Mi batch exactly**. So the reference LR schedule is the CORRECT pairing and needs no
+scaling (an earlier suggestion to scale it up was based on the wrong reference batch). If
+convergence is token-limited, conv1's 805M tokens is **12 steps** at this batch.
