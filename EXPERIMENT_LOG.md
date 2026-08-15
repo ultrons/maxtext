@@ -1532,3 +1532,27 @@ correct BY CONSTRUCTION rather than by accidental precondition.
 GMM accumulator -- likely bf16 by gmm_v2 default, never checked, sits under the largest matmuls;
 (3) the hardcoded 512 in-kernel quant block size, never swept; (4) re-derive the tgmm per-row-scale
 Mosaic blocker (reviewer notes tgmm:371 already reshapes to trailing-1 and compiles).
+
+### ckpt0424-fsdp store geometry [2026-08-15] — MEASURED, and the plan's premise was wrong
+- **`_sharding` decodes to a mesh of `fsdp=16`, every other axis 1, `expert=1`.** It is NOT
+  `fsdp=128 / ep=4` as recorded. Read from `gs://.../ckpt0424-fsdp/0/items/_sharding` (base64 keys,
+  JSON values) — 52 params, every one on the same 16-device mesh.
+- **Chunking (tensorstore `chunk_layout`, this session):** all three routed-expert arrays are
+  `[256, 58, 7168, 2048]` bf16 (435 GB each) with `read_chunk = write_chunk = [256, 58, 32, 2048]`
+  = **1.946 GB**, codec `sharding_indexed` + **zstd level 3**, inner chunk == outer shard.
+  `wo` is `[256, 58, 2048, 32]`, same size. The **expert axis is never split** — every chunk carries
+  all 256 experts and all 58 layers.
+- `read_chunk` is tensorstore's minimum read granularity, so **no sub-chunk partial read exists**.
+  Measured: reading one target-device slice `[32,1,56,2048]` = 7.34 MB took **14.15 s** (two whole
+  chunks, ~3.9 GB, fetched and zstd-decompressed to keep 7 MB). A second, disjoint slice: 13.89 s.
+- **Derived:** a device's whole `wi_0` shard (0.426 GB) lives in 2-3 chunks, so ~5.3 GB pulled per
+  device per array, ~12x amplification, order **16 TB egress / ~128 GB per host** across 1024
+  devices and three arrays. Not obviously fatal at real per-host bandwidth -> measure, don't model.
+- `_METADATA` reports `write_shape` 448 on the embed axis (the fsdp=16 process shard) while
+  tensorstore reports a 32-wide chunk. Both are true and they are different things; the one that
+  governs read cost is `read_chunk`.
+- **Consequence for the reshard plan:** the fallback is a *streaming re-chunk* (read one 1.946 GB
+  chunk, write it under an expert-split chunk grid), which runs in bounded memory on an ordinary box.
+  ">= 1.6 TB RAM" is no longer the headline infra requirement.
+- Dataset confirmed: `gs://.../tfds-reshard/c4/en/3.0.5/features.json` has exactly one feature,
+  `ids` (int32 Sequence) -> `train_data_columns=[ids] tokenize_train_data=False` is mandatory.
