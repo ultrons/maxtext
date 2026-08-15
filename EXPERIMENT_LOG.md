@@ -1483,3 +1483,29 @@ siv-cn-ctwc4: real routing, rbf=-1, sanitizer AND unsort mask OFF, in-kernel qua
 - **Open call:** the e4m3 ct wire buys 0.086 s (4.599 -> 4.513) for ~0.003 eval. Cheap, but it is the
   first lever in this campaign that is NOT numerically free, so it should be a deliberate choice
   rather than folded into the default.
+
+### Review fixes: NO REGRESSION [2026-08-15] — 4.508 s, loss unchanged
+siv-cn-fixchk on image 1410-up2-fixes (commit bfdf9dbff): **4.508 s vs 4.510 pre-fix** (within noise),
+loss 8.874/8.825/8.784 IDENTICAL. All four correctness fixes (C reciprocal-overflow guard, A drhs
+unscale, B packed-mode raise, F single-bf16-scale round trip) are free. The ship config is now
+correct BY CONSTRUCTION rather than by accidental precondition.
+
+### NEXT LEVER ANALYSIS — all-reduce.236 (the wi weight amax)
+- 102.9 KB @ **0.4 GB/s**, 116 ms/step (grew from 75 ms). Pure LATENCY, not bandwidth: 61 sequential
+  small all-reduces, one per layer, serialized by scan_layers.
+- **WHICH amax:** `_cv_scale(w) = max|w| over axis=(0,1) / 448`. For **wo** [exp, mlp, embed_full] the
+  sharded dim (embed) IS the output dim n, so each shard owns its slice -> NO all-reduce (this is the
+  "local (wo) amax"). For **wi** [exp, embed, mlp] the sharded embed dim is INSIDE the reduction, so
+  the per-output-channel amax needs a cross-shard all-reduce. all-reduce.236 is the wi amax.
+- **Option (d) REJECTED without a run:** switching cv-wag to the config's `fixed,-1,1` static scale
+  would delete the all-reduce entirely, but `fixed,-1,1` scales by 1/448 over a [-1,1] range while
+  routed-expert weights have amax well below 1 -- that wastes most of the e4m3 range and costs
+  roughly log2(1/amax) bits. The static-vs-dynamic c4 result (4.602 vs 4.611) does NOT transfer: it
+  measured the qwix dot_general path, not cv-wag's per-channel weight scale.
+- **Option (a) amortize across steps** is the sound one: the weight amax moves slowly, so recompute
+  every N steps and reuse. Cost is threading the scale through the train state (it must persist
+  across jit boundaries), which is real but contained.
+- **Precision-slate note this exposes:** the config says `weight_quantization_calibration_method=
+  fixed,-1,1` yet cv-wag computes a DYNAMIC per-channel amax for the MoE expert weights. Our
+  "static" recipe is static for attention and dynamic for the experts. Worth confirming, because it
+  changes what the static-vs-dynamic c4 comparison actually measured.
