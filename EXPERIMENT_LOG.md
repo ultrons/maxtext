@@ -1430,3 +1430,30 @@ rbf=2 record (4.251) now **0.26 s**, from 1.22 s.
   targets exactly the elementwise cost this arm just showed is NOT the binding constraint. Price it
   by measuring the AG's exposed fraction FIRST (parse_trace --collectives), not by assuming.
 - Keeping ctw2 (equivalent speed, simpler, loss matches fold1 exactly).
+
+### DESIGN [2026-08-15] — e4m3 cotangent straight into the consumers (round-trip removal)
+Agreed shape (user): feed the QUANTIZED cotangent to both consumers; dequant+requant only inside
+the tgmm; leave the gmm path simple.
+
+- **dlhs gmm: no new logic.** `lhs_is_wide` already declines to re-quantize an 8-bit lhs, and
+  `ops.py` already applies a pre-quantized lhs's scale to the OUTPUT
+  (`if isinstance(dlhs_dout, qpl.QArray): dlhs *= dlhs_dout.scale`), which lands on [m,2048] --
+  smaller than the [m,7168] dequant it replaces. dlhs contracts over n, so a per-TOKEN scale
+  factors out cleanly.
+- **drhs tgmm: needs a per-row dequant before its EXISTING quantize.** tgmm contracts over m, so a
+  per-token scale sits INSIDE the sum and does NOT factor out. The tgmm already computes a
+  per-gm-tile-per-channel amax (quantize_operands), so we only insert a per-row multiply on
+  VMEM-resident tile data -- no extra HBM traffic. Equivalent algebra: fold s[m] into the OTHER
+  operand (lhs'[m,k] = lhs[m,k]*s[m]); lhs and rhs tiles share the same row range, so ONE per-row
+  vector serves both.
+- **THE BLOCKER (found while implementing):** the kernel needs a PER-ROW scale operand, and a
+  [rows,1] BlockSpec hits the Mosaic trailing-size-1 restriction (CLAUDE.md: no trailing size-1
+  dims; no [:,None]). Options: (a) pass it with a real lane width [m, num_lanes] and use column 0 --
+  the shape `tgmm_block.py` already uses for its per-gm scale rows ([max_num_gm, aligned_k]), costs
+  m*128*4 = 67 MB = ~7% of the 940 MB e4m3 payload; (b) reuse the tgmm_block per-gm-segment scale
+  layout directly. (a) is the known-good pattern.
+- **Why a scalar scale is the tempting shortcut and why we rejected it:** only a scale constant in
+  BOTH m and n factors out of both contractions -- which is exactly why moe_fp8_dispatch_wire uses a
+  global amax. We keep per-token to stay at the per-channel floor this recipe committed to.
+- **Do NOT re-materialize a bf16 copy for the tgmm:** that rebuilds the second full-buffer array the
+  shared-cotangent lever deleted (−0.212 s), so it is self-defeating.
