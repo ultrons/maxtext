@@ -1413,3 +1413,20 @@ now **0.35 s**, from 1.22 s.
 **LADDER (rbf=-1, all loss 8.783-8.784):** 5.474 -> 5.129 -> 4.884 -> 4.811 -> 4.599 -> **4.513**
 (1497 -> 1815 TPS-chip). Total **−0.961 s / +21%**; sanitizer + unsort mask retired; gap to the
 rbf=2 record (4.251) now **0.26 s**, from 1.22 s.
+
+### ctw2 (bf16 elementwise) VERDICT [2026-08-15] — NEUTRAL (4.510 vs 4.513); my diagnosis was WRONG
+- Narrowed the ct-wire quantize/dequant elementwise work from f32 to bf16. **MEASURED: 4.510 s vs
+  ctw1's 4.513 -- within noise.** Loss 8.874/8.825/8.784 (back to matching fold1 exactly; ctw1's
+  one-tick 8.875 was the f32 rounding path).
+- **This REFUTES my explanation of the 86ms-vs-165ms gap.** I attributed the shortfall to the
+  elementwise cost the lever adds; halving those bytes bought nothing, so that was not the cause.
+  Fourth wrong prediction this session.
+- **Better explanation (consistent with everything else measured today): the cotangent AG is
+  PARTLY OVERLAPPED.** Halving the bytes of a partly-hidden collective returns only the exposed
+  fraction -- the same 1:6-ish conversion that governed the shared-cotangent lever. 86ms of an
+  ~165ms byte saving is right in that band.
+- **IMPORTANT CONSEQUENCE: do NOT build the dequant round-trip removal yet.** That is a substantial
+  plumb (e4m3 qvalue + per-token scale threaded to gmm_v2, relying on the lhs_is_wide guard), and it
+  targets exactly the elementwise cost this arm just showed is NOT the binding constraint. Price it
+  by measuring the AG's exposed fraction FIRST (parse_trace --collectives), not by assuming.
+- Keeping ctw2 (equivalent speed, simpler, loss matches fold1 exactly).
