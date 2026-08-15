@@ -1556,3 +1556,32 @@ Mosaic blocker (reviewer notes tgmm:371 already reshapes to trailing-1 and compi
   ">= 1.6 TB RAM" is no longer the headline infra requirement.
 - Dataset confirmed: `gs://.../tfds-reshard/c4/en/3.0.5/features.json` has exactly one feature,
   `ids` (int32 Sequence) -> `train_data_columns=[ids] tokenize_train_data=False` is mandatory.
+
+### RESHARD-ON-READ WORKS — and the TPU slice IS the reshard box [2026-08-15]
+`siv-cn-ckptload2`, 8x8x8, ship stack at rbf=-1, MTP on, grouped routing off, chunks=1,
+`checkpoint_storage_concurrent_gb=1024`, real c4/en:3.0.5 + llama3 tiktoken,
+`load_parameters_path=gs://mlperf-6-submission-us-central1/ckpt0424-fsdp/0/items`.
+
+| stage | wall clock |
+|---|---|
+| restore (fsdp=16/ep=1 store -> fsdp=128/ep=8 mesh) | **21:29:03 -> 21:34:10 = 5 min 07 s** |
+| save at step 0 (our sharding, full train state) | 21:36:06 -> 21:39:18 = 3 min 12 s (41.3 s serialize, 612 MiB/s/host, 24.8 GiB/host) |
+
+- **The weights arrived.** Step 0 `lm_loss 5.349` / `mtp_loss 0.654` / perplexity 210, and the curve
+  is stable across 12 steps (5.349, 5.345, 5.321, 5.309, 5.303, 5.265, ...). Random init would read
+  ~8.8; a wrong tokenizer would read higher still and erratic. MTP is live and producing a sane
+  auxiliary loss, so `mtp_block` restored too.
+- **The 12x read amplification is affordable when the read is distributed.** ~128 GB/host over 128
+  hosts finished in 5 min, versus the ~275 MB/s a single CPU stream managed locally. **The ">=1.6 TB
+  RAM host" requirement is DELETED** -- the model is 1.34 GB/device at fsdp=128/ep=8, so no address
+  space ever holds a full copy.
+- **`save_checkpoint_on_start: True` fires by default**, so the probe wrote the resharded checkpoint
+  as a side effect: `gs://sivaibhav-exp/1410-a2a/siv-cn-ckptload2/checkpoints/0`. Its `_sharding`
+  verifies `mesh={fsdp:128, expert:8}` with MoE `wi_0` pspec `['expert', None, 'fsdp', None]` --
+  exactly our target. 225 entries (params + opt_state).
+- **Caveat on that artifact:** MaxText saves at step N *after* step N runs, so those params are one
+  adamw step (at warmup lr) away from the source. `siv-cn-reshard1` redoes it at `learning_rate=0.0`,
+  `steps=1`, to a stable path `gs://sivaibhav-exp/ckpt-reshard/ds671b-fsdp128-ep8/checkpoints/0/items`.
+- **Step time on real data with MTP: 6.4-6.9 s** vs 4.508 s synthetic/no-MTP. Unexplained +42%;
+  MTP adds a 62nd layer and its own loss, real routing replaces random, chunks=1 replaces 2. Profile
+  was captured (skip 5, 2 steps). NOT yet attributed -- do not quote a cause.
