@@ -145,7 +145,7 @@ def _ring_ct_rs_fwd(output, mesh, ep_name, collective_id):
 
 
 def _ring_ct_rs_bwd(mesh, ep_name, collective_id, _res, ct):
-  return (ring_all_gather(ct, mesh, (ep_name,), 0, collective_id),)
+  return (_fp8_wire_all_gather(ct, mesh, ep_name, collective_id),)
 
 
 _ring_ct_reduce_scatter.defvjp(_ring_ct_rs_fwd, _ring_ct_rs_bwd)
@@ -166,12 +166,38 @@ def _ring_combine_rs(output, mesh, ep_name, rs_collective_id, ag_collective_id):
   return ring_reduce_scatter(output, mesh, ep_name, 0, rs_collective_id)
 
 
+def _fp8_wire_all_gather(ct, mesh, ep_name, collective_id):
+  """Ring all-gather of a cotangent with an e4m3 WIRE and a PER-TOKEN scale.
+
+  MOE_FP8_CT_WIRE=1 enables it. The combine cotangent (`shard_map.4148/4149`, bf16[8,2048,7168] =
+  235 MB/call, 333 ms/step -- the largest single item in the step) is quantized to e4m3 downstream
+  ANYWAY: it becomes the wo gmm's dlhs_dout under bwd_quantization_dtype=e4m3. So sending it e4m3
+  RELOCATES a rounding rather than adding one, and halves both the ICI bytes and the kernel's HBM
+  traffic. ring_all_gather sizes transfers from x.dtype.itemsize, so it needs no change to move fp8.
+
+  Per-token (per-row) scale, not a global amax: a single amax over [tokens, embed] is far coarser
+  than the GMM's per-row-per-512-block and below this recipe's per-channel floor. The scales ride a
+  plain XLA all_gather -- [tokens,1] f32 is tiny (0.06% of the payload), and keeping it off the
+  Pallas path avoids the trailing-size-1 Mosaic layout restriction entirely.
+  """
+  import os as _os
+
+  if _os.environ.get("MOE_FP8_CT_WIRE", "0") != "1":
+    return ring_all_gather(ct, mesh, (ep_name,), 0, collective_id)
+  _f32 = ct.astype(jnp.float32)
+  _scale = jnp.max(jnp.abs(_f32), axis=-1, keepdims=True) / 448.0 + 1e-20
+  _q = jnp.clip(_f32 / _scale, -448.0, 448.0).astype(jnp.float8_e4m3fn)
+  _qg = ring_all_gather(_q, mesh, (ep_name,), 0, collective_id)
+  _sg = jax.lax.all_gather(_scale.astype(jnp.float32), axis_name=ep_name, axis=0, tiled=True)
+  return (_qg.astype(jnp.float32) * _sg).astype(ct.dtype)
+
+
 def _ring_combine_rs_fwd(output, mesh, ep_name, rs_collective_id, ag_collective_id):
   return _ring_combine_rs(output, mesh, ep_name, rs_collective_id, ag_collective_id), None
 
 
 def _ring_combine_rs_bwd(mesh, ep_name, rs_collective_id, ag_collective_id, _res, ct):
-  return (ring_all_gather(ct, mesh, (ep_name,), 0, ag_collective_id),)
+  return (_fp8_wire_all_gather(ct, mesh, ep_name, ag_collective_id),)
 
 
 _ring_combine_rs.defvjp(_ring_combine_rs_fwd, _ring_combine_rs_bwd)
