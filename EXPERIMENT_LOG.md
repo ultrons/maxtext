@@ -1368,3 +1368,22 @@ Projected ~120 ms/step at the measured 1:6 VPU-to-step conversion.
 -> 4.884 in-kernel both (1677) -> 4.811 +shared cotangent (1703) -> **4.599 +fold+no-mask (1781)**.
 Total **−0.875 s / +19% TPS**, sanitizer AND mask both retired. Gap to the rbf=2 record (4.251) is
 now **0.35 s**, from 1.22 s.
+
+### moe_wgrad_rs_sched_group VERDICT [2026-08-15] — NET NEGATIVE (+0.129s); scheduling tags lose again
+- **Context:** the weight-grad RS is EXPOSED ~217ms/step but measured AT SPEED (272 GB/s isolated,
+  73% of the two-dim bidirectional ceiling), so placement was the only lever left for it.
+- **I predicted this route was BLOCKED** by the e4m3-primal/bf16-cotangent asymmetry (the layer-level
+  manbwd wrapper hit exactly that). **WRONG -- it compiles fine at the in-body gather site.** Cost of
+  testing the prediction instead of asserting it: one 10-minute AOT. Third wrong prediction this
+  session; all three were cheap to test and expensive to assume.
+- **MEASURED (siv-cn-wgrs2): 4.728 s/step, 1733 TPS-chip, loss 8.784** (digit-identical, as expected
+  -- a scheduling tag cannot change numerics) vs fold1 4.599. **Δ +0.129 s = NET NEGATIVE.**
+- **VERDICT: reject.** Tagging the weight-grad RS into a scheduling group makes the step SLOWER.
+  Consistent with the whole campaign's record on scheduling annotations (co-schedule groups, hoist,
+  stagger, splash-group, barrier -- all null or harmful); the ONLY annotation that ever won here was
+  the forward-only weight-AG tag. Adding a backward collective to a group appears to constrain the
+  scheduler more than it helps, matching the documented cycle/serialize hazard.
+- **What this closes:** the weight-grad RS now has NO cheap lever. It is at speed (kernel rewrite
+  worth ~50ms, not worth it), isolation is worth ~40ms, and placement-by-annotation is NEGATIVE. Its
+  ~217ms exposure is structural. Park it; spend the effort on the wire experiments instead.
+- Flag kept at default 0 (off) for the record; the probe value is the measurement, not the feature.
