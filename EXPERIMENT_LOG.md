@@ -1770,3 +1770,37 @@ All LOGGED step times, all single-slice 8x8x8, same ship stack, same
   includes the per-step eval while the profiler's step marker does not.
 - **Actionable:** `eval_interval=10` recovers ~2.7 s/step and still gives fine resolution on a
   192-step curve. The input pipeline deserves its own investigation. Neither touches the fp8 stack.
+
+### CORRECTION — the input pipeline is NOT the cost; real-token ROUTING is [2026-08-16]
+The previous entry's "real-data input pipeline = ~4.25 s" is **WRONG**. Disproved by
+`siv-cn-vreuse`: identical to `vnoev` but with **`reuse_example_batch=1`** (one batch loaded once,
+reused every step, so per-step data acquisition is ZERO).
+
+| arm | per-step data loading | s/step |
+|---|---|---|
+| siv-cn-vnoev | fresh batch every step | 9.056 |
+| **siv-cn-vreuse** | **same batch reused** | **8.997** |
+
+**Delta 59 ms.** The input pipeline costs essentially nothing. Everything proposed to fix it
+(`expansion_factor_real_data`, prefetch depth, shuffle buffer, multihost_dataloading barriers,
+GCS latency) was aimed at the wrong target. Also ruled out with receipts along the way: bandwidth
+(16.8 MB/step globally = 131 KB/host), shard starvation (**2048 shards vs 128 hosts**, so the
+`Dataset.shard` read-amplification fallback never fires), record volume (data is pre-packed to
+~3540 tokens/record => ~8 records/host/step).
+
+**What `vreuse` actually isolates:** no per-step data cost, same MTP, same grouped routing, same
+gate-driven routing as the synthetic arms -- yet 8.997 s vs a synthetic-equivalent ~4.80 s
+(4.508 + 0.130 MTP + 0.163 gate routing + 0.004 grouped). **The only remaining difference is what
+the tokens ARE.** Synthetic tokens are random => near-uniform expert assignment. (This is also why
+`vrrt` looked cheap: it disabled random *routing* but the gate still consumed synthetic
+activations, so the distribution stayed balanced.) Real text routes with heavy skew, and the ragged
+grouped-matmul critical path follows the largest group. Matches the profile: VPU +2.36 s and
+exposed SC +1.39 s (sort/gather/scatter/ragged work, which scales with skew) while MXU barely moved.
+
+=> **1817 TPS/chip is a SYNTHETIC-DATA number. ~4.2 s/step of real-data cost is expert load
+imbalance.** Caveat: vreuse/vnoev/vev1 ran from RANDOM INIT (untrained gate). But conv1 (trained
+checkpoint) 11.7 s vs vev1 (random init) 12.064 s at the same eval cadence => a trained gate helps
+only marginally; the effect survives training.
+**MECHANISM NOT YET PROVEN** -- "skew" is an inference that fits, not a measurement. Next probe:
+`vreuse` + `use_random_routing=true` (same real tokens, forced balanced assignment, no code change).
+If it drops to ~4.8 s the mechanism is proven; if it stays ~9 s the story is wrong.
