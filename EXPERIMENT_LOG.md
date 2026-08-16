@@ -1928,3 +1928,43 @@ Found while trying to reach `moe_save_sort_indices` from the ship config:
 **Price of the chain, measured:** mbwd3 (handwritten, no cv-wag, no fold) **7.368 s** vs gtopk1
 (ship + fast_group_topk) **6.818 s** = **+0.55 s**. So fixing the dtype cast at deepseek.py:1110 is
 worth at most ~0.55 s, and on this evidence the hand-written backward brings no routing win with it.
+
+### Exposed weight gathers on the 6.818 s config + FOUR MORE NULL scheduling levers [2026-08-16]
+Profile `siv-gtopk1-6818` (dropdown). **The binder FLIPPED to SparseCore** once the sorts went:
+
+| | conv1 (8.82 profiled) | gtopk1 (6.74 profiled) |
+|---|---|---|
+| TC | **6.34 (binder)** | 3.96 |
+| - vpu | 3.71 | **1.41** |
+| SC | 4.53 (exposed 2.42) | **4.87 (binder), exposed 2.71** |
+
+So part of the 2.18 s win was deleted work, and the collectives that VPU used to mask are now exposed.
+
+**True overlap (`parse_trace --collectives`):** all-gather 58.2% (6920 ms stall), reduce-scatter 44.1%
+(3393 ms), all-reduce 67.1% (361 ms); overall 55%. Worst: **all-gather.472 29%, all-gather.474 22%,
+reduce-scatter.57 20%**.
+**The two fp8 weight AGs are LATENCY-bound, not bandwidth-bound:** all-gather.474 = 5.4 MB @
+**0.3 GB/s**, all-gather.554 = 16.0 MB @ **1.1 GB/s**, vs all-gather.560 = 1.02 GB @ **315 GB/s**.
+~1.0 s/step in those two alone. (wi amax all-reduce.332: 106 KB @ 0.1 GB/s, ~98 ms/step.)
+
+**`what_if --reschedule-collectives`:** `step 6.74s | SC exposed 3.45s | hideable 1.80s -> 4.95s
+(1.36x)`. all-gather.473 (632 ms) and all-gather.553 (411 ms) are FULLY hideable = 58% of the prize;
+616 ms is **dep-locked** (no free compute cover). Projected TPS/chip 1201 -> **~1640 (+36%)**
+[8192 tok/chip/step; ceiling is the tool's model, HBM not modeled -- PROJECTED].
+
+**Levers tested against 6.818 s -- ALL NULL OR NEGATIVE:**
+| arm | change | s/step | delta |
+|---|---|---|---|
+| wagsg | `moe_weight_ag_scheduling_group=true` | 6.817 | -0.001 (null) |
+| agdepth | `xla_tpu_sparse_core_all_gather_latency_multiplier` 1->8 | 6.862 | +0.044 |
+| scmulti | `xla_tpu_use_single_sparse_core_for_all_gather_offload` true->false | 6.954 | **+0.136 WORSE** |
+
+- **The single-SC hypothesis is REFUTED** -- allowing all SCs to service AG offload is WORSE.
+- That is now 4 more null scheduling levers on top of the earlier hoist/stagger/splash-group/barrier
+  set. **The consistency of the null IS the finding**; stop hunting flags.
+- **NEXT (the only sound one):** a MINIMAL 2-op probe -- one big matmul + one all-gather with NO data
+  dependency, annotated into a scheduling group -- to establish whether the annotation mechanism
+  overlaps ANYTHING. If a 2-op program will not overlap, every annotation experiment on the full
+  model has been uninterpretable. Leading suspect if it DOES work: the SC Pallas kernels carry no
+  `cost_estimate`, so the layer scheduler believes it has zero-duration work to hide behind
+  (we set cost_estimate_flops_fwd/bwd for splash only).
