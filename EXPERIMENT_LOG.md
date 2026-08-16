@@ -1839,3 +1839,28 @@ Also measured: `compare_profiles` names the mover explicitly (`vpu +2.36s`, bind
 shows fusion count 1981 -> 3484.
 Pending: `siv-cn-vnogrp` (real tokens, real gate, `n_routing_groups=-1`) splits the recoverable
 grouped-routing share from the base-gate share of the 4.35 s.
+
+### moe_fast_group_topk WIN [2026-08-16] — -2.18 s/step (-24%), +32% TPS
+Replaces both `jax.lax.top_k` calls in `expert_group_mask` with max/argmax reductions. Neither
+needed a sort: the top-2 within each group is only SUMMED (indices discarded) so two max passes
+suffice, and the group indices only become a 0/1 mask so k max passes accumulate it directly.
+Commit a5deb88d6, image `1410-up2-gtopk`, flag `moe_fast_group_topk` (default FALSE).
+
+| run | image | path | s/step | TPS/device | lm_loss @19 |
+|---|---|---|---|---|---|
+| siv-cn-vreuse | old | top_k | 8.997 | 455.2 | 9.244 |
+| siv-cn-gtopk0 | new | top_k (flag off) | 8.995 | -- | **9.151** |
+| **siv-cn-gtopk1** | new | **fast (flag on)** | **6.818** | **600.8** | **9.160** |
+
+- **Same-image A/B: 8.995 -> 6.818 = -2.177 s.** Not a build artifact.
+- Recovers **97%** of grouped routing's 2.256 s cost (vnogrp, no grouped routing at all, was 6.741).
+- **NUMERICS -- do NOT claim bit-exact.** CPU equivalence test (bf16 + f32, 3 seeds each, plus a
+  coarse-grid TIE-STRESS case) was exact on scores AND mask. But on cluster:
+  same-path/different-image differs by **0.093** (vreuse 9.244 vs gtopk0 9.151) while
+  same-image/flag-on-vs-off differs by only **0.009**. So run-level variation is >= 0.09 and the
+  flag's effect is BELOW the noise floor. Supported claim: **"indistinguishable from run variation"**,
+  not "bit-exact". A same-image same-flag repeat would be needed to pin the noise floor properly.
+- **METHOD NOTE:** the determinism control (same image, flag off) was essential -- without it the
+  0.09 gap would have read as a numerics regression caused by the change, and the win would have
+  been thrown away.
+- Remaining: the base router `top_k` (k=8 over 256 experts, 2 of the original 6 ops) is untouched.
