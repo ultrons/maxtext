@@ -1743,3 +1743,30 @@ Earlier interpolation said ~138 GB, so the real growth from pdbs=1 (83.3 GB) is 
 CAVEAT: this measures fsdp=128. Some temporaries are fsdp-sharded, so **pdbs=2 at fsdp=1024 remains
 untested** and could conceivably fit. `aot_variant.sh` pins compile_topology AFTER $EXTRA, so it
 cannot be overridden from the args -- edit the script to test another topology.
+
+### Real-data regression ATTRIBUTED [2026-08-16] — input pipeline + eval, NOT MTP
+All LOGGED step times, all single-slice 8x8x8, same ship stack, same
+`ENVX="MOE_UNSORT_BWD_MASK=0 && export MOE_FP8_CT_WIRE=1"`, 20 steps each. One change per arm.
+
+| arm | change | s/step | delta vs 4.508 |
+|---|---|---|---|
+| fixchk | baseline (synthetic, random routing) | 4.508 | -- |
+| siv-cn-vgrpr | + `n_routing_groups=8 topk_routing_group=4` | 4.512 | **+0.004 (noise)** |
+| siv-cn-vmtp | + `mtp_num_layers=1` | 4.638 | **+0.130** |
+| siv-cn-vrrt | + `use_random_routing=false` (still synthetic) | 4.671 | **+0.163** |
+| siv-cn-vnoev | real c4 3.0.5 + MTP + grouped + gate routing, NO eval | **9.056** | **+4.548** |
+| siv-cn-vev1 | same + `eval_interval=1 eval_steps=1` | **12.064** | **+7.556** |
+
+- **Per-step eval = +3.008 s** (vev1 - vnoev, same instrument). The eval forward is only 0.6 s of
+  device time, so most of this is the eval INPUT PIPELINE + sync, not compute.
+- **Real-data input pipeline = ~4.25 s** (vnoev's +4.548 minus the 0.297 s of model-side changes).
+  Corroborated by Host-DMA 0.107 -> 0.671 s in the profile A/B.
+- **MTP is 130 ms of a ~7.2 s regression (<2%).** The earlier suspicion that MTP's second vocab head
+  drove the VPU growth is REFUTED.
+- **METHOD ERROR, corrected:** an earlier version of this analysis divided a LOGGED numerator
+  (+0.30 s of arm deltas) by a PROFILED denominator (+4.32 s = conv1 8.82 vs fixchk 4.50 profiled).
+  Like-for-like logged is conv1 11.7 vs fixchk 4.508 = **+7.2 s**. Also note conv1's logged (11.7)
+  and profiled (8.82) step disagree by 2.9 s -- hypothesis (UNVERIFIED) is that the logged step
+  includes the per-step eval while the profiler's step marker does not.
+- **Actionable:** `eval_interval=10` recovers ~2.7 s/step and still gives fine resolution on a
+  192-step curve. The input pipeline deserves its own investigation. Neither touches the fp8 stack.
