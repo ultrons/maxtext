@@ -1659,3 +1659,32 @@ step metric was logged. Script: `conv_run_2kga.sh`.
 
 **To resume:** one uninterrupted 2048-chip run of `bash conv_run_2kga.sh <name>` answers the 50-step
 question. Needs the cluster's large-slice composition healthy; escalate to the cluster owner.
+
+### MULTISLICE IS FUNCTIONAL on bodaborg-super-tpu7x-y6k [2026-08-16] — +16% step, -14% TPS/chip
+`siv-cn-ms2`: **2 x 8x8x8** (`--num-slices=2`), `dcn_data_parallelism=2` set explicitly,
+ici fsdp=128/ep=8 unchanged, pdbs=1, ship stack at rbf=-1, synthetic, 20 steps, **EXIT_CODE=0**.
+
+| | 1 slice (record cfg) | 2 x 8x8x8 |
+|---|---|---|
+| step time | 4.508 s | **5.25 s** (5.242-5.258, no variance) |
+| chips | 512 | 1024 |
+| tokens/step | 4,194,304 | 8,388,608 |
+| **TPS/chip** | **1817** | **1562** |
+
+- Receipts: `Config param dcn_data_parallelism: 2`, `num_slices: 2`,
+  `global_batch_size_to_train_on: 2048`, `total_weights: 8388608` (= 2048 x 4096 exactly).
+- Loss falls 10.048 -> 9.723 over the last 7 steps on synthetic => the DCN gradient all-reduce is
+  REAL (the slices are not training independently).
+- **Cost of the DCN reduction: +0.74 s/step (+16.4%), -14% TPS/chip.** Measured at 2 slices only;
+  do NOT assume it stays flat at 4 or 8 slices.
+- **Unblocks the 4096-chip target**: 8 x 8x8x8 over DCN sidesteps the `AttachMIGsToMMIG` ICI
+  composition failures entirely. Needs its own measurement.
+
+### Slice-size gradient of composition health [2026-08-16]
+512 chips (8x8x8): composes reliably (conv1 70 min, ga512, and BOTH ms2 slices at 11:29).
+2048 chips (8x16x16): composed at 23:27 and 23:37, then torn down / DEACTIVATING.
+4096 chips (16x16x16, 8x16x32): never composed, 3 attempts, `AttachMIGsToMMIG`.
+**CORRECTION to an earlier claim in this log's narrative: the 8x16x32 run NEVER COMPILED** (slice
+never created, 0 pods, 172-byte log = kubectl error only). The OOM was a DIFFERENT run, `conv2k`
+at **pdbs=4** on 8x16x16. **pdbs=2 has never been tested** -- the ~138 GB figure is interpolation
+between 83.3 GB (pdbs=1, measured) and 248 GB (pdbs=4, measured), NOT a measurement.
