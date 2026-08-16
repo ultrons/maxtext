@@ -1804,3 +1804,38 @@ only marginally; the effect survives training.
 **MECHANISM NOT YET PROVEN** -- "skew" is an inference that fits, not a measurement. Next probe:
 `vreuse` + `use_random_routing=true` (same real tokens, forced balanced assignment, no code change).
 If it drops to ~4.8 s the mechanism is proven; if it stays ~9 s the story is wrong.
+
+### REAL-DATA REGRESSION, FINAL ATTRIBUTION: it is the ROUTING PATH (top_k), ~4.35 s/step [2026-08-16]
+Both prior attributions (input pipeline, then expert load skew) were WRONG. The decisive pair --
+identical real tokens, SAME reused batch, MTP + grouped routing both on, no eval, only the gate differs:
+
+| arm | gate | s/step |
+|---|---|---|
+| siv-cn-vreuse | real gate (`use_random_routing=false`) | **8.997** |
+| siv-cn-vbal | gate BYPASSED (`use_random_routing=true`) | **4.651** |
+| | | **delta 4.346** |
+
+Same tokens on both sides => it is NOT the data, NOT the pipeline, NOT load skew. It is the cost of
+COMPUTING the gate.
+
+**Mechanism, from `report_timing` + `explain` on the conv1 profile:** the top SIX ops are all
+`top_k.*` at ~2.107 s each = **26.3% of the profile**, ~2.34 s/step, which matches the profile A/B's
+VPU delta (+2.36 s) almost exactly. `explain` traces them to `moe.py:1219` and `moe.py:1257`:
+`expert_group_mask` runs **two** `top_k` (top-2 within each of 8 groups, then top-4 of groups) and
+the router runs a **third** on the masked logits => 3 per router x 2 routers (main + **MTP has its
+own MoE block**) = 6. They run at **10 GFLOP/s / 2.58 GB/s HBM, `Category: sort`** -- a top-2 over
+32 elements implemented as a full sort. Latency-bound, almost no arithmetic. **Optimization target,
+not an inherent real-data cost.**
+
+**METHODOLOGY HOLE (the reason this took three attempts):** the one-factor-at-a-time arms MISSED it.
+- `vgrpr` (grouped routing, +0.004 s) inherited `use_random_routing=true` from the base MT string,
+  which BYPASSES the gate => grouped routing was DEAD CODE in that arm.
+- `vrrt` (real routing, +0.163 s) had no grouped routing => paid for only the single base `top_k`.
+- **The cost lives in the INTERACTION of the two flags.** OFAT is blind to interactions; when a
+  factor can be disabled by another factor, the "cheap" verdict may just mean "never executed".
+- Corollary: **`grouped routing is free` is RETRACTED.** It is free only when routing is random.
+
+Also measured: `compare_profiles` names the mover explicitly (`vpu +2.36s`, binder unchanged) and
+shows fusion count 1981 -> 3484.
+Pending: `siv-cn-vnogrp` (real tokens, real gate, `n_routing_groups=-1`) splits the recoverable
+grouped-routing share from the base-gate share of the 4.35 s.
