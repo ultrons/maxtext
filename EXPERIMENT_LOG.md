@@ -1864,3 +1864,37 @@ Commit a5deb88d6, image `1410-up2-gtopk`, flag `moe_fast_group_topk` (default FA
   0.09 gap would have read as a numerics regression caused by the change, and the win would have
   been thrown away.
 - Remaining: the base router `top_k` (k=8 over 256 experts, 2 of the original 6 ops) is untouched.
+
+### CORRECTION to the gate-cost decomposition [2026-08-16] — random routing does NOT skip the GEMM or the token sort
+`use_random_routing` branches INSIDE `get_topk` (moe.py:1130), which already RECEIVES `gate_logits`.
+So `vbal` (random routing) still pays: the **router GEMM**, the **SparseCore ragged TOKEN sort**, and
+the expert GMMs. It skips only the SELECTION (base top-8 + the two grouped-routing sorts) and the
+deepseek weight math.
+
+=> The 2.09 s (vnogrp 6.741 - vbal 4.651) is **NOT** "base top_k + ragged sort". It is:
+   base top-8 selection + deepseek routing weight math + whatever the DISTRIBUTION change does to
+   the ragged-sort/GMM (random routing balances tokens; real routing skews them).
+   **Selection cost and skew cost are still NOT separated.** The earlier "skew is dead" reading was
+   too strong: skew is excluded from the GROUPED-routing 2.256 s, not from this 2.09 s.
+
+**Terminology, to keep two different sorts straight:**
+- **Score sorting** (what `moe_fast_group_topk` removed): reductions over the EXPERT dimension of the
+  router logits, per token -- top-2 of 32 in a group, top-4 of 8 groups, top-8 of 256 experts.
+- **Token sorting** (untouched): the SparseCore ragged sort in `ragged_sort.py` that groups tokens by
+  assigned expert. Present in BOTH the synthetic 4.508 baseline and the real-data runs, so it is
+  **not net-new cost** on real data.
+
+### Reference implementations agree; only the lowering differs [2026-08-16]
+- **DeepSeek-V3** `inference/model.py` Gate.forward: `group_scores = scores.topk(2,-1)[0].sum(-1)`
+  when a gate bias exists (ours does -- checkpoint has `gate.bias`), else `amax`. Then
+  `group_scores.topk(topk_groups)[1]` -> mask -> `topk(scores, self.topk)`.
+- **Megatron-LM** `moe_utils.py::group_limited_topk`: `scores.view(...).topk(topk // group_topk)[0]
+  .sum(-1)`; with topk=8, group_topk=4 that is **top-2**, identical. Then
+  `torch.topk(group_scores, k=group_topk, sorted=False)` -- **NVIDIA passes `sorted=False`**, an
+  explicit statement that only the SET matters. `jax.lax.top_k` has no such option and always sorts.
+  `group_limited_topk` itself is UNFUSED; the fused path is `fused_topk_with_score_function` (TE,
+  `fused=True`), consistent with NVIDIA's "advanced MoE router optimizations" release note.
+- **=> the algorithm is identical in all three. NVIDIA attacks the cost with a CUDA kernel; we
+  removed the sort at the JAX level.** The `sorted=False` precedent is also the argument that the
+  base top-8-of-256 may not need an ordering either -- next lever, pending a check of the
+  downstream consumers.
