@@ -1898,3 +1898,33 @@ deepseek weight math.
   removed the sort at the JAX level.** The `sorted=False` precedent is also the argument that the
   base top-8-of-256 may not need an ordering either -- next lever, pending a check of the
   downstream consumers.
+
+### moe_save_sort_indices RE-PRICED under REAL routing [2026-08-16] — STILL DEAD (my prediction refuted)
+Hypothesis: the July verdict (+0.11 s, retired) was measured under synthetic/RANDOM routing, where
+there is no top-k search to skip, so the lever's main benefit was invisible. The profile showed 2 of
+the 6 `top_k` ops in `transpose(jvp())/rematted_computation`, predicting ~0.78 s/step recoverable.
+
+| arm | config | s/step | lm_loss@19 |
+|---|---|---|---|
+| siv-cn-mbwd3 | handwritten bwd, real routing, fast_group_topk | 7.368 | 9.033 |
+| siv-cn-mbwdsi3 | + moe_save_sort_indices | **7.333** | 9.043 |
+
+**Delta 35 ms = noise. PREDICTION REFUTED; the July verdict was CORRECT on its merits.** Either the
+hand-written backward does not recompute routing the way the autodiff remat does, or the saved-index
+residual traffic costs what the deleted compute saves (which is what the July note said).
+Checking the suspicion was right; the suspicion itself was wrong.
+
+### THREE SHIP LEVERS ARE MUTUALLY EXCLUSIVE WITH THE HAND-WRITTEN BACKWARD [2026-08-16]
+Found while trying to reach `moe_save_sort_indices` from the ship config:
+1. `moe_handwritten_bwd` + `moe_fp8_cv_weight_ag=true` => **`ValueError: unexpected JAX type ... got
+   bfloat16[256,7168,2048], but expected float8_e4m3fn[256,7168,2048]`** at
+   **`deepseek.py:1110`, `(dp_gather,) = vjp_gather(d_weights)`**. cv-wag gathers weights in e4m3 so
+   the gather's VJP wants an e4m3 cotangent; the hand-written backward hands it bf16. This LOCATES
+   the previously-vague "manual backward cotangent dtype wall" to a single boundary.
+2. Turning cv-wag off then breaks `moe_fold_wo_scale_in_gather`: **`AssertionError: col_scale must be
+   1D [hidden_size]=7168, got (1,)`** -- cv-wag is what produces the PER-CHANNEL wo scale; without it
+   the scale is scalar and the fold asserts.
+=> Reaching the hand-written backward costs BOTH cv-wag and the fold.
+**Price of the chain, measured:** mbwd3 (handwritten, no cv-wag, no fold) **7.368 s** vs gtopk1
+(ship + fast_group_topk) **6.818 s** = **+0.55 s**. So fixing the dtype cast at deepseek.py:1110 is
+worth at most ~0.55 s, and on this evidence the hand-written backward brings no routing win with it.
