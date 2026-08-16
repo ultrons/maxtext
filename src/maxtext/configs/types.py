@@ -1124,6 +1124,20 @@ class MoEGeneral(BaseModel):
           "disappears if BOTH the mask and the scale leave it."
       ),
   )
+  moe_fast_group_topk: bool = Field(
+      False,
+      description=(
+          "Replace the two jax.lax.top_k calls in expert_group_mask (DeepSeek grouped routing) with "
+          "max/argmax reductions. Neither top_k needs a sort: the top-2 within each group is only "
+          "SUMMED (indices discarded), so two max passes give the same value, and the top-k group "
+          "indices are only turned into a 0/1 mask, so k max passes accumulate that mask directly. "
+          "Bit-exact -- jax.lax.top_k and jnp.argmax both break ties toward the LOWER index. "
+          "Measured motivation: the six top_k ops (3 per router x 2 routers, since MTP carries its "
+          "own MoE block) are the top six ops in the real-data profile at ~2.107 s each = 26.3% of "
+          "the profile, running at 10 GFLOP/s as Category:sort -- a top-2 over 32 elements lowered "
+          "to a full sort. Grouped routing measures 2.256 s/step (vreuse 8.997 vs vnogrp 6.741)."
+      ),
+  )
   moe_sanitize_ragged_buffer: bool = Field(
       False,
       description=(

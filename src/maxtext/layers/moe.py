@@ -1216,13 +1216,35 @@ class RoutedMoE(nnx.Module):
         gate_logits,
         gate_logits.shape[:-1] + (self.config.n_routing_groups, -1),
     )
-    top2_in_group_vals, _ = jax.lax.top_k(scores_grouped, k=2)
-    group_scores = jnp.sum(jnp.astype(top2_in_group_vals, jnp.float32), axis=-1)
-    _, group_idx = jax.lax.top_k(group_scores, k=self.config.topk_routing_group)
+    n_groups = self.config.n_routing_groups
+    if self.config.moe_fast_group_topk:
+      # Neither top_k below needs a sort. The top-2 values are only summed, and the
+      # group indices are only turned into a 0/1 mask, so max/argmax reductions give
+      # the same answer. Ties match because lax.top_k and jnp.argmax both resolve to
+      # the lower index.
+      experts_per_group = scores_grouped.shape[-1]
+      first_val = jnp.max(scores_grouped, axis=-1)
+      first_hit = jax.nn.one_hot(jnp.argmax(scores_grouped, axis=-1), experts_per_group, dtype=jnp.bool_)
+      neg_inf = jnp.array(-jnp.inf, dtype=scores_grouped.dtype)
+      second_val = jnp.max(jnp.where(first_hit, neg_inf, scores_grouped), axis=-1)
+      group_scores = jnp.astype(first_val, jnp.float32) + jnp.astype(second_val, jnp.float32)
 
-    # Mask selected groups so that only those experts are considered.
-    group_mask = jax.nn.one_hot(group_idx, num_classes=self.config.n_routing_groups, dtype=jnp.float32)
-    group_mask = jnp.sum(group_mask, axis=-2)
+      # Accumulate the selected-group mask directly, one max pass per group picked.
+      group_mask = jnp.zeros_like(group_scores)
+      remaining = group_scores
+      neg_inf_f32 = jnp.array(-jnp.inf, dtype=group_scores.dtype)
+      for _ in range(self.config.topk_routing_group):
+        selected = jax.nn.one_hot(jnp.argmax(remaining, axis=-1), n_groups, dtype=group_scores.dtype)
+        group_mask = group_mask + selected
+        remaining = jnp.where(selected > 0, neg_inf_f32, remaining)
+    else:
+      top2_in_group_vals, _ = jax.lax.top_k(scores_grouped, k=2)
+      group_scores = jnp.sum(jnp.astype(top2_in_group_vals, jnp.float32), axis=-1)
+      _, group_idx = jax.lax.top_k(group_scores, k=self.config.topk_routing_group)
+
+      # Mask selected groups so that only those experts are considered.
+      group_mask = jax.nn.one_hot(group_idx, num_classes=n_groups, dtype=jnp.float32)
+      group_mask = jnp.sum(group_mask, axis=-2)
 
     # Apply masks and get top-k indices.
     score_mask_expanded = jnp.broadcast_to(
