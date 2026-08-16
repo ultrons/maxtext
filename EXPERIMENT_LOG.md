@@ -1621,3 +1621,41 @@ the usual transient -- the authoritative signal is `kubectl get slices.accelerat
 the reference 64Mi batch exactly**. So the reference LR schedule is the CORRECT pairing and needs no
 scaling (an earlier suggestion to scale it up was based on the wrong reference batch). If
 convergence is token-limited, conv1's 805M tokens is **12 steps** at this batch.
+
+### 64Mi-batch (reference) runs — MEMORY CEILING FOUND, then blocked by cluster infra [2026-08-16]
+Goal: reach the reference batch (**64M tokens = 16384 seqs @ 4096**) and see whether it converges to
+3.60 in under 50 optimizer steps. conv1 spent **805M tokens** (192 steps x 4.19M) to target, which is
+**12 steps** at the 64Mi batch -- so the token budget says <50 is plausible IF convergence is
+token-limited rather than LR-limited.
+
+**MEMORY CEILING (measured, 2 points):**
+
+| config | HLO temporaries | verdict |
+|---|---|---|
+| pdbs=1, ship stack, AOT tpu7x-1024 | **83.3 GB** / 94.74 GB avail | fits, ~11 GB headroom |
+| pdbs=4, fsdp=512, 2048 chips (siv-cn-conv2k) | **248.0 GB** | **OOM at compile** |
+
+=> ~55 GB per unit pdbs on a ~28 GB base (derived) => **pdbs=2 lands ~138 GB and does NOT fit
+either**, at ANY chip count. Raising `per_device_batch_size` is NOT a route to a bigger batch with
+this config. **`gradient_accumulation_steps` is** -- it holds the microbatch (and temps) at pdbs=1.
+
+**gradient_accumulation_steps=4 WORKS with our stack** (siv-cn-conv2kga, 2048 chips, fsdp=512, ep=8):
+`global_batch_size_to_train_on: 16384` confirmed, restore completed, and it reached
+`Waiting for step 0 to finish before checkpoint` => **the train step COMPILED AND RAN**. No OOM, and
+no incompatibility with ring-of-experts / the `ep-as-dp` custom mesh. Killed by the cluster before any
+step metric was logged. Script: `conv_run_2kga.sh`.
+
+**CLUSTER INFRA BLOCKER (not ours, 6 attempts):**
+- 4096 chips: `16x16x16` and `8x16x32` BOTH fail `AttachMIGsToMMIG failed: currently attached
+  partition ID(s) ...` -- different partition lists each attempt, while 1500-2000 nodes sat unlabeled
+  and free. Reads like a size ceiling or a race in multi-MIG attachment, not fixed leaked nodes.
+- 2048 chips (`8x16x16`): composed fine at 23:27 and 23:37, then degraded -- siv-cn-conv2kga was
+  SIGTERMed (143) with the slice going `INCOMPLETE`, and siv-cn-ga64m's slice went `DEACTIVATING`
+  82 s after creation and the jobset was REMOVED without running a step. An unrelated
+  `test-preflight` 8x16x16 hit `SliceCreationFailed` in the same window => cluster-wide, not us.
+- `--max-restarts=10` does NOT save a run whose slice goes INCOMPLETE; the jobset terminates.
+- Reminder: `JobCreationFailed` (Warden webhook) is the usual transient; the authoritative signal is
+  `kubectl get slices.accelerator.gke.io` STATE.
+
+**To resume:** one uninterrupted 2048-chip run of `bash conv_run_2kga.sh <name>` answers the 50-step
+question. Needs the cluster's large-slice composition healthy; escalate to the cluster owner.
