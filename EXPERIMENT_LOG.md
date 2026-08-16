@@ -1688,3 +1688,58 @@ ici fsdp=128/ep=8 unchanged, pdbs=1, ship stack at rbf=-1, synthetic, 20 steps, 
 never created, 0 pods, 172-byte log = kubectl error only). The OOM was a DIFFERENT run, `conv2k`
 at **pdbs=4** on 8x16x16. **pdbs=2 has never been tested** -- the ~138 GB figure is interpolation
 between 83.3 GB (pdbs=1, measured) and 248 GB (pdbs=4, measured), NOT a measurement.
+
+### Real-data vs synthetic step regression: VPU is 55% of it [2026-08-16]
+A/B of two single-slice profiles, same ship stack, staged in the :9009 dropdown as
+`siv-conv1-realdata` and `siv-fixchk-synth`:
+
+| lane | synthetic (fixchk) | real data (conv1) | delta |
+|---|---|---|---|
+| **step** | 4.50 s | 8.82 s | **+4.32** |
+| TC total | 3.47 | 6.34 | +2.87 |
+| - MXU compute | 1.98 | 2.47 | +0.49 |
+| - **VPU** | 1.35 | **3.71** | **+2.36 (55% of the regression)** |
+| - relayout | 0.140 | 0.159 | +0.02 |
+| SC exposed | 1.03 | **2.42** | **+1.39 (32%)** |
+| Host-DMA | 0.107 | 0.671 | +0.56 |
+
+- MXU grows only 25%, so **MTP's extra layer (1/61 = +1.6%) is NOT the main cause.**
+- Candidates, ALL of which land on VPU and NONE of which are separated yet: MTP's **second loss head
+  over vocab 129280** (softmax + cross-entropy twice: heavy VPU, light MXU), grouped routing's
+  group-wise top-k in the router, **per-step eval** inside the profiled window, and real routing
+  replacing perfectly balanced random routing.
+- **To separate:** two 20-step synthetic arms, MTP alone then grouped routing alone.
+
+### broadcast_select_fusion is BACK — because I re-enabled the mask [2026-08-16]
+`broadcast_select_fusion.8` in the ms2 profile, rank 9, 449.97 ms / ~3.9 steps = **~115 ms/step**,
+HBM-bound 1.77 TB/s, FLOP/B 0.2. `explain` traces it to
+`ragged-unsort-bwd/jit(_where)/select_n` at **`kernels/ragged/ragged_sort.py:639:9`** -- the unsort
+backward predicate mask the poison probe already proved redundant under `moe_bwd_inkernel_quant`.
+It is back because every multislice/convergence job was launched with `ENVX="MOE_UNSORT_BWD_MASK=1"`
+(a conservative choice on moving to real data, never revisited). **conv1, ms2 and ms13* all carry
+this ~115 ms/step tax.** Setting `MOE_UNSORT_BWD_MASK=0` removes it.
+
+### The 2-slice DCN all-reduce IDENTIFIED: all-reduce.497
+Rank 1 in the ms2 profile, 1187 ms total, **296.8 ms/firing, ~1/step**, bytes report 0 B (so NO
+bandwidth may be quoted). Identified by ABSENCE: the single-slice synthetic profile has no
+comparable op (its largest all-reduce is 0.956 ms/iter WITH a `dot_general` source). No JAX source
+attribution => partitioner-inserted cross-slice collective. ~40% of the measured +0.74 s multislice
+cost, exposed.
+NOTE: the replica-group table renders it as 1017 devices stride-8, which looks intra-slice; the
+absence test is the stronger evidence. Do not treat the group rendering as authoritative.
+
+### Multislice gang formation FAILS above ~2 slices [2026-08-16]
+14 -> 13 ACTIVE + 1 `SliceCreationFailed`. 13 -> 12 + 1. 13 (retry) -> 12 + 1. **Always exactly one
+short**, three consecutive attempts, while 2 slices composed cleanly. Failure is `AttachMIGsToMMIG
+... currently attached partition ID(s)` on a plain 8x8x8 -- the SAME shape that composes fine alone,
+so this is NOT a slice-size ceiling (correcting the earlier reading of the 4096-chip failures).
+A multislice gang needs ALL slices, so one failure blocks the job. **Needs the cluster owner.**
+Also found: ClusterQueue nominal quota is **7552 chips**, so 16 slices (8192) is rejected outright
+with `insufficient quota ... > maximum capacity (7552)`.
+
+### pdbs=2 MEASURED (was interpolated) [2026-08-16]
+AOT at fsdp=128 (compile_topology=tpu7x-1024): **120.26 GB temporaries vs 94.74 GB available = OOM.**
+Earlier interpolation said ~138 GB, so the real growth from pdbs=1 (83.3 GB) is **+37 GB, not +55**.
+CAVEAT: this measures fsdp=128. Some temporaries are fsdp-sharded, so **pdbs=2 at fsdp=1024 remains
+untested** and could conceivably fit. `aot_variant.sh` pins compile_topology AFTER $EXTRA, so it
+cannot be overridden from the args -- edit the script to test another topology.
