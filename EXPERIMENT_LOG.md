@@ -2098,3 +2098,43 @@ diffed against the xm_launch command from the run's OWN config dump, 0 real mism
 abort** (`Check failed: vf_helper_->TearDownMesh() is OK (DEADLINE_EXCEEDED ... vBAR)`) on 1 of 64
 workers after waiting ~24 min for a gang that never completed (63 Running / 1 NotReady). Churned-pod
 VF-session failure, not the deps; delete + relaunch cleared it.
+
+### 3002.patch PORTED to upstream head [2026-08-17] — runs, loss matches, worth +6 TPS/chip (NOISE)
+| arm | s/step | TPS/chip | loss@19 |
+|---|---|---|---|
+| siv-r3002-up1 (upstream baseline) | 12.098 | 2708 | 8.764 |
+| **siv-r3002-qtag4 (patch ported)** | **12.070** | **2714** | **8.759** |
+| siv-r3002-tokag2 (my simpler wire-format version) | 11.988 | 2734 | 8.762 |
+
+**The known-missing feature does NOT explain the gap.** All three candidates are now eliminated by
+measurement: config (55 flags diffed clean), deps (bump cost -21), this patch (+6).
+
+**Design (from the patch, and it IS the better design in principle):** activations are quantized
+ONCE with a **per-tensor** scale (`channelwise_axes=()`) and stay a `qpl.QArray` across the EP
+all-gather, the ragged sort, and the padding, into the GMM, which takes `lhs.qvalue` with
+`maybe_quantize_lhs=False` and dequantizes once on the [m,n] OUTPUT. The scalar scale is what makes
+it possible: a per-token scale would have to be permuted alongside the tokens by the ragged sort.
+(The absmax path takes a global `jax.lax.pmax` across EP for the same reason; the static
+`fixed,-224,224` recipe skips that collective, which is presumably why 3002 uses it.)
+I predicted this would beat my version because it also shrinks the SORT traffic and deletes the
+in-kernel quantize pass. **On this hardware it does not. Prediction wrong.**
+
+**FOUR porting iterations, four distinct causes -- all mine, and worth the lesson:**
+1. `extract_vma` -> `TypeError: jax.typeof(QArray)`. I had SEEN this hunk and judged it incidental.
+2. `AssertionError: lhs and rhs m-dim mismatch 131072!=1 (131072,7168) vs (1,131072,2048)` -- the
+   patch guards two scale multiplies with `.squeeze() if scale.size == 1`; a (1,1,1) scale
+   broadcasts a 2-D tensor to 3-D. The error shape spelled out the cause exactly.
+3. Variable aliasing: the patch keeps `residual_rhs` distinct from `rhs` because
+   `_bwd_prepare_inputs` unwraps QArrays IN PLACE. I reused `rhs`, so my drhs branch would have
+   silently never fired -- **no crash, just quietly not doing the thing**.
+4. `TypeError: Custom VJP bwd rule must produce an output with the same container (pytree)
+   structure as the args tuple of the primal`. I captured `isinstance(lhs, QArray)` at the END of
+   `_gmm_fwd`; it must be captured at the TOP, before `_fwd_quantize_activation_and_weight`
+   reassigns the operands, because the bwd must match what the PRIMAL received.
+**METHOD:** porting by intent (reading for meaning, porting what looks essential) failed 3 times.
+Enumerating every added line and accounting for each caught (3) and (4), including the one that
+would never have crashed. Do that FIRST on any hand port.
+
+**Only the environmental hypothesis survives:** their platform is **`gf_4x8x8_untwisted`**; we run a
+composed `tpu7x-4x8x8` subslice whose torus wiring is unverified. Checkable from device coords /
+replica groups in a profile we already have -- no new run needed.
