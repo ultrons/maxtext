@@ -1968,3 +1968,30 @@ reduce-scatter.57 20%**.
   model has been uninterpretable. Leading suspect if it DOES work: the SC Pallas kernels carry no
   `cost_estimate`, so the layer scheduler believes it has zero-duration work to hide behind
   (we set cost_estimate_flops_fwd/bwd for splash only).
+
+### moe_fast_group_topk HANGS when an eval graph is present [2026-08-17] — NOT SHIPPABLE
+| run | flag | eval | outcome |
+|---|---|---|---|
+| siv-cn-gtopk1 | **on** | `eval_interval=-1` | ran 20 steps clean, 6.818 s (the -2.18 s win) |
+| siv-cn-conv2 | **on** | every step | **HUNG at step 0 for 5.5 h** on 512 chips before I killed it |
+| siv-cn-cvprobe2 | off | every step | clean: `Waited 115.35 s`, steps at 11.33-11.67 s |
+| siv-cn-cvprobeon | **on** | every step | **HUNG** after `Starting eval after train step 4`, 16 min silent |
+
+- **Trigger correlates with the EVAL GRAPH.** Flag-off with eval is clean; flag-on without eval is
+  clean; flag-on WITH eval hangs, twice, at different steps (0 and 4). Both hangs stall immediately
+  after a `Starting eval after train step N` line.
+- **The -2.18 s win stands as measured but is NOT SHIPPABLE**: `gtopk1` had no eval graph, which a
+  convergence run always has. Flag stays default FALSE.
+- **Useful side result:** cvprobe2 at 11.33 s vs conv1 at 11.7 s = the unsort mask coming off
+  (~115 ms predicted), on a real-data eval-every-step config.
+- **MY ERRORS ON THIS, for the record:** (1) let conv2 burn 5.5 h of 512 chips without checking the
+  stream; (2) built an isolation probe with `steps=3` under `skip_first_n_steps_for_profiler=5`,
+  which died instantly on `ValueError: Profiling requested but initial profiling step set past
+  training final step` and taught nothing; (3) my watcher kept polling that dead pod's stale log for
+  36 min; (4) called "did not reproduce, looks transient" after seeing ONE step complete, when it
+  had simply not hung YET. Lesson: for a hang, absence of the hang at step N is not evidence of
+  health -- watch to the configured step count or to pod exit.
+- **Next diagnosis (untested):** the train and eval graphs both carry the 4 unrolled
+  argmax/one_hot/where iterations per router; suspect the eval-graph variant. A threshold
+  formulation (compare against the 4th-largest group score) would avoid the unrolled loop entirely
+  and is worth trying before debugging the current one.
