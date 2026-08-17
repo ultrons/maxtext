@@ -2138,3 +2138,42 @@ would never have crashed. Do that FIRST on any hand port.
 **Only the environmental hypothesis survives:** their platform is **`gf_4x8x8_untwisted`**; we run a
 composed `tpu7x-4x8x8` subslice whose torus wiring is unverified. Checkable from device coords /
 replica groups in a profile we already have -- no new run needed.
+
+### tgmm in-kernel bwd quantization ON THE 3002 BASELINE [2026-08-17] — +6 TPS/chip, prediction HELD
+`siv-r3002-tgmmq2`: clean upstream-head worktree + our kernel changes, `moe_bwd_inkernel_quant=true
+moe_bwd_inkernel_quant_dlhs=true`, 4x8x8 / pdbs=4 / **rbf=2**.
+
+| arm | s/step (15-19) | TPS/chip | loss@19 |
+|---|---|---|---|
+| siv-r3002-up1 (baseline) | 12.098 | 2708 | 8.764 |
+| **siv-r3002-tgmmq2** | **12.069** | **2714** | **8.779** |
+
+**-0.029 s = +6 TPS/chip. Noise, and PREDICTED:** this lever is padding-driven, so it pays at
+rbf=-1 (-0.59 s) and not at rbf=2 (+0.05 s at pdbs=1). The open question was whether the 4x larger
+absolute buffer at pdbs=4 (131072 rows vs 32768) would change the balance. **It does not.**
+
+**PORTING METHOD THAT WORKED (contrast with the 3002.patch hand port's 4 failures):** diff our branch
+against its **merge-base with upstream** (`5f2c70a563`) for just the kernel files -- that separates
+OUR changes from 97 commits of upstream churn (ops.py +269/-26, gmm kernel +16/-3, tgmm +52/-8) --
+then `git apply -3`. **All three applied cleanly first try.** Use this for the rest of the re-port.
+**One trap a file-scoped diff CANNOT see:** `ops.py` imports `maxtext.kernels.tgmm_block`, a module
+that exists only on our branch -> `ModuleNotFoundError` at runtime. Check the ported files' imports
+for `maxtext.*` paths and verify each exists upstream. Same trap will apply to the ring-AG kernel
+and the ragged-gather changes.
+
+### ALL OUR LEVERS PRICED AGAINST THE 3002 REPRO BASELINE
+| change | s/step | TPS/chip | vs baseline |
+|---|---|---|---|
+| upstream head (baseline) | 12.098 | 2708 | -- |
+| **our fp8 token AG (simple wire format)** | **11.988** | **2734** | **+25** |
+| 3002.patch ported (QArray end-to-end) | 12.070 | 2714 | +6 |
+| tgmm in-kernel bwd quant | 12.069 | 2714 | +6 |
+| dependency bump to head | 12.194 | 2687 | **-21** |
+| **internal record** | **10.91** | **3002** | **+294** |
+
+**Every lever we own is now priced, and none of them explains or closes the 294 TPS/chip gap.**
+Config, dependencies and source have all been eliminated by measurement. The only untested
+hypothesis left is the torus wiring (`gf_4x8x8_untwisted` vs our composed `tpu7x-4x8x8`), and it is
+currently supported by nothing stronger than a platform NAME -- weak evidence, leading only because
+everything else is gone. Verified so far: we run 256 chips / **512 devices**, mesh
+`(1,1,1,64,1,1,1,1,1,1,8,1)` = **fsdp=64 x ep=8**, which matches the record's mesh exactly.
