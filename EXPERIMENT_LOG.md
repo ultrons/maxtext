@@ -2033,3 +2033,40 @@ dequantizes on arrival. `logits`/`pre_bias_logits` stay bf16.
   consumes are identical either way; this relocates an existing rounding rather than adding one.
   Round-trip error vs bf16 input: max abs 9.77e-3, 3.6e-2 relative to max|x|.
 - Arm `siv-r3002-tokag` running against the 12.098 s baseline.
+
+### moe_fp8_token_ag VERDICT [2026-08-17] — real but small: -0.110 s, +25 TPS/chip, loss matches
+| arm | s/step (15-19) | TPS/chip | loss@19 | |
+|---|---|---|---|---|
+| siv-r3002-up1 (upstream baseline) | 12.098 | 2708 | 8.764 | |
+| siv-r3002-tokag (naive backward) | 11.900 | 2754 | **nan** | **BROKEN** |
+| **siv-r3002-tokag2 (straight-through bwd)** | **11.988** (11.988-11.990, flat) | **2734** | **8.762** | **KEEP** |
+
+**+25 TPS/chip (+0.93%) with the loss matching to 0.002** (inside the run-to-run variation we
+measured earlier at ~0.09). Zero `loss: nan` lines in the whole run.
+
+**THE NaN, root-caused with a CPU receipt.** The first arm went non-finite at STEP 1 while its
+step-0 FORWARD loss was still finite (12.242) -- i.e. the BACKWARD poisoned the weights. Cause: I
+let autodiff differentiate THROUGH the quantization. `scale = max|x|/448 + 1e-20`, so an **all-zero
+token row** (padding produces these on real data) gives scale = 1e-20, and the backward of
+`x / scale` multiplies that row's cotangent by 1e20 -> Inf -> NaN.
+CPU repro, one deliberately zeroed row in an 8x7168 shard-mapped grad:
+
+| backward | non-finite grads | max|g| |
+|---|---|---|
+| naive (differentiated) | **7168** | nan |
+| custom_vjp straight-through | **0** | 4.06e-01 |
+
+**Fix:** a quantized wire format must NOT be differentiated. `_fp8_token_all_gather` is now a
+`custom_vjp` whose backward is the plain transpose of the gather
+(`jax.lax.psum_scatter(ct, tiled=True)`), so gradients pass straight through.
+**PROCESS NOTE:** my pre-launch CPU check tested only the FORWARD (idempotence). A forward-only
+numerical check cannot see a backward blow-up. Cost: one 256-chip run. The zero-row grad test is
+seconds and should be the default for anything that quantizes on a differentiated path.
+
+### THE REMAINING GAP TO 3002 IS ELSEWHERE
+2708 -> 2734 with the token gather. **3002 is still 268 TPS/chip away; the token gather explains
+only ~8.5% of the original 294.** So the internal `moe_quantize_token_all_gather` is NOT the main
+missing piece. 2734 still sits below the team log's 08-11 "FSDP QWAG" row (2872). Next question is
+what that rung is, given upstream DOES gather `rhs.qvalue` at `ops.py:273` and our repro runs the
+static `fixed,-224,224` calibration that is supposed to let it fire -- so either it is not firing,
+or QWAG means more than that call site.
