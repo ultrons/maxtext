@@ -2070,3 +2070,31 @@ missing piece. 2734 still sits below the team log's 08-11 "FSDP QWAG" row (2872)
 what that rung is, given upstream DOES gather `rhs.qvalue` at `ops.py:273` and our repro runs the
 static `fixed,-224,224` calibration that is supposed to let it fire -- so either it is not firing,
 or QWAG means more than that call site.
+
+### DEPENDENCY BUMP REFUTED [2026-08-17] — new deps are 0.8% SLOWER, gap to 3002 is elsewhere
+Numbers read from the runs' TensorBoard scalars (`perf/step_time_seconds`, median of steps >=15)
+because the container logs were evicted; independent of kubectl.
+
+| arm | deps | s/step | TPS/chip |
+|---|---|---|---|
+| siv-r3002-up1 | jax 0.10.1 / libtpu 0.0.41 / qwix 0.1.6 | 12.099 | 2708.4 |
+| siv-r3002-tokag2 | same + our fp8 token AG | 11.989 | 2733.1 |
+| **siv-r3002-bump2** | **jax 0.11.0 / libtpu 0.0.46 / qwix 0.1.8 / flax 0.12.8** | **12.194** | **2687.1** |
+
+**Bumping deps LOSES 0.095 s (-21 TPS/chip).** tokamax was ALREADY at head (0.0.12), so the whole
+"our pins are stale" hypothesis -- which I proposed -- is dead. Config is also ruled out: 55 flags
+diffed against the xm_launch command from the run's OWN config dump, 0 real mismatches
+(rbf=2.0 and chunks=2 both confirmed; the 5 flagged rows were enum reprs).
+
+**What is left for the 294 TPS/chip gap:**
+1. **TORUS TOPOLOGY.** Their platform string is **`gf_4x8x8_untwisted`**; we run `tpu7x-4x8x8` via
+   xpk on a composed subslice and I never checked twisted vs untwisted. Different ICI neighbour
+   structure, and ~30 of the XLA flags in this recipe are SparseCore collective offload. This is
+   the leading candidate and it is CHECKABLE from the device coords / profile.
+2. Internal google3 MaxText differing from upstream by more than the one flag already located
+   (`moe_quantize_token_all_gather`, absent upstream under any name).
+
+**Infra note:** the first bumped attempt (`siv-r3002-bump`) died on the known **TearDownMesh HAL
+abort** (`Check failed: vf_helper_->TearDownMesh() is OK (DEADLINE_EXCEEDED ... vBAR)`) on 1 of 64
+workers after waiting ~24 min for a gang that never completed (63 Running / 1 NotReady). Churned-pod
+VF-session failure, not the deps; delete + relaunch cleared it.
