@@ -1995,3 +1995,41 @@ reduce-scatter.57 20%**.
   argmax/one_hot/where iterations per router; suspect the eval-graph variant. A threshold
   formulation (compare against the 4th-largest group score) would avoid the unrolled loop entirely
   and is worth trying before debugging the current one.
+
+### 3002 REPRO on UPSTREAM HEAD [2026-08-17] — 12.098 s = 2708 TPS/chip, ~90% of the record
+`siv-r3002-up1`, upstream `557edaa97` src overlaid on our base image (deps held constant so this is
+an A/B on MaxText source, not on the whole stack). 4x8x8 = 256 chips, pdbs=4, 8,388,608 tokens/step.
+Script `xpk_3002_repro.sh` in the upstream worktree; XLA flag list verbatim from the xm_launch cmd.
+
+**Result: steps 17/18/19 = 12.099 / 12.098 / 12.098 s, EXIT_CODE=0 => 2708 TPS/chip vs 3002.**
+Short by 294 TPS/chip (+1.19 s step, +10.9%).
+
+**Where 2708 lands in the team log:** right on the 2026-08-03/05 fp8 plateau (2677.85, 2686.74,
+2686.90) and BELOW the 08-11 "FSDP QWAG" row (2872) and the 08-13 record (3002). So upstream head
+appears to carry the recipe up to that plateau but not the last two rungs.
+
+**Three deviations forced by the open-source repo (documented in the script header):**
+1. `moe_quantize_token_all_gather=True` OMITTED -- **the flag exists in neither upstream nor our
+   branch**. Searching by NAME found nothing; searching by BEHAVIOUR found the site: upstream's ring
+   token duplication is a plain `jax.lax.all_gather` on `x` at `moe.py:1715`, bf16, with no
+   quantization branch and no flag of any name. It was internal-only to the google3 copy.
+2. `skip_jax_distributed_system=true` omitted (GKE multi-host needs it up).
+3. CNS dataset path -> `gs://max-datasets-rogue`, same `c4/en:3.0.1`.
+
+**Correction to an earlier claim of mine:** we HAD implemented a quantized token gather
+(`moe_fp8_token_ag_wire`), but it sits inside `elif self.config.moe_fwd_direct_token_ag` -- a
+dispatch path we measured NET-NEGATIVE at EP=8 (+0.548 s) and never run. So it has never executed.
+The user caught this; I had recorded it earlier as a dead-branch edit and then forgot it.
+
+### moe_fp8_token_ag: quantized token all-gather on the RING path [2026-08-17]
+New flag + `_fp8_token_all_gather` helper on the upstream worktree, at the ring path's token
+duplication. Quantizes `x` to e4m3 with a per-token scale, gathers values + a bf16 scale,
+dequantizes on arrival. `logits`/`pre_bias_logits` stay bf16.
+- **Prize:** at pdbs=4 each shard's `x` is ~235 MB (16384 tok x 7168 x 2B) BEFORE the EP=8
+  duplication -- the largest token-side collective in the layer, every layer. Halves its bytes.
+- **Numerically ~free under `fp8_full`, and this is MEASURED not asserted:** CPU check shows the
+  e4m3 round trip is **idempotent** (`fp8_rt(fp8_rt(x)) == fp8_rt(x)`, exact). The expert GMM
+  already quantizes activations per row over the SAME contraction axis, so the values the matmul
+  consumes are identical either way; this relocates an existing rounding rather than adding one.
+  Round-trip error vs bf16 input: max abs 9.77e-3, 3.6e-2 relative to max|x|.
+- Arm `siv-r3002-tokag` running against the 12.098 s baseline.
