@@ -2343,3 +2343,44 @@ The route that remains is the one the routed experts already use: `_make_cv_gath
 (`moe.py:3998-4081`) issues the all-gather explicitly under a `custom_vjp` and tags it with a real
 scheduling id. Applying that to the shared-expert weights is "make this w-ag explicit and group it
 with the other w-ags" done at the correct point in the graph.
+
+## Shared-expert weight AG: hoisted with shard_map (AOT gate PASSES)
+
+Two mechanisms tried for issuing the shared expert's FSDP weight all-gather ourselves, at a point
+where a scheduling annotation can reach it.
+
+A sharding constraint does not work. `maybe_shard_with_name` dropping the fsdp axes did move the
+gather (`f8e4m3fn[1,7168,2048]` became `bf16[1,7168,2048]`, total all-gather count 236 -> 235, so a
+collective moved rather than one being added), but zero ops carried the id. The resulting gathers
+are still `frontend_attributes={is_spmd_generated="true"}` under
+`closed_call/convert_element_type`, the same signature as the slow one we are chasing. SPMD absorbs
+the constraint, emits an all-gather of its own, and our attribute does not survive the substitution.
+That is double the wire bytes for no scheduling control, so the variant stays off.
+
+`shard_map` around `lax.all_gather` works, because it is a real op in the jaxpr that SPMD does not
+replace. Same pattern as `moe.py`'s `_make_cv_gather`, including the `custom_vjp` whose primal is
+the unannotated gather (the rematted backward copy stays untagged, so its reduce-scatter cannot
+back-edge into the rematerialized forward and raise the FAILED_PRECONDITION cycle that pattern was
+built to dodge) and a tiled `psum_scatter` transpose for the weight grad.
+
+| gate | baseline (dksg7) | shard_map hoist | verdict |
+|---|---|---|---|
+| shared-expert gather | 8x `f8e4m3fn[1,7168,2048]` | 8x `bf16[1,7168,2048]` | moved, e4m3 copies gone |
+| total all-gathers | 236 | 238 | +2, no fan-out |
+| ops carrying id 20/21/22 | 0 | 6 / 6 / 6 | tag survives, lands on the gathers |
+| peak HBM | 75.65 GiB | 78.65 GiB | +3.00 GiB, fits |
+
+The id-20 members are `all-gather.520`, `all-gather.430` and `all-gather.400`, i.e. the annotation
+is on the weight gathers themselves rather than on a folded-away cast (contrast the earlier narrow
+`DenseGeneral` tag, where only 2 ops carried the id and neither was a gather).
+
+Cost to keep in view: the kernel is bf16 at the hoist point, so this puts 29.4 MB on the wire where
+SPMD emitted 14.7 MB of e4m3. Keeping e4m3 would mean handing a pre-quantized QArray to
+`quant_dot_general`, which risks double-quantization; the routed-expert notes record the tagged
+variant of that machinery NaN'ing on cluster round 2 and losing 5.302 vs 5.106.
+
+Next is a cluster A/B against 6.818 s. Note in advance what a null means: the forward gather we are
+chasing runs at 1.1 GB/s while a larger backward gather of the same op runs at 29.9 GB/s, so if the
+hoisted, tagged, explicit gather still runs near 1.1 GB/s, contention is the cause rather than
+placement, and the `xla_tpu_enable_sparse_core_collective_offload_all_gather=false` probe becomes
+unnecessary.
