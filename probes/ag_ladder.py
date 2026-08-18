@@ -119,18 +119,24 @@ def main():
   # no local copy. The previous ladder's L1 differed from it by THREE things at once
   # (dropped the barrier, added .at[me], added a local copy), which is why it told us
   # nothing. Each rung below changes exactly one.
+  # input_output_aliases is NOT an optional feature: without it `done` waits on DMAs landing
+  # in d_ref but returns o_ref, which nothing writes, so the result is garbage BY
+  # CONSTRUCTION. Every gate that ever passed (R1-R3) had it on. It is therefore fixed ON
+  # for every rung, and the ladder varies only the genuinely optional features.
   #        name                                 peers  barrier  alias  slots  local
   rungs = [
-      ("L0 == R3 (static dest, barrier)",           1,   True,  False, False, False),
-      ("L1 + slot dest o_ref.at[me]",               1,   True,  False, True,  False),
-      ("L2 + local copy alongside remote",          1,   True,  False, True,  True),
-      ("L3 + 2nd peer sharing ss/rs",               2,   True,  False, True,  True),
-      ("L4 + input_output_aliases",                 2,   True,  True,  True,  True),
-      ("L5 + full n-1 rotation",                n - 1,   True,  True,  True,  True),
+      ("L0 == R3 (static dest, no local)",          1,   True,  True,  False, False),
+      ("L1 + slot dest o_ref.at[me]",               1,   True,  True,  True,  False),
+      ("L2 + local copy alongside remote",          1,   True,  True,  True,  True),
+      ("L3 + 2nd peer sharing ss/rs",               2,   True,  True,  True,  True),
+      ("L4 + full n-1 rotation",                n - 1,   True,  True,  True,  True),
   ]
   for name, k, bar, alias, slots, local in rungs:
     try:
       run_rung(mesh, name, k, bar, alias, slots, local)
+      if not RESULTS[-1][1]:
+        print("  -- ladder stops at the first failure --", flush=True)
+        break
     except Exception as e:  # noqa: BLE001
       gate(name, False, f"{type(e).__name__}: {str(e).strip().splitlines()[0][:400]}")
       print("  -- ladder stops at the first failure --", flush=True)
