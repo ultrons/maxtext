@@ -2384,3 +2384,54 @@ chasing runs at 1.1 GB/s while a larger backward gather of the same op runs at 2
 hoisted, tagged, explicit gather still runs near 1.1 GB/s, contention is the cause rather than
 placement, and the `xla_tpu_enable_sparse_core_collective_offload_all_gather=false` probe becomes
 unnecessary.
+
+## Shared-expert weight AG hoist: cluster A/B WINS -0.208 s [2026-08-18]
+
+Same-image A/B on the real-token substrate (`1410-up2-hoistwag`, real c4 tfds,
+`reuse_example_batch=1`, real gate, MTP + grouped routing, `moe_fast_group_topk=true`,
+rbf=-1, chunks=2, eval off). Arms differ by `shared_expert_weight_ag_sched_group=20` alone.
+
+| arm | s/step (mean 10-19) | TPS/device | lm_loss @19 |
+|---|---|---|---|
+| siv-cn-rwag0 (stock gather) | 6.864 | 596.9 | 9.312 |
+| **siv-cn-rwag1 (hoisted)** | **6.656** | **615.7** | 9.138 |
+| | **-0.208 (-3.0%)** | +18.8 | |
+
+Tail step times are flat in both (6.853-6.862 and 6.653-6.660), and TPS/device corroborates
+the step ratio independently (596.9/615.7 = 1.0315 against 6.864/6.656 = 1.0313).
+
+**The mechanism, measured.** In the baseline the shared-expert gather is the op we have been
+chasing since the profile investigation: `all-gather.525`, 15.3 MB, **7.391 ms/iter at 1.1 GB/s**,
+sourced to `closed_call/convert_element_type` (SPMD-inserted, on the e4m3 tensor). In the hoisted
+arm that op is replaced by ours, sourced to `closed_call/shard_map/all_gather`: `all-gather.498`
+carries **32.2 MB in 4.577 ms = 3.7 GB/s** and `all-gather.496` **28.4 MB in 4.228 ms = 3.5 GB/s`.
+
+So the explicit gather moves roughly 2.1x the bytes in 0.62x the wall time, i.e. **about 3.4x the
+achieved bandwidth**, and the bf16 doubling is paid for several times over. Placement was a real
+part of the problem, which the four earlier annotation attempts could not show because none of them
+ever reached the gather.
+
+**Contention is NOT refuted, it is bounded.** 3.7 GB/s is still far from the 29.9 GB/s the same op
+achieves in the backward. The lane accounting says why the win is only -0.208 s rather than the full
+2.8 ms/iter the gather saved: the SparseCore lane got *worse*, 4.69 s -> 4.91 s, which is what the
+2x bytes buys on the SC offload path, while TensorCore went 4.17 -> 4.08 s and Host-DMA 617 -> 497 ms.
+The binder is SparseCore in both arms. So we converted a badly-placed cheap-on-the-wire gather into
+a well-placed expensive-on-the-wire one and came out ahead, but the SC lane is now absorbing the
+cost. Keeping e4m3 through the hoist is the obvious next lever and would attack both terms at once.
+
+**Do NOT read op counts off the `list_collectives` top table** -- it prints a top-N and reading it
+as the population is the exact error retracted in the combined-vs-split finding. The per-op rates
+above are legitimate; the populations are not claimed.
+
+**Numerics need a gate before this ships.** lm_loss @19 is 9.312 vs 9.138, a delta of 0.174, which
+is ABOVE the ~0.09 run-level noise floor the log records (vreuse 9.244 vs gtopk0 9.151, same path
+different image). The hoist should be close to neutral, since
+`weight_quantization_calibration_method=fixed,-1,1` means the scale does not depend on whether the
+tensor is sharded or replicated at quantize time, so this difference is not yet explained and the
+flag stays default-off until it is.
+
+**Substrate lesson (cost: one wasted 512-chip run).** The first A/B inherited
+`dataset_type=synthetic` from the poison harness and measured 4.965 s, which is the synthetic/real
+gap and not an improvement on 6.818. Worse, synthetic leaves SparseCore near-idle, so it would have
+removed the very contention the experiment exists to probe. Always override the dataset explicitly
+when borrowing a harness whose base config sets one.
