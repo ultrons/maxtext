@@ -44,6 +44,11 @@ from maxtext.utils.sharding import get_physical_spec_without_axes
 from maxtext.utils.sharding import FSDP_MESH_AXES
 from maxtext.utils.sharding import truncate_out_sharding
 
+import os
+
+# Step-0 remat-survival probe for the start/done pattern (see kernels/startdone.py).
+_STARTDONE_PROBE = os.environ.get("STARTDONE_PROBE", "0") == "1"
+
 
 def _convert_to_activation_function(fn_or_string: str | Callable[..., Any]) -> Callable[..., Any]:
   """Convert a string to an activation function."""
@@ -415,6 +420,15 @@ class DenseGeneral(nnx.Module):
 
     kernel = self._maybe_two_stage_all_gather(kernel)
     kernel = self._maybe_hoist_weight_ag(kernel)
+    # STEP 0 PROBE: does a start/done PAIR survive remat? Every weight in the census appears
+    # as a fwd + bwd-remat pair, so if the pair re-traces into rematted_computation, one
+    # forward-side change covers both members. Placement probe only -- split_copy moves the
+    # same bytes an identity would.
+    if _STARTDONE_PROBE and self.hoist_weight_ag_sched_group is not None \
+        and self.hoist_weight_ag_sched_group >= 0:
+      from maxtext.kernels.startdone import split_copy
+
+      kernel = split_copy(kernel)
 
     # out_sharding should be None for auto mesh axis
     if self.shard_mode != ShardMode.EXPLICIT:
