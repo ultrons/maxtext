@@ -2435,3 +2435,60 @@ flag stays default-off until it is.
 gap and not an improvement on 6.818. Worse, synthetic leaves SparseCore near-idle, so it would have
 removed the very contention the experiment exists to probe. Always override the dataset explicitly
 when borrowing a harness whose base config sets one.
+
+## start/done split-phase collectives: feasibility probe [2026-08-18]
+
+Idea under test: split a collective into two custom calls, a `start` that issues the DMAs and
+returns without waiting and a `done` that reconstructs the identical descriptor and waits. Both
+look like ordinary TC ops to XLA, so XLA schedules real work between them and we stop depending on
+its collective scheduler. Probe at `probes/startdone_probe.py` (CPU + virtual-TPU Mosaic, no cluster).
+
+| stage | result |
+|---|---|
+| P1 semaphore as a `pallas_call` operand (`memory_space=pltpu.SEMAPHORE`) | **PASS** (traces) |
+| P2 two kernels sharing one semaphore, `done` data-dependent on `start`'s buffer | **PASS** (traces) |
+| P2 Mosaic lowering on a virtual tpu7x | **FAIL** |
+
+The Mosaic failure is a backend invariant, not a syntax problem:
+`LLO_CHECK failure (llo_region_builder.cc:7807) sync_flag->memory_space() == MemorySpace::kSflag ||
+kBarnaCoreSflag  vmem`. A DMA semaphore handed in as a kernel operand is allocated in **VMEM**, but
+the DMA wait requires it in **sync-flag** memory. Declaring `memory_space=pltpu.SEMAPHORE` on the
+input `BlockSpec` does not change the allocation. So a DMA started in kernel A cannot be waited on
+in kernel B: **cross-kernel DMA semaphore lifetime is not expressible in jax 0.10.0.**
+(An earlier FAIL at this stage, `Loads are only allowed on VMEM and SMEM references`, was my own
+bug -- an HBM load in the done body -- fixed by aliasing the destination to the output.)
+
+`get_barrier_semaphore()` is the one genuinely cross-kernel semaphore, keyed by `collective_id`, but
+it is a barrier/REGULAR semaphore rather than a DMA semaphore, so it cannot carry a DMA completion.
+
+**What this does NOT kill.** The goal (own the placement, hide the transfer inside compute) is
+already achieved in this tree by putting the gather INSIDE the consuming kernel, where the semaphore
+is legal and where we control the interleave directly rather than hoping XLA inserts work between
+two ops. `moe.py:4055` records the routed-expert fp8 path doing exactly this: the e4m3 all-gather
+happens inside the `sparse_matmul` body, and its transpose is the efficient single-psum_scatter
+weight-grad form. Note `moe_splash_wag_*` is NOT in this branch (0 matches in `types.py`); that
+in-kernel splash weight-AG lives on the 14.10 record stack, so it is precedent, not available code.
+
+**Prize, from the 6.864 s arm.** Exposed stall is 8671.85 ms = 30.9% of step (all-gather 5279 ms
+across 79 ops / 8212 firings, reduce-scatter 2235 ms, all-reduce 1158 ms). The profile spans ~4.09
+steps and these fire ~58x/step, one per layer:
+
+| op | scope | bytes | stall/iter | BW | ~ms/step |
+|---|---|---|---|---|---|
+| `all-gather.445` | bwd `rematted_computation/convert_element_type` | 5.3 MB | 9.448 ms | 0.3 GB/s | 536 |
+| `all-gather.525` | fwd `closed_call/convert_element_type` | 16.0 MB | 7.391 ms | 1.1 GB/s | 419 |
+| `all-gather.519` | `shard_map/all_gather` | 245.2 MB | 1.518 ms | 80.8 GB/s | 86 |
+
+`.519` moves 46x the bytes of `.445` at 250x the bandwidth, so the fabric is not the limit and the
+collective implementation is not the limit; placement is. That argues for the THINNEST possible
+intervention (own where the DMA sits) rather than rewriting a competitive collective.
+
+`.445` is the biggest single item and the hoist just shipped does NOT touch it by design (its primal
+is deliberately unannotated to avoid the FAILED_PRECONDITION cycle). I could not pin `.445` to a
+specific weight: the backward remat gathers are `f8e4m3fn[1,7168,576]` (4.1 MB),
+`[1,7168,1536]` (11.0 MB), `[1,7168,2048]`, `[1,512,128,256]`, `[1,1536,128,192]`,
+`[1,128,128,7168]`, none matching 5.0-5.3 MB cleanly. Identify it before designing for it.
+
+**Caution carried forward.** `mpmd-map-sc-barrier-blocks-fsdp-ag` records an SC kernel next to a gmm
+poisoning an all-gather from 47 -> 3 GB/s. Any in-kernel gather sits in that same adjacency, so the
+first microbenchmark must check the neighbouring gmm's bandwidth, not just the gather's.
