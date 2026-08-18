@@ -2492,3 +2492,33 @@ specific weight: the backward remat gathers are `f8e4m3fn[1,7168,576]` (4.1 MB),
 **Caution carried forward.** `mpmd-map-sc-barrier-blocks-fsdp-ag` records an SC kernel next to a gmm
 poisoning an all-gather from 47 -> 3 GB/s. Any in-kernel gather sits in that same adjacency, so the
 first microbenchmark must check the neighbouring gmm's bandwidth, not just the gather's.
+
+### CORRECTION: start/done DOES lower. The semaphore is reconstructed, not passed.
+
+The previous entry's verdict was wrong because the probe was wrong. It threaded the DMA semaphore
+through as a `pallas_call` operand, which forces it into VMEM and trips
+`LLO_CHECK ... sync_flag->memory_space() == kSflag || kBarnaCoreSflag  vmem`. That is an artifact of
+passing it. The pattern does not pass a semaphore at all: **each kernel allocates its own DMA
+semaphore as kernel scratch** (which is what puts it in sync-flag memory), and `done` rebuilds the
+identical descriptor, so the wait names the same physical sync flag `start` armed.
+
+Rewritten probe (`probes/startdone_probe.py`), Mosaic lowering on a virtual tpu7x, no hardware:
+
+| stage | result |
+|---|---|
+| P1 local HBM->HBM, two kernels, semaphore reconstructed | **PASS** |
+| P2 independent compute placed between start and done | **PASS** |
+| P3 remote cross-device start/done (`make_async_remote_copy`) | **PASS** |
+
+Shape of it: `start(x)` arms the DMA and returns; its output buffer is threaded into `done(x, d)` as
+a real data dependency so XLA cannot hoist the wait above the arm (the semaphore itself is invisible
+to the scheduler, so the buffer dependency is doing the ordering work). `done` uses
+`input_output_aliases={1: 0}` so the destination IS the output and no HBM load is needed.
+
+**What this does NOT establish.** Mosaic lowering is a static gate. It does not prove the two
+kernels' scratch semaphores resolve to the same hardware sync flag at runtime, it does not prove the
+bytes arrive, and it does not prove XLA actually schedules anything into the gap rather than
+emitting the two calls back to back. Those need hardware: v5p (4 chips, SparseCore, SSH) is the rig.
+The runtime gate is P4 -- assert the destination contents, and measure the NEIGHBOURING gmm's
+bandwidth, because `mpmd-map-sc-barrier-blocks-fsdp-ag` records an SC kernel next to a gmm poisoning
+an all-gather from 47 -> 3 GB/s and that adjacency is exactly what this pattern creates.

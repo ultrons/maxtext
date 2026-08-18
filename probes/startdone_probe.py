@@ -1,21 +1,28 @@
 """Feasibility gate for the start/done split-phase collective pattern.
 
-The whole design rests on ONE binary question: can a DMA started inside kernel A be
-waited on inside a SEPARATE kernel B? That requires the DMA semaphore to outlive a
-single pallas_call. Pallas exposes SEMAPHORE as a first-class MemorySpace, which is
-what makes this plausible, but scratch semaphores are kernel-scoped.
+The pattern: split a collective into two kernels. `start` issues the DMAs and returns
+WITHOUT waiting, so XLA can schedule real compute after it. `done` RECONSTRUCTS the
+identical DMA descriptor and waits on it. Both look like ordinary TC custom-calls to
+XLA, so it schedules around them instead of fencing at them.
 
-Probe order, cheapest first. Each stage prints PASS/FAIL and why, so a failure tells us
-which layer refused rather than just "it broke".
+Crucially NO semaphore is passed between the kernels. Each kernel allocates its own DMA
+semaphore as kernel scratch, which is what puts it in sync-flag memory; because the
+allocation is deterministic, `done`'s reconstructed descriptor names the same physical
+sync flag that `start` armed.
 
-  P1  can a pallas_call take an operand in SEMAPHORE memory space at all (trace only)
-  P2  does a two-kernel start/done LOWER through Mosaic (AOT, no hardware)
-  P3  (hardware only, not run here) do the bytes actually arrive
+(An earlier version of this probe threaded the semaphore through as a pallas_call
+operand. That is wrong and does not lower: an operand semaphore is allocated in VMEM and
+Mosaic rejects the wait with
+  LLO_CHECK ... sync_flag->memory_space() == kSflag || kBarnaCoreSflag  vmem
+Setting memory_space=pltpu.SEMAPHORE on the input BlockSpec does not change it.)
+
+  P1  local HBM->HBM start/done, two kernels, Mosaic lowering on a virtual tpu7x
+  P2  same, with real compute between start and done (the point of the pattern)
+  P3  remote (cross-device) start/done -- the shape a weight all-gather actually needs
+  P4  (hardware) do the bytes arrive, and does the neighbouring gmm keep its bandwidth
 
 Run:  python3 startdone_probe.py
 """
-
-import traceback
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +31,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 N = 512
 DT = jnp.float32
+HBM = pl.BlockSpec(memory_space=pltpu.HBM)
 
 
 def _report(tag, fn):
@@ -31,115 +39,112 @@ def _report(tag, fn):
     fn()
     print(f"  PASS  {tag}")
     return True
-  except Exception as e:  # noqa: BLE001 - we want the class + first line
-    first = str(e).strip().split("\n")[0][:220]
+  except Exception as e:  # noqa: BLE001
+    first = str(e).strip().split("\n")[0][:240]
     print(f"  FAIL  {tag}\n          {type(e).__name__}: {first}")
     return False
 
 
-# --------------------------------------------------------------------------------
-# P1: is SEMAPHORE usable as a pallas_call operand memory space?
-# --------------------------------------------------------------------------------
-def p1_semaphore_as_operand():
-  def body(x_ref, sem_ref, o_ref):
-    pltpu.make_async_copy(x_ref, o_ref, sem_ref).start()
-    pltpu.make_async_copy(x_ref, o_ref, sem_ref).wait()
+def _topo_dev():
+  from jax.experimental import topologies
 
-  f = pl.pallas_call(
-      body,
-      in_specs=[
-          pl.BlockSpec(memory_space=pltpu.HBM),
-          pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
-      ],
-      out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-      out_shape=jax.ShapeDtypeStruct((N,), DT),
-  )
-  x = jax.ShapeDtypeStruct((N,), DT)
-  sem = jax.ShapeDtypeStruct(pltpu.SemaphoreType.DMA(()).shape,
-                             pltpu.SemaphoreType.DMA(()).dtype)
-  jax.eval_shape(f, x, sem)
+  return topologies.get_topology_desc("tpu7x:2x2x1", platform="tpu").devices[0]
 
 
-# --------------------------------------------------------------------------------
-# P2: two SEPARATE kernels sharing one semaphore -- the actual pattern.
-#     `start` issues the DMA and returns without waiting. `done` reconstructs the
-#     identical descriptor and waits. The destination buffer is threaded through as
-#     `done`'s input so XLA has a REAL data dependency and cannot hoist done above
-#     start (a semaphore alone is invisible to the scheduler).
-# --------------------------------------------------------------------------------
-def _start_body(x_ref, sem_ref, o_ref):
-  pltpu.make_async_copy(x_ref, o_ref, sem_ref).start()
+# ---------------------------------------------------------------------------
+# start: arm the DMA, do NOT wait.   done: rebuild the same descriptor, wait.
+# ---------------------------------------------------------------------------
+def _start_body(x_ref, o_ref, sem):
+  pltpu.make_async_copy(x_ref, o_ref, sem).start()
 
 
-def _done_body(x_ref, d_ref, sem_ref, o_ref):
-  # ONLY wait. Reconstruct the identical descriptor so the wait knows the byte count;
-  # no load, because Mosaic forbids loads from an HBM ref ("Loads are only allowed on
-  # VMEM and SMEM references"). The result is delivered by aliasing d_ref to the output.
-  pltpu.make_async_copy(x_ref, d_ref, sem_ref).wait()
+def _done_body(x_ref, d_ref, o_ref, sem):
+  # d_ref is aliased to the output, so no HBM load is needed (Mosaic forbids those).
+  pltpu.make_async_copy(x_ref, d_ref, sem).wait()
 
 
-def p2_two_kernel_start_done():
-  sem_sds = jax.ShapeDtypeStruct(pltpu.SemaphoreType.DMA(()).shape,
-                                 pltpu.SemaphoreType.DMA(()).dtype)
-  any_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-  sem_spec = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+_SEM = [pltpu.SemaphoreType.DMA]
 
-  start = pl.pallas_call(
-      _start_body,
-      in_specs=[any_spec, sem_spec],
-      out_specs=any_spec,
-      out_shape=jax.ShapeDtypeStruct((N,), DT),
-      input_output_aliases={},
-  )
-  done = pl.pallas_call(
-      _done_body,
-      in_specs=[any_spec, any_spec, sem_spec],
-      out_specs=any_spec,
-      out_shape=jax.ShapeDtypeStruct((N,), DT),
-      input_output_aliases={1: 0},   # d_ref IS the output; no copy, no HBM load
-  )
-
-  def f(x, sem):
-    d = start(x, sem)          # DMA in flight; kernel body already exited
-    # ... other work would be scheduled here ...
-    return done(x, d, sem)     # real data dep on d, so done cannot float above start
-
-  jax.eval_shape(f, jax.ShapeDtypeStruct((N,), DT), sem_sds)
+start = pl.pallas_call(
+    _start_body,
+    in_specs=[HBM],
+    out_specs=HBM,
+    out_shape=jax.ShapeDtypeStruct((N,), DT),
+    scratch_shapes=_SEM,
+)
+done = pl.pallas_call(
+    _done_body,
+    in_specs=[HBM, HBM],
+    out_specs=HBM,
+    out_shape=jax.ShapeDtypeStruct((N,), DT),
+    scratch_shapes=_SEM,
+    input_output_aliases={1: 0},  # the DMA destination IS the output
+)
 
 
-def p2_mosaic_lowering():
-  """Same as P2 but forced all the way through Mosaic on a virtual TPU (no hardware)."""
+def p1_local():
+  def f(x):
+    d = start(x)        # in flight; kernel body has already exited
+    return done(x, d)   # real data dep on d, so done cannot float above start
+
+  with jax.default_device(_topo_dev()):
+    jax.jit(f).lower(jax.ShapeDtypeStruct((N,), DT)).compile()
+
+
+def p2_compute_between():
+  """The whole point: independent compute scheduled between start and done."""
+
+  def f(x, w):
+    d = start(x)
+    busy = (w @ w).sum()            # no dependency on d -- XLA may place it in the gap
+    return done(x, d), busy
+
+  with jax.default_device(_topo_dev()):
+    jax.jit(f).lower(
+        jax.ShapeDtypeStruct((N,), DT), jax.ShapeDtypeStruct((256, 256), DT)
+    ).compile()
+
+
+def p3_remote():
+  """Cross-device start/done -- the shape a weight all-gather actually needs."""
   from jax.experimental import topologies
 
   topo = topologies.get_topology_desc("tpu7x:2x2x1", platform="tpu")
-  sem_sds = jax.ShapeDtypeStruct(pltpu.SemaphoreType.DMA(()).shape,
-                                 pltpu.SemaphoreType.DMA(()).dtype)
-  any_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-  sem_spec = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+  mesh = jax.sharding.Mesh(topo.devices[:8], ("fsdp",))
+  P = jax.sharding.PartitionSpec
 
-  start = pl.pallas_call(_start_body, in_specs=[any_spec, sem_spec], out_specs=any_spec,
-                         out_shape=jax.ShapeDtypeStruct((N,), DT))
-  done = pl.pallas_call(_done_body, in_specs=[any_spec, any_spec, sem_spec],
-                        out_specs=any_spec, out_shape=jax.ShapeDtypeStruct((N,), DT),
-                        input_output_aliases={1: 0})
+  def _rstart_body(x_ref, o_ref, ss, rs):
+    nxt = jax.lax.rem(jax.lax.axis_index("fsdp") + 1, jax.lax.axis_size("fsdp"))
+    pltpu.make_async_remote_copy(x_ref, o_ref, ss, rs, device_id=nxt).start()
 
-  def f(x, sem):
-    return done(x, start(x, sem), sem)
+  def _rdone_body(x_ref, d_ref, o_ref, ss, rs):
+    nxt = jax.lax.rem(jax.lax.axis_index("fsdp") + 1, jax.lax.axis_size("fsdp"))
+    pltpu.make_async_remote_copy(x_ref, d_ref, ss, rs, device_id=nxt).wait()
+
+  sems = [pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA]
+  rstart = pl.pallas_call(_rstart_body, in_specs=[HBM], out_specs=HBM,
+                          out_shape=jax.ShapeDtypeStruct((N,), DT), scratch_shapes=sems)
+  rdone = pl.pallas_call(_rdone_body, in_specs=[HBM, HBM], out_specs=HBM,
+                         out_shape=jax.ShapeDtypeStruct((N,), DT), scratch_shapes=sems,
+                         input_output_aliases={1: 0})
+
+  def f(x):
+    return jax.shard_map(
+        lambda xx: rdone(xx, rstart(xx)),
+        mesh=mesh, in_specs=(P("fsdp"),), out_specs=P("fsdp"), check_vma=False,
+    )(x)
 
   with jax.default_device(topo.devices[0]):
-    jax.jit(f).lower(jax.ShapeDtypeStruct((N,), DT), sem_sds).compile()
+    jax.jit(f).lower(jax.ShapeDtypeStruct((N * 8,), DT)).compile()
 
 
 if __name__ == "__main__":
   print(f"jax {jax.__version__}")
-  print("P1  SEMAPHORE as a pallas_call operand")
-  ok1 = _report("trace", p1_semaphore_as_operand)
-  print("P2  two-kernel start/done sharing one semaphore")
-  ok2 = _report("trace", p2_two_kernel_start_done)
-  ok3 = _report("mosaic lowering (virtual tpu7x)", p2_mosaic_lowering) if ok2 else False
+  print("P1  local HBM->HBM start/done, semaphore reconstructed not passed")
+  ok1 = _report("mosaic lowering", p1_local)
+  print("P2  independent compute between start and done")
+  ok2 = _report("mosaic lowering", p2_compute_between)
+  print("P3  remote (cross-device) start/done")
+  ok3 = _report("mosaic lowering", p3_remote)
   print()
-  print(f"VERDICT: operand={ok1} two_kernel_trace={ok2} mosaic={ok3}")
-  if not (ok1 and ok2):
-    print("=> cross-kernel semaphore lifetime is NOT expressible as written;")
-    print("   the start/done split collapses to a single kernel unless another")
-    print("   mechanism carries the semaphore.")
+  print(f"VERDICT: local={ok1} compute_between={ok2} remote={ok3}")
