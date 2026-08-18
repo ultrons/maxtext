@@ -2210,3 +2210,35 @@ merged the fourth (upstream tightened the qwix condition to `== "fp8_full"`, we 
 `git apply -3` labels the working tree "ours", and getting that backwards would have silently
 reverted 97 commits of upstream refactors. The import audit (added after the `tgmm_block`
 ModuleNotFoundError) ran clean.
+
+### VERDICT: the pdbs=1 lever stack does NOT transfer to pdbs=4 [2026-08-18]
+`siv-r3002-ship2r`: 5 levers (cv-wag e4m3 weight AG, ring cotangent AG, e4m3 bwd gradients,
+in-kernel bwd quant dlhs+drhs, unsort mask off) at the baseline's **rbf=2**, 4x8x8 / pdbs=4.
+**12.075 s, loss 8.754** vs baseline 12.098 / 8.764 = **-0.023 s = +5 TPS/chip. Noise.**
+
+**Full table, everything priced against the same 12.098 s baseline:**
+| change | s/step | TPS/chip | delta |
+|---|---|---|---|
+| upstream head (baseline) | 12.098 | 2708 | -- |
+| **our fp8 token AG (simple wire format)** | **11.988** | **2734** | **+25** |
+| 3002.patch ported (QArray end-to-end) | 12.070 | 2714 | +6 |
+| tgmm in-kernel bwd quant alone | 12.069 | 2714 | +6 |
+| 5-lever pdbs=1 stack @ rbf=2 | 12.075 | 2713 | +5 |
+| dependency bump to head | 12.194 | 2687 | -21 |
+| pdbs=1 stack @ rbf=4 | OOM 189.71G | -- | -- |
+| pdbs=1 stack @ rbf=-1 | OOM 199.57G | -- | -- |
+| **internal record** | **10.91** | **3002** | **+294** |
+
+**CORRECTION to the previous entry.** I attributed the rbf=-1 OOM to worst-case buffer sizing being
+structurally too large at pdbs=4. The rbf=4 arm refutes that: **189.71G vs 199.57G, only 5% apart**,
+so the buffer factor is NOT the dominant term -- our LEVERS are what overflow HBM. Leading suspect
+is `moe_x_sorted=device`, which trades recompute for a saved activation that scales directly with
+per-device batch (131072 x 7168 per layer at pdbs=4, 4x the pdbs=1 size). Not isolated yet: the
+5-lever arm that fits simply excludes it.
+
+**So the pdbs=1 arc is a small-batch result.** Several of its levers buy time by spending HBM, and at
+4x the batch that trade is unavailable; the one lever whose mechanism is padding-driven
+(in-kernel bwd quant) needs rbf=-1 to pay, and rbf=-1 does not fit. Neither the deck nor the blog
+should imply these transfer. The one thing that DID move this baseline is the simplest change in the
+set -- the e4m3 token all-gather at +25 TPS/chip with matching loss -- and it is not from the
+pdbs=1 arc at all; it was written this session.
