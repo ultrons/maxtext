@@ -111,7 +111,8 @@ def _rdone_body(x_ref, d_ref, o_ref, ss, rs):
 
 def r3(mesh):
   sems = [pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA]
-  cp = pltpu.CompilerParams(collective_id=7)
+  cp = pltpu.CompilerParams(collective_id=7, allow_collective_id_without_custom_barrier=True,
+                            has_side_effects=True)
   rstart = pl.pallas_call(_rstart_body, in_specs=[HBM], out_specs=HBM,
                           out_shape=jax.ShapeDtypeStruct((N,), DT),
                           scratch_shapes=sems, compiler_params=cp)
@@ -134,6 +135,73 @@ def r3(mesh):
   want = host[(np.arange(nd) - 1) % nd]
   gate("R3 remote start/done delivers the neighbour's shard",
        np.allclose(got, want), f"max|err|={np.max(np.abs(got - want)):.3e}")
+
+
+# ---------------------------------------------------------------------------
+# R5 MISMATCHED SCRATCH -- the failure mode that would bite silently in the model.
+# R1 only proves the two kernels' scratch semaphores coincide when their scratch
+# FOOTPRINTS are identical. A real gather gives `start` and `done` different scratch
+# (done needs VMEM staging, start does not). If Mosaic then assigns the DMA semaphore a
+# different slot, the wait targets the wrong sync flag and it fails as a hang or as
+# corruption, never as an error. So: give `done` extra scratch AHEAD of its semaphore
+# and check the bytes still arrive.
+# ---------------------------------------------------------------------------
+def _done_body_mm(x_ref, d_ref, o_ref, pad_vmem, pad_sem, sem):
+  pltpu.make_async_copy(x_ref, d_ref, sem).wait()
+
+
+def r5(dev):
+  done_mm = pl.pallas_call(
+      _done_body_mm, in_specs=[HBM, HBM], out_specs=HBM,
+      out_shape=jax.ShapeDtypeStruct((N,), DT),
+      scratch_shapes=[pltpu.VMEM((256, 128), DT), pltpu.SemaphoreType.REGULAR,
+                      pltpu.SemaphoreType.DMA],
+      input_output_aliases={1: 0})
+
+  @jax.jit
+  def f(x):
+    return done_mm(x, _start(x))
+
+  x = jax.device_put(jnp.arange(N, dtype=DT) * 0.001 + 3.0, dev)
+  print("    r5: lowering/compiling ...", flush=True)
+  c = jax.jit(f).lower(x).compile()
+  print("    r5: COMPILED ok; executing (a hang past here == wrong sync flag) ...", flush=True)
+  got = np.asarray(c(x))
+  print("    r5: executed", flush=True)
+  gate("R5 start/done survives MISMATCHED scratch footprints",
+       np.allclose(got, np.asarray(x)),
+       f"max|err|={np.max(np.abs(got - np.asarray(x))):.3e}")
+
+
+# ---------------------------------------------------------------------------
+# R6 THE FIX: mismatched scratch hangs (R5), so make `start` declare the SAME scratch
+# signature as `done` even though it does not use the padding. If this passes, the rule
+# for every start/done pair we build is: byte-identical scratch_shapes on both halves.
+# ---------------------------------------------------------------------------
+_PAD = [pltpu.VMEM((256, 128), DT), pltpu.SemaphoreType.REGULAR, pltpu.SemaphoreType.DMA]
+
+
+def _start_body_pad(x_ref, o_ref, pad_vmem, pad_sem, sem):
+  pltpu.make_async_copy(x_ref, o_ref, sem).start()
+
+
+def r6(dev):
+  start_pad = pl.pallas_call(_start_body_pad, in_specs=[HBM], out_specs=HBM,
+                             out_shape=jax.ShapeDtypeStruct((N,), DT), scratch_shapes=_PAD)
+  done_pad = pl.pallas_call(_done_body_mm, in_specs=[HBM, HBM], out_specs=HBM,
+                            out_shape=jax.ShapeDtypeStruct((N,), DT), scratch_shapes=_PAD,
+                            input_output_aliases={1: 0})
+
+  def f(x):
+    return done_pad(x, start_pad(x))
+
+  x = jax.device_put(jnp.arange(N, dtype=DT) * 0.001 + 5.0, dev)
+  c = jax.jit(f).lower(x).compile()
+  print("    r6: COMPILED ok; executing ...", flush=True)
+  got = np.asarray(c(x))
+  gate("R6 MATCHED scratch on both halves restores correctness",
+       np.allclose(got, np.asarray(x)),
+       f"max|err|={np.max(np.abs(got - np.asarray(x))):.3e}")
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +251,11 @@ if __name__ == "__main__":
   nd = jax.device_count()
   mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape(nd), ("fsdp",))
 
-  for fn, args in ((r1_r2, (dev,)), (r3, (mesh,)), (r4, (dev,))):
+  import os
+  sel = os.environ.get("GATES", "")
+  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r4": (r4, (dev,))}
+  chosen = [allg[k] for k in (sel.split(",") if sel else allg) if k in allg]
+  for fn, args in chosen:
     try:
       fn(*args)
     except Exception as e:  # noqa: BLE001

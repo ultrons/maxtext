@@ -2522,3 +2522,41 @@ emitting the two calls back to back. Those need hardware: v5p (4 chips, SparseCo
 The runtime gate is P4 -- assert the destination contents, and measure the NEIGHBOURING gmm's
 bandwidth, because `mpmd-map-sc-barrier-blocks-fsdp-ag` records an SC kernel next to a gmm poisoning
 an all-gather from 47 -> 3 GB/s and that adjacency is exactly what this pattern creates.
+
+## start/done RUNTIME gates on v7x 2x2x1 -- the pattern works, with one hard constraint
+
+Cluster `sivaibhav-exp-v7x`, one 2x2x1 node (4 chips / 8 devices), jax 0.10.1, plain Indexed Job
+with TPU topology selectors + `google.com/tpu` toleration. Probe `probes/startdone_runtime.py`.
+
+| gate | result |
+|---|---|
+| R1 `done`'s RECONSTRUCTED descriptor waits on the DMA `start` armed (local) | **PASS** `max err 0.000e+00` |
+| R2 ordering holds with independent compute between start and done | **PASS** `0.000e+00` |
+| R3 remote cross-device start/done delivers the neighbour's shard | **PASS** `0.000e+00` |
+| R4 matmul throughput next to an in-flight start/done | **PASS** 819.4 -> 789.2 TFLOP/s (96.3%) |
+| R5 MISMATCHED scratch footprints | **HANGS** (compiles, then never completes) |
+
+R1 is the binary question and it is exact: no semaphore crosses the kernel boundary, each kernel
+allocates its own DMA semaphore as scratch, and rebuilding the identical descriptor in `done` waits
+on the flag `start` armed.
+
+R4 settles the standing worry from `mpmd-map-sc-barrier-blocks-fsdp-ag`, where an SC kernel next to
+a gmm poisoned an all-gather 47 -> 3 GB/s. A TC-shaped custom call does not do that: 96.3% of matmul
+throughput is retained next to an in-flight DMA. Bounded, not eliminated -- this is a clean
+microbenchmark and the model has far more contention.
+
+**R5 is the constraint that shapes every kernel we write.** Giving `done` extra scratch (VMEM +
+REGULAR semaphore) AHEAD of its DMA semaphore compiles fine and then hangs at execution. The
+instrumented run prints `r5: COMPILED ok; executing ...` and never returns, which isolates it to
+runtime rather than lowering. Mosaic assigns the DMA semaphore a different slot when the scratch
+footprint differs, so the reconstructed descriptor waits on the wrong sync flag. It fails as a HANG,
+never as an error. **Rule: both halves of a start/done pair must declare byte-identical
+`scratch_shapes`**, even where one half does not use the padding. R6 tests exactly that fix.
+
+**Two false starts worth recording, because both looked like results.** The first R5 run died to
+SPOT PREEMPTION (`rig-2x2x1` nodes disappeared from the Ready list; kubelet went unreachable), which
+I initially read as the hang. The second hit `activeDeadlineSeconds` and Kubernetes DELETED the pod,
+taking the logs with it, and because the gate order put `r5` first a hang produced no output at all.
+Neither was a measurement. Fixes: run a known-good gate FIRST so a clean environment is proven,
+print either side of `.compile()` so a stall is attributable, stream logs to disk continuously, and
+prefer the non-spot `eval-2x2x1` pool.
