@@ -2177,3 +2177,36 @@ hypothesis left is the torus wiring (`gf_4x8x8_untwisted` vs our composed `tpu7x
 currently supported by nothing stronger than a platform NAME -- weak evidence, leading only because
 everything else is gone. Verified so far: we run 256 chips / **512 devices**, mesh
 `(1,1,1,64,1,1,1,1,1,1,8,1)` = **fsdp=64 x ep=8**, which matches the record's mesh exactly.
+
+### pdbs=1 SHIP STACK ON pdbs=4: rbf=-1 OOMs, and that is structural [2026-08-18]
+`siv-r3002-ship2` (7 levers, rbf=-1, 4x8x8/pdbs=4):
+**`RESOURCE_EXHAUSTED: HLO temporaries (199.57G) exceeds available HBM (94.74G)` -- 2.1x over.**
+
+**Why it cannot be tuned away:** rbf=-1 sizes the ragged buffer WORST CASE, which at EP=8 is 8x the
+balanced size, and the balanced size at pdbs=4 is already 4x what our pdbs=1 work carried
+(131072 local rows vs 32768). **=> the entire rbf=-1 ladder (the in-kernel-quant campaign, 5.474 ->
+4.508) is SPECIFIC TO THE SMALL-BATCH REGIME.** It also explains why the pdbs=4 line runs rbf=2 in
+the first place. Next probe: rbf=4 (`siv-r3002-ship4`), which doubles the padded fraction vs rbf=2
+while staying far below worst case -- the mechanism is padding-driven, so that is where it would
+first show if it transfers at all.
+
+### moe_fold_wo_scale_in_gather BLOCKED on this config
+`siv-r3002-ship1` (8 levers): **`AssertionError: col_scale must be 1D [hidden_size]=7168, got (1,)`**.
+The fold needs a PER-CHANNEL wo scale. `_cv_scale` does produce `[1,1,7168]` (max over axes (0,1)),
+so cv-wag's branch is evidently NOT engaging here and `wo_scale` is arriving from qwix's static
+`fixed,-224,224` path as a scalar. NOT fully diagnosed: the `_fp8cv` branch has preconditions
+(`not w01_only and not wo_only`, plus whatever sets `_fp8cv`) I have not traced, so I cannot yet say
+whether the cause is the calibration method, a config precondition, or the merge. Excluded that one
+lever to get the other seven measured; the fold was a small piece of the pdbs=1 ladder
+(part of 4.599 -> 4.508).
+
+### PORT METHOD, second application -- WORKED AGAIN
+Merge-base diff (`5f2c70a563`) of 8 files -> `git apply -3` on a clean upstream worktree:
+everything clean except **4 conflicts, all in moe.py**, all of them upstream REFACTORS of code we
+touched (precomputed `output_pspec`; `_maybe_shard_with_pspec` sharding block;
+`remove_mesh_axes_from_partition_spec` replacing `embed_tensor_transpose`). Took upstream on three,
+merged the fourth (upstream tightened the qwix condition to `== "fp8_full"`, we add `qwix_rule`).
+**Verified the ours/theirs orientation against the PRISTINE upstream file before resolving** --
+`git apply -3` labels the working tree "ours", and getting that backwards would have silently
+reverted 97 commits of upstream refactors. The import audit (added after the `tgmm_block`
+ModuleNotFoundError) ran clean.
