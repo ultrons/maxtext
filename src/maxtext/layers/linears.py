@@ -428,7 +428,9 @@ class DenseGeneral(nnx.Module):
         and self.hoist_weight_ag_sched_group >= 0:
       from maxtext.kernels.startdone import split_copy
 
-      kernel = split_copy(kernel)
+      _pspec = get_physical_spec_without_axes(
+          PartitionSpec(*self.kernel_axes), self.mesh, FSDP_MESH_AXES).spec
+      kernel = split_copy(kernel, self.mesh, _pspec)
 
     # out_sharding should be None for auto mesh axis
     if self.shard_mode != ShardMode.EXPLICIT:

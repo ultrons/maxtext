@@ -15,6 +15,8 @@ not raise. `_SCRATCH` below is shared by both halves for exactly this reason, an
 `assert_scratch_matches()` is the guard so a future edit cannot break it silently.
 """
 
+import functools
+
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -43,7 +45,7 @@ def _done_body(x_ref, d_ref, o_ref, sem):
   pltpu.make_async_copy(x_ref, d_ref, sem).wait()
 
 
-def _split_copy_impl(x):
+def _split_copy_impl(x, mesh, spec):
   """Identity, expressed as an armed DMA and a separate wait.
 
   Structurally this is what a split-phase gather looks like from XLA's point of view: two
@@ -52,7 +54,11 @@ def _split_copy_impl(x):
   performance change.
   """
   assert_scratch_matches(_SCRATCH, _SCRATCH)
-  shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+  shard = tuple(
+      d // mesh.shape[a] if (a := spec[i]) is not None and a in mesh.shape else d
+      for i, d in enumerate(x.shape)
+  )
+  shape = jax.ShapeDtypeStruct(shard, x.dtype)
   start = pl.pallas_call(
       _start_body, in_specs=[_HBM], out_specs=_HBM, out_shape=shape,
       scratch_shapes=_SCRATCH,
@@ -61,7 +67,12 @@ def _split_copy_impl(x):
       _done_body, in_specs=[_HBM, _HBM], out_specs=_HBM, out_shape=shape,
       scratch_shapes=_SCRATCH, input_output_aliases={1: 0},
   )
-  return done(x, start(x))
+  # Mosaic kernels cannot be automatically partitioned ("Please wrap the call in a
+  # shard_map"), so the pair runs per-shard with the kernel's own physical spec.
+  return jax.shard_map(
+      lambda xx: done(xx, start(xx)), mesh=mesh,
+      in_specs=(spec,), out_specs=spec, check_vma=False,
+  )(x)
 
 
 # A pallas_call on a grad-live path cannot be differentiated: autodiff descends into the
@@ -70,16 +81,16 @@ def _split_copy_impl(x):
 # the same reason `moe.py`'s `_make_cv_gather` is a custom_vjp. The PRIMAL keeps the real
 # start/done pair, so `remat_policy=custom` re-runs the pair in the backward, which is the
 # property this probe exists to measure.
-@jax.custom_vjp
-def split_copy(x):
-  return _split_copy_impl(x)
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2))
+def split_copy(x, mesh, spec):
+  return _split_copy_impl(x, mesh, spec)
 
 
-def _split_copy_fwd(x):
-  return _split_copy_impl(x), None
+def _split_copy_fwd(x, mesh, spec):
+  return _split_copy_impl(x, mesh, spec), None
 
 
-def _split_copy_bwd(_res, ct):
+def _split_copy_bwd(mesh, spec, _res, ct):
   # Transpose of an identity copy is the identity. A real gather's transpose is a tiled
   # psum_scatter (see `_make_cv_gather`).
   return (ct,)
