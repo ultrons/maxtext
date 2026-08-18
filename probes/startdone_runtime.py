@@ -245,6 +245,46 @@ def r4(dev):
        f"{g_alone:.1f} -> {g_adj:.1f} TFLOP/s ({ratio*100:.1f}% retained)")
 
 
+
+# ---------------------------------------------------------------------------
+# R7  the REAL forward split all-gather: does it match lax.all_gather exactly, and does
+#     its VJP match the stock gather's VJP? A wrong transpose corrupts weight grads
+#     silently, so the gradient is checked, not just the forward value.
+# ---------------------------------------------------------------------------
+def r7(mesh):
+  from maxtext.kernels.startdone import split_all_gather
+
+  ax = "fsdp"
+  n = mesh.shape[ax]
+  K, C = 256, 128
+  in_spec, out_spec = P(ax, None), P(None, None)
+
+  def ours(w):
+    return split_all_gather(w, mesh, ax, in_spec, out_spec)
+
+  def stock(w):
+    return jax.shard_map(
+        lambda x: jax.lax.all_gather(x, ax, axis=0, tiled=True),
+        mesh=mesh, in_specs=(in_spec,), out_specs=out_spec, check_vma=False)(w)
+
+  rng = np.random.default_rng(0)
+  host = rng.standard_normal((K, C)).astype(np.float32)
+  w = jax.device_put(jnp.asarray(host), jax.sharding.NamedSharding(mesh, in_spec))
+
+  go, gs = np.asarray(jax.jit(ours)(w)), np.asarray(jax.jit(stock)(w))
+  gate("R7a split all-gather matches lax.all_gather", np.array_equal(go, gs),
+       f"max|err|={np.max(np.abs(go - gs)):.3e}")
+
+  # gradient of sum(f(w) * fixed) -- exercises the custom_vjp / psum_scatter transpose
+  co = jax.device_put(jnp.asarray(rng.standard_normal((K, C)).astype(np.float32)),
+                      jax.sharding.NamedSharding(mesh, out_spec))
+  loss = lambda f: (lambda w: jnp.sum(f(w) * co))
+  do = np.asarray(jax.jit(jax.grad(loss(ours)))(w))
+  ds = np.asarray(jax.jit(jax.grad(loss(stock)))(w))
+  gate("R7b split all-gather VJP matches the stock gather's VJP", np.allclose(do, ds, atol=0, rtol=0),
+       f"max|err|={np.max(np.abs(do - ds)):.3e}")
+
+
 if __name__ == "__main__":
   print(f"jax {jax.__version__}  devices={jax.device_count()}", flush=True)
   dev = jax.devices()[0]
@@ -253,7 +293,7 @@ if __name__ == "__main__":
 
   import os
   sel = os.environ.get("GATES", "")
-  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r4": (r4, (dev,))}
+  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r7": (r7, (mesh,)), "r4": (r4, (dev,))}
   chosen = [allg[k] for k in (sel.split(",") if sel else allg) if k in allg]
   for fn, args in chosen:
     try:

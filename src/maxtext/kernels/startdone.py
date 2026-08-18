@@ -130,19 +130,34 @@ def _peer_id(axis_name, mesh_axes, d):
 
 
 def _ag_descriptors(x_ref, o_ref, loc, ss, rs, axis_name, mesh_axes, n):
-  """The S copies, built identically by both halves. Order matters: it fixes the slots."""
+  """The S copies, built identically by both halves. Order matters: it fixes the slots.
+
+  ROTATION, not `for d in range(n)`. The loop is static but `me` is dynamic, so a plain
+  range includes d == me and the device both local-copies AND remote-copies into its own
+  slot: two writes to one destination and a semaphore count that does not match the waits.
+  That halts the core (`RuntimeUnexpectedCoreHalt`). Stepping `peer = (me + step) % n` over
+  step in 1..n-1 visits every OTHER device exactly once, with no self-send.
+  """
   me = jax.lax.axis_index(axis_name)
   yield pltpu.make_async_copy(x_ref, o_ref.at[me], loc)
-  for d in range(n):
+  for step in range(1, n):
+    peer = jax.lax.rem(me + step, n)
     yield pltpu.make_async_remote_copy(
-        x_ref, o_ref.at[me], ss, rs, device_id=_peer_id(axis_name, mesh_axes, d)
+        x_ref, o_ref.at[me], ss, rs, device_id=_peer_id(axis_name, mesh_axes, peer)
     )
 
 
-def _ag_barrier(n):
+def _ag_barrier(axis_name, mesh_axes, n):
+  """Handshake so no peer writes into our output before it exists.
+
+  device_id must be the multi-axis MESH dict, not a bare int: a flat integer is only
+  correct on a 1-D mesh and silently addresses the wrong device on the model's mesh.
+  """
   bar = pltpu.get_barrier_semaphore()
-  for d in range(n):
-    pl.semaphore_signal(bar, device_id=d)
+  me = jax.lax.axis_index(axis_name)
+  for step in range(n):
+    peer = jax.lax.rem(me + step, n)
+    pl.semaphore_signal(bar, device_id=_peer_id(axis_name, mesh_axes, peer))
   pl.semaphore_wait(bar, n)
 
 
@@ -150,7 +165,7 @@ def make_ag_bodies(axis_name, mesh_axes, n):
   """Build the start/done kernel bodies for an S-way push all-gather."""
 
   def start_body(x_ref, o_ref, loc, ss, rs):
-    _ag_barrier(n)
+    _ag_barrier(axis_name, mesh_axes, n)
     for dma in _ag_descriptors(x_ref, o_ref, loc, ss, rs, axis_name, mesh_axes, n):
       dma.start()
 
