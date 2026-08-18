@@ -97,3 +97,65 @@ def _split_copy_bwd(mesh, spec, _res, ct):
 
 
 split_copy.defvjp(_split_copy_fwd, _split_copy_bwd)
+
+
+# =============================================================================
+# Forward split-phase all-gather.
+#
+# Push model: every device arms one DMA per peer, writing its OWN shard into that peer's
+# output slot, plus a local copy into its own slot. `start` arms all S of them and returns;
+# `done` reconstructs the identical descriptors and waits. One start, one done, maximal
+# concurrency, and the layer's compute sits in the gap.
+#
+# The output is shaped (S,) + shard so the destination slot is a clean `o_ref.at[me]`;
+# callers reshape to the gathered layout afterwards.
+#
+# The BACKWARD is `lax.psum_scatter`, i.e. XLA's reduce-scatter, deliberately. Measured on
+# the 6.864 s profile the reduce-scatters run 10.4-25.9 GB/s while the gathers we are
+# chasing run 0.3-1.1 GB/s, and `rs-lever-mapped-closed` already found direct-to-owner RS
+# near-optimal and not reclaimable by a better kernel. The RS is not the pathology, so we do
+# not write an accumulating kernel to replace it.
+#
+# Barrier: a peer must not write into our output before it exists, so both halves open with
+# a `get_barrier_semaphore` handshake keyed by `collective_id`.
+# =============================================================================
+
+# start and done share this signature -- see R5/R6, a mismatch HANGS rather than raising.
+_AG_SCRATCH = [pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA]
+
+
+def _peer_id(axis_name, mesh_axes, d):
+  """Rank `d` on the gather axis, every other mesh axis held at this device's index."""
+  return {a: (d if a == axis_name else jax.lax.axis_index(a)) for a in mesh_axes}
+
+
+def _ag_descriptors(x_ref, o_ref, loc, ss, rs, axis_name, mesh_axes, n):
+  """The S copies, built identically by both halves. Order matters: it fixes the slots."""
+  me = jax.lax.axis_index(axis_name)
+  yield pltpu.make_async_copy(x_ref, o_ref.at[me], loc)
+  for d in range(n):
+    yield pltpu.make_async_remote_copy(
+        x_ref, o_ref.at[me], ss, rs, device_id=_peer_id(axis_name, mesh_axes, d)
+    )
+
+
+def _ag_barrier(n):
+  bar = pltpu.get_barrier_semaphore()
+  for d in range(n):
+    pl.semaphore_signal(bar, device_id=d)
+  pl.semaphore_wait(bar, n)
+
+
+def make_ag_bodies(axis_name, mesh_axes, n):
+  """Build the start/done kernel bodies for an S-way push all-gather."""
+
+  def start_body(x_ref, o_ref, loc, ss, rs):
+    _ag_barrier(n)
+    for dma in _ag_descriptors(x_ref, o_ref, loc, ss, rs, axis_name, mesh_axes, n):
+      dma.start()
+
+  def done_body(x_ref, d_ref, o_ref, loc, ss, rs):
+    for dma in _ag_descriptors(x_ref, d_ref, loc, ss, rs, axis_name, mesh_axes, n):
+      dma.wait()
+
+  return start_body, done_body
