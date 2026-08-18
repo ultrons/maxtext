@@ -2667,3 +2667,31 @@ covering only slots actually written) carry over unchanged.
 
 Still unattributed and to be retested after the redesign: the `RuntimeUnexpectedCoreHalt` seen at
 the local-copy rung under the broken-alias configuration.
+
+## WORKING split all-gather: static destinations only [2026-08-18]
+
+`probes/ag_static.py` on v7x 2x2x1 (8 devices): **PASS, all positions correct**, exit 0.
+
+The push model failed because the destination offset `o_ref.at[me]` is computed on the sender and
+has to be interpreted in the receiver's buffer; the bytes silently never arrived. A pull model does
+NOT fix that -- the offset still crosses the device boundary. What rung L0 actually proved is that a
+remote copy into a STATIC, whole-buffer destination delivers correctly, so the design that follows
+is to never index at all:
+
+  at step k (k = 1..n-1, a PYTHON constant) device `me` pushes its shard into device (me+k)'s
+  buffer k.
+
+`k` is static on both sides, so no offset ever crosses a device boundary. Receiver j's buffer k
+holds shard (j-k) mod n, and the gathered array is assembled outside the kernel with ordinary XLA
+ops (no DMA addressing). One `start` arms all n-1 sends, one `done` reconstructs and waits, both
+halves sharing one scratch signature (R5/R6). Each step gets its OWN send/recv semaphore pair,
+which also sidesteps the untested question of whether n-1 copies can share one pair.
+
+**Open and untested: scale.** n-1 output buffers and 2(n-1) semaphores in a single kernel is 127
+buffers / 254 semaphores at fsdp=128. The 8-device rig cannot answer whether that is within Mosaic's
+limits, and it is the same class of unknown as DMA queue depth. Fallback if it bites: a ring over
+fewer steps with a static double buffer, trading kernel width for sequential steps.
+
+Next: (1) width/scale probe, (2) replace the push implementation in `kernels/startdone.py` with
+this one and re-gate numerics + VJP (R7a/R7b), (3) AOT, (4) cluster A/B against the stock 6.864 s
+baseline with the hoist off.
