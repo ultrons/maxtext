@@ -2609,3 +2609,34 @@ indistinguishable. Note the backward is where this stops being thin -- a `psum_s
 accumulation, not just DMA, so it is more than a start/done wrapper around the same transfer. That
 matters because the bwd-remat gathers are the worse half: `.445` at 0.3 GB/s is the single biggest
 item in the profile.
+
+## Split all-gather: the push model's addressing assumption is WRONG [2026-08-18]
+
+Bisection ladder (`probes/ag_ladder.py`) on v7x 2x2x1, climbing from the known-good R3.
+
+| rung | result |
+|---|---|
+| L0 == R3: barrier, 1 remote copy, STATIC whole-buffer dest, no local copy | **PASS** |
+| L1 + slot destination `o_ref.at[me]` | **FAIL, wrong slots, no halt** |
+
+Failures are uniform across devices (`(0,7) (1,0) (2,1) ...`), i.e. every device's expected
+slot `j-1` holds the wrong shard. So a remote `make_async_remote_copy` into `o_ref.at[me]`
+does NOT deposit the sender's shard in the receiver's slot `me`. The whole push model was built
+on that assumption. This is a silent-corruption failure, not a halt.
+
+**Four ladder iterations were spent debugging the PROBE, not the kernel.** Recording them because
+each is a trap worth not repeating:
+1. DMA src/dst rank mismatch -- a 2-D `(n,SHARD)` array sharded on axis 0 gives a `(1,SHARD)`
+   shard against a `(SHARD,)` slot: `'tpu.enqueue_dma' op DMA source and target must have the
+   same shape`.
+2. The first ladder's L1 differed from R3 by THREE things (dropped barrier, added `.at[me]`,
+   added a local copy), so its halt was uninformative.
+3. `input_output_aliases` is NOT optional: without it `done` waits on DMAs landing in `d_ref`
+   and returns `o_ref`, which nothing writes, so the result is garbage by construction. Every
+   gate that ever passed had it on.
+4. The expected-slot set included the local slot even when the local copy was disabled, which
+   manufactured failures and hid the real (uniform) one behind a fake asymmetry.
+
+Also unattributed: an earlier `RuntimeUnexpectedCoreHalt` at the rung that adds a local copy
+alongside the remote one. It ran under the broken-alias configuration, so "the local copy halts"
+is NOT established and must be retested once addressing is fixed.

@@ -107,6 +107,14 @@ def run_rung(mesh, name, n_peers, use_barrier, alias, slots=True, local=True):  
   senders = lambda j: ([j] if local else []) + [(j - k) % n for k in range(1, n_peers + 1)]
   ok = all(np.array_equal(got[j, s], host[s]) for j in range(n) for s in senders(j))
   bad = [(j, s) for j in range(n) for s in senders(j) if not np.array_equal(got[j, s], host[s])]
+  if not ok:
+    # Where did the bytes ACTUALLY land? For each device, report slot -> source shard.
+    for j in range(min(n, 3)):
+      m = {}
+      for sl in range(n):
+        src = [t for t in range(n) if np.array_equal(got[j, sl], host[t])]
+        m[sl] = src[0] if src else None
+      print(f"      dev{j} slot->shard {m}", flush=True)
   gate(name, ok, "slot contents correct" if ok else f"wrong slots (sample {bad[:3]})")
 
 
