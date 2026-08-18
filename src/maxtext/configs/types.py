@@ -1138,6 +1138,20 @@ class MoEGeneral(BaseModel):
           "to a full sort. Grouped routing measures 2.256 s/step (vreuse 8.997 vs vnogrp 6.741)."
       ),
   )
+  shared_expert_weight_ag_sched_group: int = Field(
+      -1,
+      description=(
+          "When >= 0, the MoE shared expert issues its FSDP weight all-gather EXPLICITLY (a "
+          "sharding constraint that drops the fsdp axes, placed ahead of the dot) tagged with this "
+          "XLA _scheduling_group_id, and its wi/wo weights take ids base, base+1, base+2 so the "
+          "all-gather combiner cannot fuse them into one un-hideable monolith. -1 keeps the stock "
+          "SPMD-inserted gather. Motivation: the stock shared-expert gather measures 7.5 ms/iter at "
+          "~1.1 GB/s in the forward while a larger backward gather of the same op runs at 29.9 GB/s, "
+          "so cost tracks the phase rather than the payload. NOTE this gathers the bf16 kernel "
+          "(29.4 MB) rather than the e4m3 one SPMD emits (14.7 MB), because the qwix quantize "
+          "happens inside the dot; the doubling is the price of reaching the gather at all."
+      ),
+  )
   moe_shared_expert_sched_group: int = Field(
       -1,
       description=(

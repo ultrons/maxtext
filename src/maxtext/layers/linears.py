@@ -15,7 +15,6 @@
 """Linear Layers."""
 
 import functools
-import os
 import operator
 from typing import Any, Callable, Iterable, Sequence
 
@@ -44,11 +43,6 @@ from maxtext.utils.sharding import maybe_shard_with_name
 from maxtext.utils.sharding import get_physical_spec_without_axes
 from maxtext.utils.sharding import FSDP_MESH_AXES
 from maxtext.utils.sharding import truncate_out_sharding
-
-# Scheduling-group id for the kernel materialization (the op SPMD hangs the FSDP weight
-# all-gather off). -1 disables. Read from the environment so no constructor plumbing is
-# needed across every DenseGeneral call site.
-_DENSE_KERNEL_SCHED_GROUP = int(os.environ.get("DENSE_KERNEL_SCHED_GROUP", "-1"))
 
 
 def _convert_to_activation_function(fn_or_string: str | Callable[..., Any]) -> Callable[..., Any]:
@@ -139,6 +133,7 @@ class DenseGeneral(nnx.Module):
       mesh: Mesh | None = None,
       use_two_stage_all_gather: bool = False,
       debug_sharding: bool = False,
+      hoist_weight_ag_sched_group: int = -1,
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
   ):
@@ -165,6 +160,10 @@ class DenseGeneral(nnx.Module):
         transpose XLA emits for a single combined 2-axis all-gather.
       debug_sharding: when True, log the logical/physical sharding of the
         two-stage all-gather constraints to the sharding dump files.
+      hoist_weight_ag_sched_group: when >= 0, issue the FSDP weight all-gather
+        EXPLICITLY (a sharding constraint that drops the fsdp axes) before the
+        dot, tagged with this XLA `_scheduling_group_id`, instead of leaving it
+        to SPMD to insert next to the matmul. -1 leaves the default behaviour.
       rngs: RNG state for initialization in nnx.
     """
     self.in_features_shape = canonicalize_tuple(in_features_shape)
@@ -181,6 +180,7 @@ class DenseGeneral(nnx.Module):
     self.parameter_memory_host_offload = parameter_memory_host_offload
     self.mesh = mesh
     self.use_two_stage_all_gather = use_two_stage_all_gather
+    self.hoist_weight_ag_sched_group = hoist_weight_ag_sched_group
     self.debug_sharding = debug_sharding
 
     # Parameter initialization
@@ -261,6 +261,36 @@ class DenseGeneral(nnx.Module):
     kernel = shard(kernel, stage2)
     return kernel
 
+  def _maybe_hoist_weight_ag(self, kernel):
+    """Issue the FSDP weight all-gather explicitly, tagged, ahead of the dot.
+
+    By default SPMD inserts this gather itself, right next to the matmul that
+    consumes the kernel, and it lands on the *quantized* tensor inside
+    `_compute_dot_general_nnx`. For the MoE shared expert that gather measures
+    7.5 ms/iter at ~1.1 GB/s in the forward, while a comparable backward gather
+    of more bytes runs at 29.9 GB/s, so the cost tracks the phase rather than
+    the payload and the scheduler is what we want to reach.
+
+    Dropping the fsdp axes from the kernel's sharding here forces the gather at
+    a point we choose, where a `_scheduling_group_id` can attach to it. The
+    kernel is still bf16 at this point, so the wire cost doubles relative to the
+    e4m3 gather SPMD would emit (29.4 MB vs 14.7 MB for the shared expert); the
+    backward measurement above says that is affordable if placement is the
+    problem, and the AOT dump tells us whether we moved the gather or added one.
+    """
+    sg = self.hoist_weight_ag_sched_group
+    if sg is None or sg < 0 or self.mesh is None:
+      return kernel
+    if not any(self.mesh.shape.get(ax, 1) > 1 for ax in FSDP_MESH_AXES):
+      return kernel
+    full_logical = PartitionSpec(*self.kernel_axes)
+    gathered = get_physical_spec_without_axes(full_logical, self.mesh, FSDP_MESH_AXES)
+    with xla_metadata.set_xla_metadata(_scheduling_group_id=sg):
+      kernel = maybe_shard_with_name(
+          kernel, gathered, shard_mode=self.shard_mode, debug_sharding=self.debug_sharding
+      )
+    return kernel
+
   def __call__(
       self,
       inputs: Array,
@@ -301,23 +331,14 @@ class DenseGeneral(nnx.Module):
       if self.parameter_memory_host_offload:
         max_logging.log("linear.py: Moving parameter logits_dense kernel to device")
         kernel = jax.device_put(kernel, max_utils.device_space())
-      # Tag ONLY the kernel materialization -- the narrow region where SPMD inserts the FSDP
-      # weight all-gather. Tagging the whole layer fails: XLA rejects a scheduling group whose
-      # members are non-contiguous ("annotation groups with gaps"), because the matmul and the
-      # gather get separated in the schedule.
-      _sg = _DENSE_KERNEL_SCHED_GROUP
-      if _sg is not None and _sg >= 0:
-        with xla_metadata.set_xla_metadata(_scheduling_group_id=_sg):
-          kernel = jnp.asarray(kernel, self.dtype)
-      else:
-        kernel = jnp.asarray(kernel, self.dtype)
-      # Name the MATERIALIZED (fsdp-gathered) kernel so the remat policy can SAVE it. Without this
-      # the backward's rematted_computation re-runs the weight all-gather: the per-pass HLO dump
-      # shows every one of these weights gathered twice per step, once in the scan body and once
-      # under checkpoint/rematted_computation. Saving the e4m3 copy costs far less than replicating
-      # the parameter, because it stores one quantized tensor rather than a bf16 param plus two
-      # optimizer moments.
-      kernel = checkpoint_name(kernel, "dense_kernel")
+      # NOTE: do NOT tag or checkpoint_name here. This is the SHARDED parameter, upstream of both
+      # the qwix quantize and the SPMD weight all-gather, which happen together inside
+      # `_compute_dot_general_nnx` below. A `_scheduling_group_id` placed on this cast lands on a
+      # no-op (the param is already bf16), XLA folds the cast away, and the annotation goes with it
+      # -- measured: 2 ops carried the id in the optimized HLO, neither of them a gather. A
+      # `checkpoint_name` here names a leaf that is always available, so it cannot stop the backward
+      # from re-running the gather. The hoist below is the site that actually reaches the gather.
+      kernel = jnp.asarray(kernel, self.dtype)
 
     if slice_bounds is not None:
       if self.quant is not None:
@@ -328,6 +349,7 @@ class DenseGeneral(nnx.Module):
       kernel = kernel[..., begin:end]
 
     kernel = self._maybe_two_stage_all_gather(kernel)
+    kernel = self._maybe_hoist_weight_ag(kernel)
 
     # out_sharding should be None for auto mesh axis
     if self.shard_mode != ShardMode.EXPLICIT:
@@ -522,6 +544,7 @@ class MlpBlock(nnx.Module):
           weight_dtype=self.weight_dtype,
           kernel_init=self.kernel_init,
           kernel_axes=("embed", "num_activations", "mlp"),
+          hoist_weight_ag_sched_group=self._hoist_wag_sg(0),
           quant=self.quant,
           use_bias=self.use_bias,
           shard_mode=self.config.shard_mode,
@@ -541,6 +564,7 @@ class MlpBlock(nnx.Module):
             weight_dtype=self.weight_dtype,
             kernel_init=self.kernel_init,
             kernel_axes=self._wi_kernel_axes(),
+            hoist_weight_ag_sched_group=self._hoist_wag_sg(idx),
             quant=self.quant,
             use_bias=self.use_bias,
             shard_mode=self.config.shard_mode,
@@ -559,6 +583,7 @@ class MlpBlock(nnx.Module):
         weight_dtype=self.weight_dtype,
         kernel_init=self.kernel_init,
         kernel_axes=self._wo_kernel_axes(),
+        hoist_weight_ag_sched_group=self._hoist_wag_sg(2),
         quant=self.quant,
         use_bias=self.use_bias,
         shard_mode=self.config.shard_mode,
@@ -611,6 +636,19 @@ class MlpBlock(nnx.Module):
     return bool(getattr(self.config, "moe_shared_expert_replicate", False)) and bool(
         getattr(self, "_is_shared_expert", False)
     )
+
+  def _hoist_wag_sg(self, offset=0):
+    """Scheduling-group id for this block's explicit FSDP weight all-gather.
+
+    Only the MoE shared expert opts in, so the MLA projections and the logits dense keep the
+    stock SPMD-inserted gather. Each weight gets its own id (base, +1, +2) so the all-gather
+    combiner cannot fuse the three into one monolith that no single compute region can hide,
+    which is the same reasoning the routed-expert gathers use in `moe.py`.
+    """
+    base = getattr(self.config, "shared_expert_weight_ag_sched_group", -1)
+    if base is None or base < 0 or not getattr(self, "_is_shared_expert", False):
+      return -1
+    return base + offset
 
   def _wi_kernel_axes(self):
     return (None, "mlp") if self._replicate_embed() else ("embed", "mlp")
