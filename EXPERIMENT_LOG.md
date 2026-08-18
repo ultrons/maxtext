@@ -2560,3 +2560,7 @@ taking the logs with it, and because the gate order put `r5` first a hang produc
 Neither was a measurement. Fixes: run a known-good gate FIRST so a clean environment is proven,
 print either side of `.compile()` so a stall is attributable, stream logs to disk continuously, and
 prefer the non-spot `eval-2x2x1` pool.
+
+**R6 PASS (`max err 0.000e+00`).** Giving `start` the same padded scratch signature as `done`
+(unused VMEM + REGULAR semaphore ahead of the DMA semaphore) restores exact delivery. The rule is
+confirmed and cheap: **both halves declare byte-identical `scratch_shapes`.**
