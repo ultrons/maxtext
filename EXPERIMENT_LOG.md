@@ -2564,3 +2564,48 @@ prefer the non-spot `eval-2x2x1` pool.
 **R6 PASS (`max err 0.000e+00`).** Giving `start` the same padded scratch signature as `done`
 (unused VMEM + REGULAR semaphore ahead of the DMA semaphore) restores exact delivery. The rule is
 confirmed and cheap: **both halves declare byte-identical `scratch_shapes`.**
+
+## STEP 0 ANSWERED: the start/done pair SURVIVES remat [2026-08-18]
+
+AOT `hlodump_sdremat4`, exit=0, real routing + MTP + grouped routing, `STARTDONE_PROBE=1` on the
+shared expert only. Differenced against the no-probe baseline `hlodump_dksg7` so nothing is
+attributed to us that was already there: `tpu_custom_call` goes **50 -> 68**, and all 18 new ops
+land in three scopes.
+
+| scope | new custom calls |
+|---|---|
+| `jvp()/while/body/closed_call/shard_map` (forward, inside scan) | 6 |
+| `transpose(jvp())/.../checkpoint/rematted_computation/shard_map` (backward remat) | 6 |
+| `jvp()/shard_map` (non-scanned layers) | 6 |
+
+Six per scope = 3 `DenseGeneral` (wi_0, wi_1, wo) x 2 kernels (start + done). The pair re-traces
+into `rematted_computation` intact and there is **no FAILED_PRECONDITION cycle** (0 matches).
+
+**Consequence for the plan.** Every weight in the census is a fwd + bwd-remat pair, so a single
+forward-side conversion covers BOTH members. The plan stays a handful of edits rather than doubling
+into the hand-written backward path.
+
+### Three environment requirements, each cost one ~25 min AOT round trip
+
+These are the reusable part; any real gather needs all three regardless of which weight it targets.
+
+1. **Byte-identical `scratch_shapes` on both halves** (R5/R6). Mismatch HANGS, does not raise.
+2. **`custom_vjp` wrapper.** A `pallas_call` on a grad-live path cannot be differentiated:
+   `_pallas_call_jvp_rule` -> `ad.jvp_jaxpr` -> bare `AssertionError`. Same reason
+   `_make_cv_gather` is a custom_vjp.
+3. **`shard_map` wrapper.** `NotImplementedError: Mosaic kernels cannot be automatically
+   partitioned. Please wrap the call in a shard_map.`
+
+### Next: real VJP rules
+
+`split_copy`'s identity backward is correct only because the probe is an identity. A real split
+gather's transpose is a **tiled `psum_scatter`** over fsdp (as in `_make_cv_gather`); getting it
+wrong corrupts weight grads silently rather than erroring, so it needs a numerics gate against the
+stock gather, not just a compile.
+
+Stage it: correct plain-`psum_scatter` VJP first (gated on numerics), THEN split the backward into
+its own start/done pair. Doing both at once makes a correctness failure and a placement failure
+indistinguishable. Note the backward is where this stops being thin -- a `psum_scatter` needs
+accumulation, not just DMA, so it is more than a start/done wrapper around the same transfer. That
+matters because the bwd-remat gathers are the worse half: `.445` at 0.3 GB/s is the single biggest
+item in the profile.
