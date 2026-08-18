@@ -108,3 +108,90 @@ top of it would give two unexplained numerics sources and no way to attribute ei
 
 Substrate: real c4 tokens with `reuse_example_batch=1`. A synthetic run is 4.965 s and leaves
 SparseCore near-idle, which removes the contention this work exists to fix.
+
+---
+
+# Design as built (2026-08-18)
+
+## The problem in one line
+
+The FSDP weight all-gathers are exposed for **1274 ms/step, 18.8% of a 6.864 s step**, and they are
+slow because of WHERE XLA puts them, not because of the fabric or the collective implementation.
+The evidence: `all-gather.519` moves 245 MB at **80.8 GB/s** while `all-gather.445` moves 5.3 MB at
+**0.3 GB/s**. Same op, same replica groups, 46x the bytes, 250x the bandwidth. Two of 81 ops carry
+75% of the exposed time.
+
+## Why we stopped asking XLA nicely
+
+Four attempts to influence the scheduler all failed, and each failed for a different reason worth
+remembering. A region tag on the layer hits `annotation groups with gaps`. A narrow tag on the
+kernel materialization lands on a cast XLA folds away (2 ops carried the id, neither a gather). A
+`with_sharding_constraint` hoist gets ABSORBED by SPMD, which re-emits its own all-gather and drops
+our frontend attribute entirely. Only an explicitly emitted collective (`shard_map` + `lax.all_gather`)
+kept the tag, and that won -0.208 s -- but its placement is still XLA's to choose.
+
+So: own the transfer outright.
+
+## The mechanism: split-phase start/done
+
+Two ordinary TC-shaped Pallas custom calls. `start` arms the DMAs and returns WITHOUT waiting;
+`done` RECONSTRUCTS the identical descriptors and waits. Because both look like normal compute ops,
+XLA schedules around them instead of fencing at them, and whatever we place between them overlaps
+the transfer. Ordering is enforced by a real buffer dependency (`done` takes `start`'s output), since
+the semaphore is invisible to the scheduler.
+
+No semaphore is passed between the kernels. Each allocates its own as scratch, which is what puts it
+in sync-flag memory; Mosaic's deterministic allocation makes `done`'s rebuilt descriptor name the
+flag `start` armed.
+
+Measured on v7x: R1 delivery exact, R2 ordering holds with compute in the gap, R3 remote exact,
+R4 a neighbouring matmul retains **96.3%** of throughput (which retires the old `mpmd_map` worry that
+a co-resident kernel poisons collectives), R6 the scratch rule. R5 is the trap: **mismatched
+`scratch_shapes` between the halves HANGS** rather than raising, so both halves share one signature
+and a guard asserts it.
+
+## The kernel: static destinations, no indexing
+
+The natural push formulation (`o_ref.at[me]`) is REFUTED on hardware: the offset is computed on the
+sender and must be interpreted in the receiver's buffer, and the bytes silently never arrive at all.
+A pull model does not fix it -- the offset still crosses the boundary.
+
+What works: never index. At step `k` (`k = 1..n-1`, a PYTHON constant) device `me` pushes its shard
+into device `(me+k)`'s **buffer k**. `k` is static on both sides, each step has its own output buffer
+and its own send/recv semaphore pair, and the gathered array is assembled outside the kernel with
+ordinary XLA ops. Verified delivering every shard on 8 devices.
+
+## The backward
+
+`lax.psum_scatter`, i.e. XLA's reduce-scatter, deliberately. The reduce-scatters measure 10.4-25.9
+GB/s against the gathers' 0.3-1.1, and `rs-lever-mapped-closed` already found direct-to-owner RS
+near-optimal. The RS is not the pathology; writing an accumulating kernel would be effort on the
+healthy collective. Crucially the big backward item, `.445`, is an all-GATHER inside
+`rematted_computation` -- the forward gather re-run -- so it is covered by the forward conversion.
+
+## Where it plugs in, and why one change covers two gathers
+
+Inside `DenseGeneral`, ahead of the dot, replacing the SPMD-inserted gather. Every weight in the
+census appears as a **fwd + bwd-remat pair**, and Step 0 proved the start/done pair RE-TRACES into
+`rematted_computation` intact (6 pairs in each scope, no scheduling cycle). So one forward-side
+conversion covers both members.
+
+Placement is WITHIN a layer: `start` at the top, `done` before the consuming matmul. The budget says
+that is enough -- 45.2 ms/layer of TC compute against 22.0 ms/layer of exposed gather, a ratio of
+**2.06** -- so no cross-layer prefetch and no scan-carry plumbing.
+
+## Non-negotiable requirements (each cost an iteration to learn)
+
+1. Byte-identical `scratch_shapes` on both halves, or it hangs.
+2. `custom_vjp` wrapper: a `pallas_call` on a grad-live path cannot be differentiated.
+3. `shard_map` wrapper: Mosaic kernels cannot be auto-partitioned.
+4. `input_output_aliases` is mandatory, not optional: without it `done` returns a buffer nothing wrote.
+5. DMA source and destination shapes must match exactly.
+
+## What is left
+
+Scale (127 buffers / 254 semaphores at fsdp=128 is untested and could invalidate the width-based
+design; fallback is a ring with a static double buffer), then swap into `kernels/startdone.py` and
+re-gate numerics + VJP bit-exactly, AOT, then a cluster A/B against the **stock 6.864 s baseline with
+the hoist off** (the hoist is default-off pending an unexplained 0.174 lm_loss delta, and stacking
+would leave two numerics sources).
