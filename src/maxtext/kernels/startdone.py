@@ -159,3 +159,56 @@ def make_ag_bodies(axis_name, mesh_axes, n):
       dma.wait()
 
   return start_body, done_body
+
+
+_AG_CP = pltpu.CompilerParams(
+    collective_id=7, allow_collective_id_without_custom_barrier=True, has_side_effects=True
+)
+
+
+def _sag_impl(w, mesh, axis_name, in_spec, out_spec):
+  n = mesh.shape[axis_name]
+  mesh_axes = tuple(mesh.axis_names)
+  start_body, done_body = make_ag_bodies(axis_name, mesh_axes, n)
+  assert_scratch_matches(_AG_SCRATCH, _AG_SCRATCH)
+
+  def body(xx):
+    shard = jax.ShapeDtypeStruct((n,) + xx.shape, xx.dtype)
+    start = pl.pallas_call(
+        start_body, in_specs=[_HBM], out_specs=_HBM, out_shape=shard,
+        scratch_shapes=_AG_SCRATCH, compiler_params=_AG_CP,
+    )
+    done = pl.pallas_call(
+        done_body, in_specs=[_HBM, _HBM], out_specs=_HBM, out_shape=shard,
+        scratch_shapes=_AG_SCRATCH, input_output_aliases={1: 0}, compiler_params=_AG_CP,
+    )
+    g = done(xx, start(xx))               # <-- layer compute belongs in this gap
+    return g.reshape((n * xx.shape[0],) + xx.shape[1:])
+
+  return jax.shard_map(
+      body, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec, check_vma=False
+  )(w)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4))
+def split_all_gather(w, mesh, axis_name, in_spec, out_spec):
+  """FSDP weight all-gather we own the placement of. Backward is XLA's reduce-scatter."""
+  return _sag_impl(w, mesh, axis_name, in_spec, out_spec)
+
+
+def _sag_fwd(w, mesh, axis_name, in_spec, out_spec):
+  return _sag_impl(w, mesh, axis_name, in_spec, out_spec), None
+
+
+def _sag_bwd(mesh, axis_name, in_spec, out_spec, _res, ct):
+  # Transpose of a tiled all-gather is a tiled psum_scatter. Left to XLA on purpose: the
+  # reduce-scatters measure 10.4-25.9 GB/s against the gathers' 0.3-1.1 GB/s, so the RS is
+  # not the pathology and an accumulating kernel would be effort on the healthy collective.
+  g = jax.shard_map(
+      lambda c: jax.lax.psum_scatter(c, axis_name, scatter_dimension=0, tiled=True),
+      mesh=mesh, in_specs=(out_spec,), out_specs=in_spec, check_vma=False,
+  )(ct)
+  return (g,)
+
+
+split_all_gather.defvjp(_sag_fwd, _sag_bwd)
