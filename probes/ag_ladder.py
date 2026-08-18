@@ -82,10 +82,13 @@ def run_rung(mesh, name, n_peers, use_barrier, alias, check_slots):
   @jax.jit
   def f(w):
     return jax.shard_map(lambda xx: done(xx, start(xx)), mesh=mesh,
-                         in_specs=(P(AX, None),), out_specs=P(AX, None), check_vma=False)(w)
+                         in_specs=(P(AX),), out_specs=P(AX, None), check_vma=False)(w)
 
+  # 1-D so the per-device shard is (SHARD,), matching `o_ref.at[me]`. With a 2-D (n,SHARD)
+  # array the shard is (1,SHARD) and the ranks differ:
+  #   'tpu.enqueue_dma' op DMA source and target must have the same shape
   host = (np.arange(n)[:, None] * 1000.0 + np.arange(SHARD)[None, :]).astype(np.float32)
-  w = jax.device_put(jnp.asarray(host), jax.sharding.NamedSharding(mesh, P(AX, None)))
+  w = jax.device_put(jnp.asarray(host.reshape(-1)), jax.sharding.NamedSharding(mesh, P(AX)))
   print(f"    {name}: executing ...", flush=True)
   got = np.asarray(f(w)).reshape(n, n, SHARD)
 
@@ -114,7 +117,7 @@ def main():
     try:
       run_rung(mesh, name, k, bar, alias, check_slots=lambda nn: [0])
     except Exception as e:  # noqa: BLE001
-      gate(name, False, f"{type(e).__name__}: {str(e).strip().splitlines()[0][:170]}")
+      gate(name, False, f"{type(e).__name__}: {str(e).strip().splitlines()[0][:400]}")
       print("  -- ladder stops at the first failure --", flush=True)
       break
 
