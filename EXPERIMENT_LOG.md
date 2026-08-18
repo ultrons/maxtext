@@ -2242,3 +2242,48 @@ per-device batch (131072 x 7168 per layer at pdbs=4, 4x the pdbs=1 size). Not is
 should imply these transfer. The one thing that DID move this baseline is the simplest change in the
 set -- the e4m3 token all-gather at +25 TPS/chip with matching loss -- and it is not from the
 pdbs=1 arc at all; it was written this session.
+
+### RETRACTION: the "combined vs split all-gather" finding was a TRUNCATION ARTIFACT [2026-08-18]
+I reported that synthetic emits ONE combined 39.6 MB weight all-gather @ 118 GB/s while real routing
+splits it into FOUR small ones @ 0.3-29.9 GB/s, and built three mechanisms on it (combiner
+threshold, MTP scope-splitting, flat 127-hop ring). **All wrong. The op SETS are the same.**
+
+`list_collectives` prints a **"Top Collectives by Time"** table of only ~15 rows; I read that (and
+piped it through `head`) as if it were the population. The summary line two rows above gives the
+real counts:
+
+| | HLO all-gathers | profile all-gather OPS | what I quoted |
+|---|---|---|---|
+| synthetic | 54 | **51** | "4" |
+| real | 88 | **85** | "7" |
+
+The small gathers were in the synthetic profile too -- they just were not in the top rows BECAUSE
+THEY WERE FAST. **Rule: take the summary count, never the ranked top-N, and cross-check against a
+second source before building a mechanism on it.**
+
+### What the per-pass HLO dump DID establish (`--xla_dump_hlo_pass_re=.*`, 279 passes)
+- **Divergence is at PASS 0**, before any XLA pass: X64_elimination shows rand=14, realnomtp=18,
+  real=29 all-gathers. It is the TRACED PROGRAM, not a compiler decision. MTP adds 11 (its block is
+  outside the layer scan, so its weights are a separate unscanned set); real+grouped routing adds 4.
+  Final: 54 / 58 / 88.
+- **No pass combines in one arm and declines in the other.** SparseCore_Offload applies to ALL
+  gathers in every arm (54/58/89).
+- **The two gathers of interest are structurally IDENTICAL** across rand and real: shared expert
+  [1,7168,2048] and wq_b [1,1536,128,192], each x2 FWD in the scan `body/closed_call` and x2 BWD in
+  `checkpoint/rematted_computation`, gather axis `axis_0` (fsdp) in both.
+- **The offload strategy is HIERARCHICAL, not a flat ring** (from after_codegen):
+  4 phase_rings, Y_TORUS and Z_TORUS, CW and CCW, core_count=8 each, `use_single_sparse_core:true`.
+  **So the earlier "127 hops @ 59 us, 1.1% link utilization" model is RETRACTED** -- tens of hops,
+  not 127.
+- **BWD gathers are pure REMAT cost** (`rematted_computation`): each weight is gathered twice per
+  step, once in the scan body and once in the recompute. Saving the gathered weight instead would
+  delete them -- one layer's worth of HBM, unlike the 15.3 GB that killed replication.
+
+### The surviving explanation: RUNTIME CONTENTION (by elimination, not by direct evidence)
+Identical ops, identical replica groups, identical hierarchical offload, identical scopes -- 118 GB/s
+in one run and 0.3 GB/s in another, and WHICH instance is slow depends on the PHASE (user's
+observation: shared expert slow in fwd, attention slow in bwd; HLO shows both exist in both phases).
+Nothing in 279 passes distinguishes them. All these gathers are pinned to ONE SparseCore
+(`use_single_sparse_core:true`), and the SC is the binding lane at 4.87 s under real routing vs
+near-idle under synthetic. **Untested.** The one-flag probe is
+`xla_tpu_enable_sparse_core_collective_offload_all_gather=false` on the gtopk1 config.

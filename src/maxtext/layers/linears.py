@@ -437,6 +437,7 @@ class MlpBlock(nnx.Module):
       use_pre_norm: bool = False,
       quant: None | Quant = None,
       model_mode: None | str = None,
+      is_shared_expert: bool = False,
       *,
       rngs: nnx.Rngs,
   ) -> None:
@@ -459,6 +460,7 @@ class MlpBlock(nnx.Module):
       quant: Optional quantization config, no quantization if None.
       out_sharding: Named sharding of outputs
     """
+    self._is_shared_expert = is_shared_expert
     self.config = config
     self.mesh = mesh
     self.in_features = in_features
@@ -515,7 +517,7 @@ class MlpBlock(nnx.Module):
             dtype=self.dtype,
             weight_dtype=self.weight_dtype,
             kernel_init=self.kernel_init,
-            kernel_axes=("embed", "mlp"),
+            kernel_axes=self._wi_kernel_axes(),
             quant=self.quant,
             use_bias=self.use_bias,
             shard_mode=self.config.shard_mode,
@@ -533,7 +535,7 @@ class MlpBlock(nnx.Module):
         dtype=self.dtype,
         weight_dtype=self.weight_dtype,
         kernel_init=self.kernel_init,
-        kernel_axes=("mlp", "embed"),
+        kernel_axes=self._wo_kernel_axes(),
         quant=self.quant,
         use_bias=self.use_bias,
         shard_mode=self.config.shard_mode,
@@ -574,6 +576,24 @@ class MlpBlock(nnx.Module):
       )
     else:
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
+
+  def _replicate_embed(self) -> bool:
+    """Whether this block's kernels should leave the embed axis unsharded.
+
+    Only the MoE shared expert opts in. Its [d_model, d_ff_shared] kernel is small (14.7 MB), but
+    sharding embed over fsdp=128 leaves 56 rows per device, and the resulting SPMD all-gather is a
+    127-hop ring carrying ~114 KB per hop -- measured 7.5 ms/iter at ~1% link utilization.
+    Replicating the weight deletes that collective at a few hundred MB of per-device storage.
+    """
+    return bool(getattr(self.config, "moe_shared_expert_replicate", False)) and bool(
+        getattr(self, "_is_shared_expert", False)
+    )
+
+  def _wi_kernel_axes(self):
+    return (None, "mlp") if self._replicate_embed() else ("embed", "mlp")
+
+  def _wo_kernel_axes(self):
+    return ("mlp", None) if self._replicate_embed() else ("mlp", "embed")
 
   def __call__(
       self,

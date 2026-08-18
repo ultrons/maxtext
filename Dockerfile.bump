@@ -1,0 +1,5 @@
+FROM gcr.io/tpu-vm-gke-testing/integrate_v2:1410-up2-d59a6a618
+RUN pip install --no-cache-dir -U "jax==0.11.0" "jaxlib==0.11.0" "libtpu==0.0.46" "qwix==0.1.8" \
+      -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+RUN rm -rf /deps/src/maxtext
+COPY src/maxtext/ /deps/src/maxtext/

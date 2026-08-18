@@ -1138,6 +1138,18 @@ class MoEGeneral(BaseModel):
           "to a full sort. Grouped routing measures 2.256 s/step (vreuse 8.997 vs vnogrp 6.741)."
       ),
   )
+  moe_shared_expert_replicate: bool = Field(
+      False,
+      description=(
+          "Leave the MoE SHARED expert's kernels unsharded on the embed (fsdp) axis. The kernel is "
+          "only 14.7 MB, but sharding embed over fsdp=128 leaves 56 rows per device and the "
+          "SPMD-inserted all-gather becomes a 127-hop ring carrying ~114 KB per hop: measured "
+          "7.5 ms/iter at ~1.1% link utilization, 232 firings, one of the two worst-overlapping "
+          "collectives in the step (22-29% overlap). Replicating deletes the collective outright. "
+          "Costs a few hundred MB per device for the replicated weight and its optimizer state. "
+          "Note this collective is SPMD-generated, so no scheduling annotation of ours can reach it."
+      ),
+  )
   moe_sanitize_ragged_buffer: bool = Field(
       False,
       description=(

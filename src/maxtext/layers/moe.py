@@ -4329,6 +4329,7 @@ class RoutedAndSharedMoE(nnx.Module):
         weight_dtype=self.config.weight_dtype,
         config=self.config,
         quant=self.quant,
+        is_shared_expert=True,  # opts this block alone into moe_shared_expert_replicate
         rngs=self.rngs,
     )
 
