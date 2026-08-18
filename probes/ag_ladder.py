@@ -77,7 +77,7 @@ def build(n, n_peers, use_barrier, alias, slots=True, local=True):
   return start, done
 
 
-def run_rung(mesh, name, n_peers, use_barrier, alias, slots=True, local=True):
+def run_rung(mesh, name, n_peers, use_barrier, alias, slots=True, local=True):  # noqa: D401
   n = mesh.shape[AX]
   start, done = build(n, n_peers, use_barrier, alias, slots, local)
 
@@ -102,7 +102,9 @@ def run_rung(mesh, name, n_peers, use_barrier, alias, slots=True, local=True):
     return
   got = raw.reshape(n, n, SHARD)
   # Device j's slot s should hold device s's shard, for the senders that targeted j.
-  senders = lambda j: [j] + [(j - k) % n for k in range(1, n_peers + 1)]
+  # Only slots that were actually written: the local copy fills slot j (when enabled), and
+  # sender (j-k) fills slot (j-k) for each peer step k.
+  senders = lambda j: ([j] if local else []) + [(j - k) % n for k in range(1, n_peers + 1)]
   ok = all(np.array_equal(got[j, s], host[s]) for j in range(n) for s in senders(j))
   bad = [(j, s) for j in range(n) for s in senders(j) if not np.array_equal(got[j, s], host[s])]
   gate(name, ok, "slot contents correct" if ok else f"wrong slots (sample {bad[:3]})")
