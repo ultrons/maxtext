@@ -1138,6 +1138,18 @@ class MoEGeneral(BaseModel):
           "to a full sort. Grouped routing measures 2.256 s/step (vreuse 8.997 vs vnogrp 6.741)."
       ),
   )
+  moe_shared_expert_sched_group: int = Field(
+      -1,
+      description=(
+          "XLA _scheduling_group_id for the MoE shared expert's FSDP weight all-gather (-1 = off). "
+          "That gather is SPMD-inserted, which is why no annotation of ours has ever reached it; "
+          "tagging the enclosing region is the way to make it visible to the latency-hiding "
+          "scheduler. Set it equal to the attention/splash group to overlap it with attention "
+          "compute, or to a distinct id to keep the all-gather-combiner from fusing it into an "
+          "un-hideable monolith. Measured: 7.549 ms/iter at 1.1 GB/s in the forward vs 0.299 ms at "
+          "29.9 GB/s for the identical gather in the backward."
+      ),
+  )
   moe_shared_expert_replicate: bool = Field(
       False,
       description=(

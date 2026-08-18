@@ -2287,3 +2287,59 @@ Nothing in 279 passes distinguishes them. All these gathers are pinned to ONE Sp
 (`use_single_sparse_core:true`), and the SC is the binding lane at 4.87 s under real routing vs
 near-idle under synthetic. **Untested.** The one-flag probe is
 `xla_tpu_enable_sparse_core_collective_offload_all_gather=false` on the gtopk1 config.
+
+## Weight-AG scheduling annotation: the tag was in the wrong place (RESOLVED, negative)
+
+Three attempts to put the shared-expert FSDP weight all-gather into an XLA scheduling group,
+and what each one actually showed.
+
+Tagging the whole `self.shared_experts(...)` call (`moe_shared_expert_sched_group=1`, then `=7`)
+fails to compile: `UNIMPLEMENTED: Support for annotation groups with gaps doesn't exist yet,
+annotation: 1, instr: dot_general.168`. That error is itself informative, because XLA could only
+raise it if the annotation reached the ops. The tag propagates; the grouping is what gets rejected.
+
+Narrowing the tag to just the kernel materialization in `DenseGeneral.__call__` compiles cleanly,
+and that is where it comes apart. Grepping the optimized HLO for the id finds exactly two
+instructions carrying it, and neither is a shared-expert weight gather. The reason is placement:
+the tagged expression is `jnp.asarray(kernel, self.dtype)` on the **sharded** parameter, which is
+already bf16, so the cast is a no-op that XLA folds away and the annotation goes with it.
+
+The same dump shows why the placement can never have worked. The weight all-gathers are on the
+**quantized** tensor, downstream of the site we tagged:
+
+| shape | count | what it is |
+|---|---|---|
+| `f8e4m3fn[32,7168,2048]` | 16 | routed experts (32 local at EP=8) |
+| `f8e4m3fn[1,7168,2048]` | 8 | shared expert wi_0 / wi_1 (14.7 MB) |
+| `f8e4m3fn[1,7168,18432]` | 8 | dense-layer MLP |
+| `f8e4m3fn[1,1536,128,192]` | 10 | MLA q_b (the exposed backward one) |
+
+In `DenseGeneral.__call__` the kernel passes through `_maybe_two_stage_all_gather` and then
+`_compute_dot_general_nnx(..., self.quant_dot_general, ...)`. Both the qwix quantize and the
+SPMD-inserted all-gather happen inside that call. Anything we tag or name before it sits on the
+sharded parameter, upstream of the op we care about.
+
+The same defect kills the remat variant. `checkpoint_name(kernel, "dense_kernel")` names the
+sharded bf16 parameter, which is a leaf that is always available and costs nothing to "save", so
+wiring it into `tensors_on_device` could not have stopped the backward from re-running the gather.
+Separately, that name covers every `DenseGeneral` (all MLA projections, out_proj, logits dense, and
+the shared expert); under scan the residual stacks across 58 layers, which is roughly 13 GB/device
+at e4m3 and more in bf16, against a ~103 GB ceiling. A blanket save was never viable.
+
+One more reason id 7 was the wrong probe even where it landed: the routed-expert cv gathers already
+carry ids 1, 2 and 3 (`_WEIGHT_AG_SCHED_GROUP` and +1/+2). A group of one cannot co-schedule
+anything, so "hoist with the other w-ags" means reusing id 1, not minting a new id.
+
+**Status of the code.** `dense_kernel_sched_group` is removed from `types.py`; leaving it would have
+been a flag that silently did nothing on the cluster, the same failure mode as the
+`moe_shared_expert_replicate` no-op (6.819 vs 6.818). The narrow tag now reads
+`DENSE_KERNEL_SCHED_GROUP` from the environment and defaults to off.
+
+**Shared-expert replication is not enabled** in any current launch config. It was backed out after
+it OOM'd: 3 weights x 58 layers = 2.55 B params, x3 for adamw bf16 = 15.3 GB/device against a
+103.71 G ceiling.
+
+The route that remains is the one the routed experts already use: `_make_cv_gather`
+(`moe.py:3998-4081`) issues the all-gather explicitly under a `custom_vjp` and tags it with a real
+scheduling id. Applying that to the shared-expert weights is "make this w-ag explicit and group it
+with the other w-ags" done at the correct point in the graph.

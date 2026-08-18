@@ -15,6 +15,7 @@
 """Linear Layers."""
 
 import functools
+import os
 import operator
 from typing import Any, Callable, Iterable, Sequence
 
@@ -25,6 +26,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.sharding import NamedSharding, Mesh, PartitionSpec
 from jax.ad_checkpoint import checkpoint_name
+from jax.experimental import xla_metadata
 
 from flax import nnx
 import flax.linen as nn
@@ -42,6 +44,11 @@ from maxtext.utils.sharding import maybe_shard_with_name
 from maxtext.utils.sharding import get_physical_spec_without_axes
 from maxtext.utils.sharding import FSDP_MESH_AXES
 from maxtext.utils.sharding import truncate_out_sharding
+
+# Scheduling-group id for the kernel materialization (the op SPMD hangs the FSDP weight
+# all-gather off). -1 disables. Read from the environment so no constructor plumbing is
+# needed across every DenseGeneral call site.
+_DENSE_KERNEL_SCHED_GROUP = int(os.environ.get("DENSE_KERNEL_SCHED_GROUP", "-1"))
 
 
 def _convert_to_activation_function(fn_or_string: str | Callable[..., Any]) -> Callable[..., Any]:
@@ -294,7 +301,23 @@ class DenseGeneral(nnx.Module):
       if self.parameter_memory_host_offload:
         max_logging.log("linear.py: Moving parameter logits_dense kernel to device")
         kernel = jax.device_put(kernel, max_utils.device_space())
-      kernel = jnp.asarray(kernel, self.dtype)
+      # Tag ONLY the kernel materialization -- the narrow region where SPMD inserts the FSDP
+      # weight all-gather. Tagging the whole layer fails: XLA rejects a scheduling group whose
+      # members are non-contiguous ("annotation groups with gaps"), because the matmul and the
+      # gather get separated in the schedule.
+      _sg = _DENSE_KERNEL_SCHED_GROUP
+      if _sg is not None and _sg >= 0:
+        with xla_metadata.set_xla_metadata(_scheduling_group_id=_sg):
+          kernel = jnp.asarray(kernel, self.dtype)
+      else:
+        kernel = jnp.asarray(kernel, self.dtype)
+      # Name the MATERIALIZED (fsdp-gathered) kernel so the remat policy can SAVE it. Without this
+      # the backward's rematted_computation re-runs the weight all-gather: the per-pass HLO dump
+      # shows every one of these weights gathered twice per step, once in the scan body and once
+      # under checkpoint/rematted_computation. Saving the e4m3 copy costs far less than replicating
+      # the parameter, because it stores one quantized tensor rather than a bf16 param plus two
+      # optimizer moments.
+      kernel = checkpoint_name(kernel, "dense_kernel")
 
     if slice_bounds is not None:
       if self.quant is not None:

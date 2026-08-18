@@ -4411,9 +4411,22 @@ class RoutedAndSharedMoE(nnx.Module):
       # would serialize the pipeline). Identity on values -> bit-exact. Same caveat as the
       # chunk barriers: xla_tpu_aggressive_opt_barrier_removal=true may strip this fence.
       shared_input, _ = jax.lax.optimization_barrier((inputs, combine_token))
-    shared_experts = self.shared_experts(
-        shared_input, intermediate_sharding=intermediate_sharding, out_sharding=out_sharding
-    )
+    # moe_shared_expert_sched_group: tag the shared expert's (SPMD-inserted) FSDP weight
+    # all-gather with a scheduling-group id so the latency-hiding scheduler can overlap it with
+    # attention-phase compute, the way _WEIGHT_AG_SCHED_GROUP already does for the routed expert
+    # weights. Measured motivation: this gather costs 7.549 ms/iter at 1.1 GB/s in the FORWARD
+    # while its own backward twin costs 0.299 ms at 29.9 GB/s -- same shape, same replica groups,
+    # same hierarchical offload. It is slow because of WHERE it lands, not what it is.
+    _sg = getattr(self.config, "moe_shared_expert_sched_group", -1)
+    if _sg is not None and _sg >= 0:
+      with _scheduling_group(_sg):
+        shared_experts = self.shared_experts(
+            shared_input, intermediate_sharding=intermediate_sharding, out_sharding=out_sharding
+        )
+    else:
+      shared_experts = self.shared_experts(
+          shared_input, intermediate_sharding=intermediate_sharding, out_sharding=out_sharding
+      )
     if save_routing:
       return routed_experts + shared_experts, load_balance_loss, moe_bias_updates, routing_saved
     return routed_experts + shared_experts, load_balance_loss, moe_bias_updates
