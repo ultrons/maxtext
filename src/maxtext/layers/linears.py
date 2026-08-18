@@ -271,25 +271,90 @@ class DenseGeneral(nnx.Module):
     of more bytes runs at 29.9 GB/s, so the cost tracks the phase rather than
     the payload and the scheduler is what we want to reach.
 
-    Dropping the fsdp axes from the kernel's sharding here forces the gather at
-    a point we choose, where a `_scheduling_group_id` can attach to it. The
-    kernel is still bf16 at this point, so the wire cost doubles relative to the
-    e4m3 gather SPMD would emit (29.4 MB vs 14.7 MB for the shared expert); the
-    backward measurement above says that is affordable if placement is the
-    problem, and the AOT dump tells us whether we moved the gather or added one.
+    A sharding constraint does NOT work here, and the AOT dump says so: dropping
+    the fsdp axes with `maybe_shard_with_name` did move the gather (the
+    shared-expert `f8e4m3fn[1,7168,2048]` became `bf16[1,7168,2048]`, total
+    all-gather count 236 -> 235, so a gather moved rather than one being added),
+    but zero ops carried the id. SPMD absorbs the constraint and emits a fresh
+    all-gather of its own, still marked `is_spmd_generated="true"` and still under
+    `closed_call/convert_element_type`, and our frontend attribute does not
+    survive that substitution. That bought 2x the wire bytes and no scheduling
+    control.
+
+    So emit the collective ourselves, the way `moe.py`'s `_make_cv_gather` does
+    for the routed experts: a `shard_map` around `lax.all_gather` is a real op in
+    the jaxpr that SPMD does not replace, so the tag stays attached to it. The
+    `custom_vjp` keeps the PRIMAL gather unannotated, which is what
+    `remat_policy=custom` recomputes in the backward; annotating the backward
+    gather back-edges its reduce-scatter into the rematerialized forward and
+    raises a FAILED_PRECONDITION scheduling cycle. The backward rule is the
+    transpose of a tiled all-gather, a tiled psum_scatter, so FSDP weight grads
+    stay correct and no large residual is saved.
+
+    The kernel is still bf16 at this point, so the wire cost doubles relative to
+    the e4m3 gather SPMD would emit (29.4 MB vs 14.7 MB for the shared expert).
+    The backward measurement above says that is affordable if placement is what
+    is broken. Quantizing here instead to keep e4m3 would mean handing a
+    pre-quantized QArray to `quant_dot_general`, which risks double-quantization;
+    the routed-expert notes record that the tagged variant of exactly that
+    machinery NaN'd on cluster round 2 and lost 5.302 vs 5.106.
     """
     sg = self.hoist_weight_ag_sched_group
     if sg is None or sg < 0 or self.mesh is None:
       return kernel
     if not any(self.mesh.shape.get(ax, 1) > 1 for ax in FSDP_MESH_AXES):
       return kernel
+
     full_logical = PartitionSpec(*self.kernel_axes)
-    gathered = get_physical_spec_without_axes(full_logical, self.mesh, FSDP_MESH_AXES)
-    with xla_metadata.set_xla_metadata(_scheduling_group_id=sg):
-      kernel = maybe_shard_with_name(
-          kernel, gathered, shard_mode=self.shard_mode, debug_sharding=self.debug_sharding
-      )
-    return kernel
+    in_spec = get_physical_spec_without_axes(full_logical, self.mesh, ()).spec
+    out_spec = get_physical_spec_without_axes(full_logical, self.mesh, FSDP_MESH_AXES).spec
+    if in_spec == out_spec:
+      return kernel  # nothing sharded on an FSDP axis, so there is no gather to hoist
+
+    diff = [i for i in range(len(in_spec)) if in_spec[i] != out_spec[i]]
+    if len(diff) != 1:
+      # More than one dim changes only under 2D FSDP, which `_maybe_two_stage_all_gather`
+      # already handles; leave those to SPMD rather than guess a single gather axis.
+      return kernel
+    gather_axis = diff[0]
+    names = in_spec[gather_axis]
+    names = (names,) if isinstance(names, str) else tuple(names)
+    ag_axes = tuple(n for n in names if n in FSDP_MESH_AXES)
+    if not ag_axes:
+      return kernel
+
+    @jax.custom_vjp
+    def _gather(w):  # PRIMAL: plain gather, i.e. what remat recomputes in the backward
+      return jax.shard_map(
+          lambda x: jax.lax.all_gather(x, ag_axes, axis=gather_axis, tiled=True),
+          mesh=self.mesh,
+          in_specs=(in_spec,),
+          out_specs=out_spec,
+          check_vma=False,
+      )(w)
+
+    def _gather_fwd(w):  # FORWARD under diff: annotated, so it can be co-scheduled
+      def _fn(x):
+        with xla_metadata.set_xla_metadata(_scheduling_group_id=sg):
+          return jax.lax.all_gather(x, ag_axes, axis=gather_axis, tiled=True)
+
+      w_full = jax.shard_map(
+          _fn, mesh=self.mesh, in_specs=(in_spec,), out_specs=out_spec, check_vma=False
+      )(w)
+      return w_full, None  # no residual: the sharded param is a leaf, always available
+
+    def _gather_bwd(_res, ct):  # transpose of a tiled all-gather = tiled psum_scatter
+      g = jax.shard_map(
+          lambda gg: jax.lax.psum_scatter(gg, ag_axes, scatter_dimension=gather_axis, tiled=True),
+          mesh=self.mesh,
+          in_specs=(out_spec,),
+          out_specs=in_spec,
+          check_vma=False,
+      )(ct)
+      return (g,)
+
+    _gather.defvjp(_gather_fwd, _gather_bwd)
+    return _gather(kernel)
 
   def __call__(
       self,
