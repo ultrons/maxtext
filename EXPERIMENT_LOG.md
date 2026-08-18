@@ -2640,3 +2640,30 @@ each is a trap worth not repeating:
 Also unattributed: an earlier `RuntimeUnexpectedCoreHalt` at the rung that adds a local copy
 alongside the remote one. It ran under the broken-alias configuration, so "the local copy halts"
 is NOT established and must be retested once addressing is fixed.
+
+### Landing-site diagnostic: the bytes do not arrive AT ALL
+
+`slot->shard` map for the L1 rung, every device, every slot:
+
+```
+dev0 slot->shard {0: None, 1: None, ..., 7: None}
+dev1 slot->shard {0: None, 1: None, ..., 7: None}
+dev2 slot->shard {0: None, 1: None, ..., 7: None}
+```
+
+No slot holds any sender's shard. So this is NOT a misplaced write into the wrong slot: with a
+DYNAMIC index on the remote DMA destination (`o_ref.at[me]`), the transfer does not deliver
+anywhere observable, while `done`'s wait still returns without error and the static-destination
+rung (L0) delivers correctly. Silent non-delivery is the worst shape this could have taken --
+nothing raises, nothing hangs, the output is simply junk.
+
+**Recommended redesign: PULL instead of PUSH.** In the push model every destination offset is
+computed on the sender and has to be interpreted in the receiver's buffer, which is exactly the
+semantics that just failed. In a pull model each device issues remote copies that READ its peers'
+shards into its OWN slots, so every destination offset is computed on the device that owns the
+buffer and is a plain local index. That removes this entire class of bug rather than patching it.
+The ladder rungs (L0 known-good, then one feature at a time, aliases mandatory, expectations
+covering only slots actually written) carry over unchanged.
+
+Still unattributed and to be retested after the redesign: the `RuntimeUnexpectedCoreHalt` seen at
+the local-copy rung under the broken-alias configuration.
