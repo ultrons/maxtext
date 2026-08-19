@@ -259,9 +259,9 @@ def _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot=0, group=
       return _assemble(x_alias, got, order, gather_axis, n)
 
     # STAGE 1: gather within the contiguous subgroup of `group` ranks (fan-out group-1).
-    base = (me // group) * group
-    off = me - base
-    p1 = lambda me_, k: base + jax.lax.rem(off + k + 1, group)
+    # peer_fn must derive EVERYTHING from me_ (computed inside the kernel): a closure over
+    # traced values raises "captures constants ... pass them as inputs".
+    p1 = lambda me_, k: (me_ // group) * group + jax.lax.rem(me_ - (me_ // group) * group + k + 1, group)
     st1, dn1 = _make_ag_pair(n, jax.ShapeDtypeStruct(xx.shape, xx.dtype), axis_name,
                              mesh_axes, slot=slot, n_steps=group - 1, peer_fn=p1)
     xa1, b1, ss1, rs1 = st1(xx)
@@ -271,8 +271,7 @@ def _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot=0, group=
 
     # STAGE 2: exchange assembled blocks across the s2 supergroups at stride `group`
     # (fan-out s2-1). Depends on stage 1's done through `block`.
-    gi = me // group
-    p2 = lambda me_, k: jax.lax.rem(gi + k + 1, s2) * group + off
+    p2 = lambda me_, k: jax.lax.rem(me_ // group + k + 1, s2) * group + jax.lax.rem(me_, group)
     st2, dn2 = _make_ag_pair(n, jax.ShapeDtypeStruct(block.shape, block.dtype), axis_name,
                              mesh_axes, slot=slot + 3, n_steps=s2 - 1, peer_fn=p2)
     xa2, b2, ss2, rs2 = st2(block)
