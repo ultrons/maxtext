@@ -430,6 +430,7 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes, slot=0, n_steps=None, peer
   return start, done
 
 
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4, 5, 6, 7))
 def split_all_gather(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot=0, group=0):
   """FSDP weight all-gather whose placement we own. Backward is XLA's reduce-scatter.
 
