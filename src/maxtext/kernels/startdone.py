@@ -18,6 +18,7 @@ not raise. `_SCRATCH` below is shared by both halves for exactly this reason, an
 import functools
 
 import jax
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -100,127 +101,124 @@ split_copy.defvjp(_split_copy_fwd, _split_copy_bwd)
 
 
 # =============================================================================
-# Forward split-phase all-gather.
+# Forward split-phase all-gather -- STATIC destinations only.
 #
-# Push model: every device arms one DMA per peer, writing its OWN shard into that peer's
-# output slot, plus a local copy into its own slot. `start` arms all S of them and returns;
-# `done` reconstructs the identical descriptors and waits. One start, one done, maximal
-# concurrency, and the layer's compute sits in the gap.
+# The natural push formulation (remote copy into `o_ref.at[me]`) is REFUTED on hardware:
+# the destination offset is computed on the sender and must be interpreted in the
+# receiver's buffer, and the bytes silently never arrive (probes/ag_ladder.py, all slots
+# empty). A pull model has the same defect. What DOES deliver (probes/ag_static.py, PASS)
+# is a remote copy into a STATIC whole-buffer destination, so this design never indexes:
 #
-# The output is shaped (S,) + shard so the destination slot is a clean `o_ref.at[me]`;
-# callers reshape to the gathered layout afterwards.
+#   at step k (k = 1..n-1, a PYTHON constant) device `me` pushes its shard into device
+#   (me+k)'s buffer k.
 #
-# The BACKWARD is `lax.psum_scatter`, i.e. XLA's reduce-scatter, deliberately. Measured on
+# k is static on both sides. Receiver j's buffer k holds shard (j-k) mod n; the gathered
+# array is assembled OUTSIDE the kernel with ordinary XLA ops (a dynamic take + reshape,
+# ~8 us of HBM traffic for a 29 MB weight -- no DMA addressing involved).
+#
+# `start` arms all n-1 sends and returns; `done` reconstructs the identical descriptors
+# and waits. Both halves share ONE scratch signature (R5/R6: a mismatch HANGS). Each step
+# has its own send/recv semaphore pair, sidestepping the untested question of whether
+# n-1 in-flight copies may share one pair.
+#
+# The BACKWARD is `lax.psum_scatter` -- XLA's reduce-scatter -- deliberately. Measured on
 # the 6.864 s profile the reduce-scatters run 10.4-25.9 GB/s while the gathers we are
-# chasing run 0.3-1.1 GB/s, and `rs-lever-mapped-closed` already found direct-to-owner RS
-# near-optimal and not reclaimable by a better kernel. The RS is not the pathology, so we do
-# not write an accumulating kernel to replace it.
-#
-# Barrier: a peer must not write into our output before it exists, so both halves open with
-# a `get_barrier_semaphore` handshake keyed by `collective_id`.
+# chasing run 0.3-1.1 GB/s; `rs-lever-mapped-closed` found direct-to-owner RS
+# near-optimal. The RS is not the pathology. The pathological backward item `.445` is the
+# forward gather RE-RUN inside rematted_computation, and Step 0 proved this pair
+# re-traces there intact, so the forward conversion covers it.
 # =============================================================================
-
-# start and done share this signature -- see R5/R6, a mismatch HANGS rather than raising.
-_AG_SCRATCH = [pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA]
-
-
-def _peer_id(axis_name, mesh_axes, d):
-  """Rank `d` on the gather axis, every other mesh axis held at this device's index."""
-  return {a: (d if a == axis_name else jax.lax.axis_index(a)) for a in mesh_axes}
-
-
-def _ag_descriptors(x_ref, o_ref, loc, ss, rs, axis_name, mesh_axes, n):
-  """The S copies, built identically by both halves. Order matters: it fixes the slots.
-
-  ROTATION, not `for d in range(n)`. The loop is static but `me` is dynamic, so a plain
-  range includes d == me and the device both local-copies AND remote-copies into its own
-  slot: two writes to one destination and a semaphore count that does not match the waits.
-  That halts the core (`RuntimeUnexpectedCoreHalt`). Stepping `peer = (me + step) % n` over
-  step in 1..n-1 visits every OTHER device exactly once, with no self-send.
-  """
-  me = jax.lax.axis_index(axis_name)
-  yield pltpu.make_async_copy(x_ref, o_ref.at[me], loc)
-  for step in range(1, n):
-    peer = jax.lax.rem(me + step, n)
-    yield pltpu.make_async_remote_copy(
-        x_ref, o_ref.at[me], ss, rs, device_id=_peer_id(axis_name, mesh_axes, peer)
-    )
-
-
-def _ag_barrier(axis_name, mesh_axes, n):
-  """Handshake so no peer writes into our output before it exists.
-
-  device_id must be the multi-axis MESH dict, not a bare int: a flat integer is only
-  correct on a 1-D mesh and silently addresses the wrong device on the model's mesh.
-  """
-  bar = pltpu.get_barrier_semaphore()
-  me = jax.lax.axis_index(axis_name)
-  for step in range(n):
-    peer = jax.lax.rem(me + step, n)
-    pl.semaphore_signal(bar, device_id=_peer_id(axis_name, mesh_axes, peer))
-  pl.semaphore_wait(bar, n)
-
-
-def make_ag_bodies(axis_name, mesh_axes, n):
-  """Build the start/done kernel bodies for an S-way push all-gather."""
-
-  def start_body(x_ref, o_ref, loc, ss, rs):
-    _ag_barrier(axis_name, mesh_axes, n)
-    for dma in _ag_descriptors(x_ref, o_ref, loc, ss, rs, axis_name, mesh_axes, n):
-      dma.start()
-
-  def done_body(x_ref, d_ref, o_ref, loc, ss, rs):
-    for dma in _ag_descriptors(x_ref, d_ref, loc, ss, rs, axis_name, mesh_axes, n):
-      dma.wait()
-
-  return start_body, done_body
-
 
 _AG_CP = pltpu.CompilerParams(
     collective_id=7, allow_collective_id_without_custom_barrier=True, has_side_effects=True
 )
 
 
-def _sag_impl(w, mesh, axis_name, in_spec, out_spec):
+def _peer_id(axis_name, mesh_axes, d):
+  """Multi-axis mesh device id: rank `d` on the gather axis, every other axis held fixed.
+
+  A bare int is only correct on a 1-D mesh; the model mesh is multi-axis.
+  """
+  return {a: (d if a == axis_name else jax.lax.axis_index(a)) for a in mesh_axes}
+
+
+def _make_ag_pair(n, shard_sds, axis_name, mesh_axes):
+  """Build the start/done pallas_call pair for an n-way static-destination all-gather."""
+  # One (send, recv) DMA semaphore pair per step. IDENTICAL in both halves (R5/R6).
+  scratch = [pltpu.SemaphoreType.DMA] * (2 * (n - 1))
+
+  def descriptors(x_ref, bufs, sems):
+    me = jax.lax.axis_index(axis_name)
+    for i, k in enumerate(range(1, n)):
+      peer = jax.lax.rem(me + k, n)
+      yield pltpu.make_async_remote_copy(
+          x_ref, bufs[i], sems[2 * i], sems[2 * i + 1],
+          device_id=_peer_id(axis_name, mesh_axes, peer),
+      )
+
+  def start_body(x_ref, *rest):
+    bufs, sems = list(rest[: n - 1]), list(rest[n - 1:])
+    # A peer must not write into our buffers before this kernel is entered.
+    bar = pltpu.get_barrier_semaphore()
+    me = jax.lax.axis_index(axis_name)
+    for k in range(n):
+      pl.semaphore_signal(bar, device_id=_peer_id(axis_name, mesh_axes, jax.lax.rem(me + k, n)))
+    pl.semaphore_wait(bar, n)
+    for dma in descriptors(x_ref, bufs, sems):
+      dma.start()
+
+  def done_body(x_ref, *rest):
+    ins = list(rest[: n - 1])            # aliased to the outputs; nothing loaded here
+    sems = list(rest[2 * (n - 1):])
+    for dma in descriptors(x_ref, ins, sems):
+      dma.wait()
+
+  shapes = [shard_sds] * (n - 1)
+  start = pl.pallas_call(start_body, in_specs=[_HBM], out_specs=[_HBM] * (n - 1),
+                         out_shape=shapes, scratch_shapes=scratch, compiler_params=_AG_CP)
+  done = pl.pallas_call(done_body, in_specs=[_HBM] * n, out_specs=[_HBM] * (n - 1),
+                        out_shape=shapes, scratch_shapes=scratch, compiler_params=_AG_CP,
+                        input_output_aliases={i + 1: i for i in range(n - 1)})
+  return start, done
+
+
+def _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec):
   n = mesh.shape[axis_name]
   mesh_axes = tuple(mesh.axis_names)
-  start_body, done_body = make_ag_bodies(axis_name, mesh_axes, n)
-  assert_scratch_matches(_AG_SCRATCH, _AG_SCRATCH)
 
   def body(xx):
-    shard = jax.ShapeDtypeStruct((n,) + xx.shape, xx.dtype)
-    start = pl.pallas_call(
-        start_body, in_specs=[_HBM], out_specs=_HBM, out_shape=shard,
-        scratch_shapes=_AG_SCRATCH, compiler_params=_AG_CP,
+    start, done = _make_ag_pair(n, jax.ShapeDtypeStruct(xx.shape, xx.dtype),
+                                axis_name, mesh_axes)
+    bufs = start(xx)
+    got = done(xx, *bufs)                # <-- the layer's compute belongs in this gap
+    # Position k holds shard (me-k) mod n; own shard at position 0. Permute to shard
+    # order 0..n-1, then lay out exactly as lax.all_gather(tiled=True, axis=gather_axis).
+    stacked = jnp.stack([xx] + list(got), axis=0)          # (n,) + shard
+    me = jax.lax.axis_index(axis_name)
+    order = jax.lax.rem(me - jnp.arange(n) + n, n)         # position of shard s
+    permuted = jnp.take(stacked, order, axis=0)
+    shard = xx.shape
+    return jnp.moveaxis(permuted, 0, gather_axis).reshape(
+        shard[:gather_axis] + (n * shard[gather_axis],) + shard[gather_axis + 1:]
     )
-    done = pl.pallas_call(
-        done_body, in_specs=[_HBM, _HBM], out_specs=_HBM, out_shape=shard,
-        scratch_shapes=_AG_SCRATCH, input_output_aliases={1: 0}, compiler_params=_AG_CP,
-    )
-    g = done(xx, start(xx))               # <-- layer compute belongs in this gap
-    return g.reshape((n * xx.shape[0],) + xx.shape[1:])
 
-  return jax.shard_map(
-      body, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec, check_vma=False
-  )(w)
+  return jax.shard_map(body, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec,
+                       check_vma=False)(w)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4))
-def split_all_gather(w, mesh, axis_name, in_spec, out_spec):
-  """FSDP weight all-gather we own the placement of. Backward is XLA's reduce-scatter."""
-  return _sag_impl(w, mesh, axis_name, in_spec, out_spec)
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4, 5))
+def split_all_gather(w, mesh, axis_name, gather_axis, in_spec, out_spec):
+  """FSDP weight all-gather whose placement we own. Backward is XLA's reduce-scatter."""
+  return _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec)
 
 
-def _sag_fwd(w, mesh, axis_name, in_spec, out_spec):
-  return _sag_impl(w, mesh, axis_name, in_spec, out_spec), None
+def _sag_fwd(w, mesh, axis_name, gather_axis, in_spec, out_spec):
+  return _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec), None
 
 
-def _sag_bwd(mesh, axis_name, in_spec, out_spec, _res, ct):
-  # Transpose of a tiled all-gather is a tiled psum_scatter. Left to XLA on purpose: the
-  # reduce-scatters measure 10.4-25.9 GB/s against the gathers' 0.3-1.1 GB/s, so the RS is
-  # not the pathology and an accumulating kernel would be effort on the healthy collective.
+def _sag_bwd(mesh, axis_name, gather_axis, in_spec, out_spec, _res, ct):
   g = jax.shard_map(
-      lambda c: jax.lax.psum_scatter(c, axis_name, scatter_dimension=0, tiled=True),
+      lambda c: jax.lax.psum_scatter(c, axis_name, scatter_dimension=gather_axis, tiled=True),
       mesh=mesh, in_specs=(out_spec,), out_specs=in_spec, check_vma=False,
   )(ct)
   return (g,)

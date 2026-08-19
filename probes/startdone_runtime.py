@@ -252,37 +252,46 @@ def r4(dev):
 #     silently, so the gradient is checked, not just the forward value.
 # ---------------------------------------------------------------------------
 def r7(mesh):
+  """Numerics gate for the STATIC-destination split_all_gather, both gather axes.
+
+  R7a/c: forward bit-identical to lax.all_gather(tiled=True). R7b/d: gradient bit-identical
+  to the stock gather's gradient (a wrong psum_scatter transpose corrupts weight grads
+  silently, so the gradient is the check that matters). Shapes are the real shared-expert
+  kernel sharded over this rig's fsdp=8: wi (7168,2048) on axis 0, wo (2048,7168) on axis 1.
+  """
   from maxtext.kernels.startdone import split_all_gather
 
   ax = "fsdp"
-  n = mesh.shape[ax]
-  K, C = 256, 128
-  in_spec, out_spec = P(ax, None), P(None, None)
-
-  def ours(w):
-    return split_all_gather(w, mesh, ax, in_spec, out_spec)
-
-  def stock(w):
-    return jax.shard_map(
-        lambda x: jax.lax.all_gather(x, ax, axis=0, tiled=True),
-        mesh=mesh, in_specs=(in_spec,), out_specs=out_spec, check_vma=False)(w)
-
   rng = np.random.default_rng(0)
-  host = rng.standard_normal((K, C)).astype(np.float32)
-  w = jax.device_put(jnp.asarray(host), jax.sharding.NamedSharding(mesh, in_spec))
 
-  go, gs = np.asarray(jax.jit(ours)(w)), np.asarray(jax.jit(stock)(w))
-  gate("R7a split all-gather matches lax.all_gather", np.array_equal(go, gs),
-       f"max|err|={np.max(np.abs(go - gs)):.3e}")
+  def check(tag, full_shape, g_axis, in_spec):
+    out_spec = P(None, None)
 
-  # gradient of sum(f(w) * fixed) -- exercises the custom_vjp / psum_scatter transpose
-  co = jax.device_put(jnp.asarray(rng.standard_normal((K, C)).astype(np.float32)),
-                      jax.sharding.NamedSharding(mesh, out_spec))
-  loss = lambda f: (lambda w: jnp.sum(f(w) * co))
-  do = np.asarray(jax.jit(jax.grad(loss(ours)))(w))
-  ds = np.asarray(jax.jit(jax.grad(loss(stock)))(w))
-  gate("R7b split all-gather VJP matches the stock gather's VJP", np.allclose(do, ds, atol=0, rtol=0),
-       f"max|err|={np.max(np.abs(do - ds)):.3e}")
+    def ours(w):
+      return split_all_gather(w, mesh, ax, g_axis, in_spec, out_spec)
+
+    def stock(w):
+      return jax.shard_map(
+          lambda x: jax.lax.all_gather(x, ax, axis=g_axis, tiled=True),
+          mesh=mesh, in_specs=(in_spec,), out_specs=out_spec, check_vma=False)(w)
+
+    host = rng.standard_normal(full_shape).astype(np.float32)
+    w = jax.device_put(jnp.asarray(host), jax.sharding.NamedSharding(mesh, in_spec))
+    go, gs = np.asarray(jax.jit(ours)(w)), np.asarray(jax.jit(stock)(w))
+    gate(f"R7{tag}1 split AG matches lax.all_gather (axis {g_axis})",
+         np.array_equal(go, gs), f"max|err|={np.max(np.abs(go - gs)):.3e}")
+
+    co = jax.device_put(jnp.asarray(rng.standard_normal(full_shape).astype(np.float32)),
+                        jax.sharding.NamedSharding(mesh, out_spec))
+    loss = lambda f: (lambda w: jnp.sum(f(w) * co))
+    do = np.asarray(jax.jit(jax.grad(loss(ours)))(w))
+    ds = np.asarray(jax.jit(jax.grad(loss(stock)))(w))
+    gate(f"R7{tag}2 split AG VJP matches stock VJP (axis {g_axis})",
+         np.array_equal(do, ds), f"max|err|={np.max(np.abs(do - ds)):.3e}")
+
+  check("a", (7168, 2048), 0, P(ax, None))   # wi: embed-sharded on axis 0
+  check("b", (2048, 7168), 1, P(None, ax))   # wo: embed-sharded on axis 1
+
 
 
 if __name__ == "__main__":

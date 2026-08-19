@@ -1138,6 +1138,16 @@ class MoEGeneral(BaseModel):
           "to a full sort. Grouped routing measures 2.256 s/step (vreuse 8.997 vs vnogrp 6.741)."
       ),
   )
+  shared_expert_weight_ag_split: bool = Field(
+      False,
+      description=(
+          "When true, the MoE shared expert's FSDP weight all-gather is issued as a split-phase "
+          "start/done Pallas pair (kernels/startdone.py): `start` arms per-peer DMAs with STATIC "
+          "destinations and returns, `done` reconstructs the descriptors and waits, so the "
+          "transfer bypasses the SparseCore offload path and hides under the compute between the "
+          "halves. Backward is lax.psum_scatter. Single-axis FSDP only."
+      ),
+  )
   shared_expert_weight_ag_sched_group: int = Field(
       -1,
       description=(

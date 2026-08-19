@@ -139,6 +139,7 @@ class DenseGeneral(nnx.Module):
       use_two_stage_all_gather: bool = False,
       debug_sharding: bool = False,
       hoist_weight_ag_sched_group: int = -1,
+      hoist_weight_ag_split: bool = False,
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
   ):
@@ -186,6 +187,7 @@ class DenseGeneral(nnx.Module):
     self.mesh = mesh
     self.use_two_stage_all_gather = use_two_stage_all_gather
     self.hoist_weight_ag_sched_group = hoist_weight_ag_sched_group
+    self.hoist_weight_ag_split = hoist_weight_ag_split
     self.debug_sharding = debug_sharding
 
     # Parameter initialization
@@ -305,7 +307,8 @@ class DenseGeneral(nnx.Module):
     machinery NaN'd on cluster round 2 and lost 5.302 vs 5.106.
     """
     sg = self.hoist_weight_ag_sched_group
-    if sg is None or sg < 0 or self.mesh is None:
+    split = bool(self.hoist_weight_ag_split)
+    if ((sg is None or sg < 0) and not split) or self.mesh is None:
       return kernel
     if not any(self.mesh.shape.get(ax, 1) > 1 for ax in FSDP_MESH_AXES):
       return kernel
@@ -326,6 +329,17 @@ class DenseGeneral(nnx.Module):
     names = (names,) if isinstance(names, str) else tuple(names)
     ag_axes = tuple(n for n in names if n in FSDP_MESH_AXES)
     if not ag_axes:
+      return kernel
+
+    if split:
+      # Split-phase start/done all-gather (kernels/startdone.py): the DMAs are armed by a
+      # `start` custom call and awaited by a separate `done`, so the transfer runs on OUR
+      # schedule, off the SparseCore offload path, hidden under the compute between them.
+      # Single-axis only; 2D-FSDP stays on the stock path.
+      if len(ag_axes) == 1:
+        from maxtext.kernels.startdone import split_all_gather
+
+        return split_all_gather(kernel, self.mesh, ag_axes[0], gather_axis, in_spec, out_spec)
       return kernel
 
     @jax.custom_vjp
@@ -626,6 +640,7 @@ class MlpBlock(nnx.Module):
           kernel_init=self.kernel_init,
           kernel_axes=("embed", "num_activations", "mlp"),
           hoist_weight_ag_sched_group=self._hoist_wag_sg(0),
+          hoist_weight_ag_split=self._hoist_wag_split(),
           quant=self.quant,
           use_bias=self.use_bias,
           shard_mode=self.config.shard_mode,
@@ -646,6 +661,7 @@ class MlpBlock(nnx.Module):
             kernel_init=self.kernel_init,
             kernel_axes=self._wi_kernel_axes(),
             hoist_weight_ag_sched_group=self._hoist_wag_sg(idx),
+            hoist_weight_ag_split=self._hoist_wag_split(),
             quant=self.quant,
             use_bias=self.use_bias,
             shard_mode=self.config.shard_mode,
@@ -665,6 +681,7 @@ class MlpBlock(nnx.Module):
         kernel_init=self.kernel_init,
         kernel_axes=self._wo_kernel_axes(),
         hoist_weight_ag_sched_group=self._hoist_wag_sg(2),
+        hoist_weight_ag_split=self._hoist_wag_split(),
         quant=self.quant,
         use_bias=self.use_bias,
         shard_mode=self.config.shard_mode,
@@ -730,6 +747,12 @@ class MlpBlock(nnx.Module):
     if base is None or base < 0 or not getattr(self, "_is_shared_expert", False):
       return -1
     return base + offset
+
+  def _hoist_wag_split(self):
+    """Split-phase start/done weight AG -- shared expert opt-in, like the sched-group hoist."""
+    return bool(getattr(self.config, "shared_expert_weight_ag_split", False)) and bool(
+        getattr(self, "_is_shared_expert", False)
+    )
 
   def _wi_kernel_axes(self):
     return (None, "mlp") if self._replicate_embed() else ("embed", "mlp")
