@@ -2866,3 +2866,29 @@ cluster attempt to make 0x41ef name itself.
 Caveat on R11's power: the three gathers are loop-invariant in the probe's scan, so XLA may have
 hoisted them out of the loop despite has_side_effects; the 3-pair interleave within one execution
 is tested regardless, the 8x repetition claim is weaker than it looks.
+
+## Two-stage bounded-fan-out gather GREEN on the rig [2026-08-19]
+
+v7 (`split_all_gather(..., group=g)`): stage 1 gathers within contiguous subgroups of g ranks,
+stage 2 exchanges assembled blocks across n/g supergroups at stride g; both stages are canonical
+start/done pairs, stage-2 slots at +3 (six pairs/layer, collective_ids 7-12). At fsdp=128 with
+group=16 the per-kernel peer fan-out drops 127 -> 15 and 7 -- inside the envelope the rig has
+actually validated, which is the point: sag1g's halt needs something per-peer that only exists
+with 127 DISTINCT peers, and this sidesteps it rather than diagnosing it.
+
+| gate | result |
+|---|---|
+| R13 two-stage forward vs lax.all_gather, both axes (group=4 on 8 devices) | bit-exact |
+| R13 two-stage gradient through consumer | rel 2.7e-7 |
+| R7/R9/R11 single-stage regression after the peer_fn refactor | all green, unchanged |
+
+Cost booked in the docstring: stage 2 depends on stage 1's done, so the cross-group part of the
+transfer has roughly half the hiding window.
+
+Pallas lessons this iteration (each one rig-caught in minutes): kernel bodies cannot close over
+traced values (peer_fns must derive everything from in-kernel me); the same restriction does NOT
+apply to the shard_map body around the kernels. Plus two patch-hygiene slips (duplicate _sag_impl
+shadowing, a swallowed decorator) now guarded by parse-and-assert patch scripts.
+
+Next: fsdp=128 AOT with group=16 (running), then the cluster A/B: sag2a (split+group16) vs the
+banked stock 6.879.
