@@ -374,9 +374,9 @@ def r9(mesh):
   def body(x1, x2):
     start, done = _make_ag_pair(n, jax.ShapeDtypeStruct(x1.shape, x1.dtype), ax, tuple(mesh.axis_names))
     b1 = start(x1)
-    x2d = x2 + 0.0 * b1[0][0, :1]            # start2 after start1
+    x2d = x2 + 0.0 * b1[0][:1]            # start2 after start1
     b2 = start(x2d)
-    x1d = x1 + 0.0 * b2[0][0, :1]            # done1 after start2
+    x1d = x1 + 0.0 * b2[0][:1]            # done1 after start2
     g1 = done(x1d, *b1)
     g2 = done(x2d, *b2)
     return (jnp.stack([x1d] + list(g1)), jnp.stack([x2d] + list(g2)))
@@ -385,7 +385,6 @@ def r9(mesh):
   o1, o2 = f(jnp.asarray(h1.reshape(-1)), jnp.asarray(h2.reshape(-1)))
   o1, o2 = np.asarray(o1).reshape(n, n, -1), np.asarray(o2).reshape(n, n, -1)
   hh1, hh2 = h1.reshape(n, -1), h2.reshape(n, -1)
-  ok = all(np.array_equal(o1[j, (j - k) % n if False else 0], o1[j, 0]) for j in range(1) for k in [0])
   # position k on device j holds shard (j-k) mod n
   ok1 = all(np.array_equal(o1[j, k], hh1[(j - k) % n]) for j in range(n) for k in range(n))
   ok2 = all(np.array_equal(o2[j, k], hh2[(j - k) % n]) for j in range(n) for k in range(n))
