@@ -2806,3 +2806,17 @@ the A/B is now same-image in both directions.
 init, before first execution. Every genuine kernel failure (sag1b/c/d) printed its semaphore
 detail on worker 0. The same-night, same-image, same-cluster stock arm ran clean, so the slice
 failures are churn, not code. Kueue then suspended/requeued sag1e; watching for resume.
+
+## v6 (stacked landing buffer) gates green; compile-OOM theory REFUTED; sag1f launched [2026-08-19]
+
+v6: ONE stacked (n-1,)+shard landing buffer, destinations `buf.at[k]` at PYTHON-int k (still
+static -- the refuted addressing was dynamic me-indexing). Kernel operands collapse ~256 -> 4.
+Full rig suite green (R7 bit-exact both axes, R8, R9 on 2-D shards). New constraint recorded:
+shards must be >=2-D (1-D trips Mosaic's squeezed-dim rule); explicit rank guard added.
+
+fsdp=128 AOT exit=0 with **peak compile RSS 19.16 GiB** -- modest, so the theory that v5's
+operand fan-out OOM'd worker compiles is REFUTED, stated plainly. The sag1e slice failures
+revert to infra churn (the same night's stock arm also lost a worker; no kernel signature on
+any of 128 workers across three attempts). v6 ships on its merits, not as a fix for those.
+
+sag1f launched: image `splitag12`, single flag vs the banked same-image stock 6.879.
