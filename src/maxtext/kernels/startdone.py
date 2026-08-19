@@ -225,6 +225,10 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes, slot=0):
 
 
 def _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot=0):
+  if w.ndim < 2:
+    # buf.at[i] on a (n-1,)+(S,) landing buffer squeezes to 1-D, which Mosaic rejects
+    # ("All tiled squeezed dimensions must be of size 1"). Every model weight is >=2-D.
+    raise ValueError(f"split_all_gather requires a >=2-D shard, got shape {w.shape}")
   n = mesh.shape[axis_name]
   mesh_axes = tuple(mesh.axis_names)
 
