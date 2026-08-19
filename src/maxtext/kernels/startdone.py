@@ -147,97 +147,78 @@ def _peer_id(axis_name, mesh_axes, d):
 
 
 def _make_ag_pair(n, shard_sds, axis_name, mesh_axes, slot=0):
-  """Build the start/done pallas_call pair for an n-way static-destination all-gather.
+  """Start/done pair for an n-way static-destination all-gather, CANONICAL form.
 
-  `slot` separates CO-SCHEDULED pairs. Scratch semaphores are allocated at the same
-  physical sync-flag slots for every kernel with the same signature, and DMA semaphores
-  are anonymous counters -- so when XLA interleaves two pairs' starts before their dones
-  (the model runs three pairs per layer), pair B's completions satisfy pair A's waits.
-  REPRODUCED at n=8 (probe R9, same halt signature as sag1d). `slot` leading dummy
-  REGULAR semaphores displace this pair's DMA semaphores to distinct physical flags.
+  Follows the Pallas Async Ops pattern (jax/tests/pallas/tpu_pallas_async_test.py):
+  `start` RETURNS its DMA semaphores as outputs (`SemaphoreType.DMA(())` out_shape,
+  `SEMAPHORE` memory-space out_spec) and `done` takes them as INPUTS. XLA keeps the sync
+  flags alive and threads them through the dataflow, which retires the two failure
+  classes of the reconstruct-in-done design at once: no deterministic-slot assumption
+  (mismatched-scratch hang, R5) and no slot aliasing between co-scheduled pairs (the
+  sag1d cluster halt, reproduced by R9 -- three padding attempts could not displace the
+  slots because semaphore allocation is not positional-by-signature).
+
+  `start` also aliases x through ({0: 0}), keeping the source buffer alive under the
+  in-flight sends; `done` aliases every landing buffer to its outputs so downstream
+  consumers order after the waits. Destinations stay per-step and STATIC (the
+  dynamic-index refutation stands). The REGULAR exit fence in `done` serializes repeated
+  executions, which reuse buffers -- and therefore sync-flag addresses -- under scan.
   """
-  # ONE shared (send, recv) DMA semaphore pair for ALL n-1 sends -- constant in n.
-  # Per-step PAIRS halted at n=128: 2*(n-1) = 254 scratch semaphores overflows the
-  # sync-flag budget ("Semaphore (scratch argument 253) has a nonzero value upon exit",
-  # siv-cn-sag1b, zero steps), invisible at the rig's 14 and at compile time. DMA
-  # semaphores are counters, so concurrent copies sharing a pair is legal: each
-  # descriptor's wait decrements its own byte count (the ladder's shared-pair rungs
-  # passed). Buffers stay per-step -- STATIC destinations are what correctness requires.
-  # IDENTICAL in both halves (R5/R6).
-  # [send, recv, exit]. The REGULAR `exit` semaphore is the EPOCH FENCE: the pair runs
-  # 116x/step under scan+remat, every instance reuses the same physical sync-flag slots,
-  # and DMA semaphores are anonymous counters -- so without a fence a fast device can pass
-  # the entry barrier for execution i+1 on a laggard's execution-i signals and arm sends
-  # into a peer still waiting in done_i, which consumes the wrong epoch's bytes and leaves
-  # the residue the halt reported ("Semaphore (scratch argument 0) has a nonzero value",
-  # sag1c). done therefore ends with signal-all + wait-n on `exit`: a device cannot
-  # complete its i-th exit wait until every device has signaled its i-th, because each
-  # device's cumulative signals are bounded by its own completed dones. Hard serialization
-  # of executions; skew across epochs becomes impossible rather than unlikely.
-  # Pad WITHIN EACH POOL: Mosaic allocates DMA and REGULAR semaphores separately, so
-  # REGULAR-only padding left the DMA slots shared (R9 still halted with it). Layout:
-  # [2*slot dummy DMA] [ss] [rs] [slot dummy REGULAR] [exit].
-  scratch = (
-      [pltpu.SemaphoreType.DMA] * (2 * slot)
-      + [pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA]
-      + [pltpu.SemaphoreType.REGULAR] * slot
-      + [pltpu.SemaphoreType.REGULAR]
-  )
+  cp = _ag_cp(slot)
+  sem = pltpu.SemaphoreType.DMA(())
+  SEM = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
 
-  def descriptors(x_ref, bufs, sems):
-    ss, rs = sems[2 * slot], sems[2 * slot + 1]
+  def descriptors(x_ref, bufs, ss, rs):
     me = jax.lax.axis_index(axis_name)
     for i, k in enumerate(range(1, n)):
       peer = jax.lax.rem(me + k, n)
       yield pltpu.make_async_remote_copy(
-          x_ref, bufs[i], ss, rs,
-          device_id=_peer_id(axis_name, mesh_axes, peer),
+          x_ref, bufs[i], ss, rs, device_id=_peer_id(axis_name, mesh_axes, peer)
       )
 
-  def _pin_dummies(sems):
-    # Dummy padding semaphores are dead code unless referenced, and Mosaic's DCE strips
-    # unreferenced scratch BEFORE allocation -- which collapses every pair back to slots
-    # 0/1 and is why both padding variants still failed R9. A self-balanced signal+wait
-    # forces liveness at ~ns cost. Dummies: DMA sems [0, 2*slot) and REGULAR sems
-    # [2*slot+2, 2*slot+2+slot).
-    for i in list(range(2 * slot)) + list(range(2 * slot + 2, 2 * slot + 2 + slot)):
-      pl.semaphore_signal(sems[i], 1)
-      pl.semaphore_wait(sems[i], 1)
-
-  def start_body(x_ref, *rest):
-    bufs, sems = list(rest[: n - 1]), list(rest[n - 1:])
-    _pin_dummies(sems)
-    # A peer must not write into our buffers before this kernel is entered.
+  def start_body(x_ref, x_alias, *rest):
+    bufs, (ss, rs) = list(rest[: n - 1]), rest[n - 1:]
     bar = pltpu.get_barrier_semaphore()
     me = jax.lax.axis_index(axis_name)
     for k in range(n):
       pl.semaphore_signal(bar, device_id=_peer_id(axis_name, mesh_axes, jax.lax.rem(me + k, n)))
     pl.semaphore_wait(bar, n)
-    for dma in descriptors(x_ref, bufs, sems):
+    for dma in descriptors(x_ref, bufs, ss, rs):
       dma.start()
 
+  start = pl.pallas_call(
+      start_body,
+      in_specs=[_HBM],
+      out_shape=(shard_sds,) + (shard_sds,) * (n - 1) + (sem, sem),
+      out_specs=((_HBM,) * n) + (SEM, SEM),
+      input_output_aliases={0: 0},
+      compiler_params=cp,
+  )
+
   def done_body(x_ref, *rest):
-    ins = list(rest[: n - 1])            # aliased to the outputs; nothing loaded here
-    sems = list(rest[2 * (n - 1):])
-    _pin_dummies(sems)
-    for dma in descriptors(x_ref, ins, sems):
-      dma.wait()   # sequential waits on the shared pair; each decrements its own bytes
-    # Epoch fence (see scratch comment): no device leaves done_i before all finished done_i.
-    exit_sem = sems[2 * slot + 2 + slot]
+    bufs = list(rest[: n - 1])
+    ss, rs = rest[n - 1], rest[n]
+    exit_sem = rest[-1]                                   # scratch, appended last
+    # outputs rest[n+1:-1] are aliased to bufs; nothing is loaded here.
+    for _ in range(n - 1):
+      pltpu.make_async_copy(x_ref, x_ref, ss).wait()      # one send completion each
+    for b in bufs:
+      pltpu.make_async_copy(b, b, rs).wait()              # one arrival each
+    # Epoch fence: scan reuses buffers, hence sync-flag addresses, across executions.
     me = jax.lax.axis_index(axis_name)
     for k in range(n):
-      pl.semaphore_signal(
-          exit_sem, device_id=_peer_id(axis_name, mesh_axes, jax.lax.rem(me + k, n))
-      )
+      pl.semaphore_signal(exit_sem, device_id=_peer_id(axis_name, mesh_axes, jax.lax.rem(me + k, n)))
     pl.semaphore_wait(exit_sem, n)
 
-  shapes = [shard_sds] * (n - 1)
-  cp = _ag_cp(slot)
-  start = pl.pallas_call(start_body, in_specs=[_HBM], out_specs=[_HBM] * (n - 1),
-                         out_shape=shapes, scratch_shapes=scratch, compiler_params=cp)
-  done = pl.pallas_call(done_body, in_specs=[_HBM] * n, out_specs=[_HBM] * (n - 1),
-                        out_shape=shapes, scratch_shapes=scratch, compiler_params=cp,
-                        input_output_aliases={i + 1: i for i in range(n - 1)})
+  done = pl.pallas_call(
+      done_body,
+      in_specs=[_HBM] * n + [SEM, SEM],
+      out_specs=(_HBM,) * (n - 1),
+      out_shape=(shard_sds,) * (n - 1),
+      input_output_aliases={i + 1: i for i in range(n - 1)},
+      scratch_shapes=[pltpu.SemaphoreType.REGULAR],
+      compiler_params=cp,
+  )
   return start, done
 
 
@@ -248,8 +229,10 @@ def _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot=0):
   def body(xx):
     start, done = _make_ag_pair(n, jax.ShapeDtypeStruct(xx.shape, xx.dtype),
                                 axis_name, mesh_axes, slot=slot)
-    bufs = start(xx)
-    got = done(xx, *bufs)                # <-- the layer's compute belongs in this gap
+    outs = start(xx)
+    x_alias, bufs, (ss, rs) = outs[0], list(outs[1:n]), outs[n:]
+    got = done(x_alias, *bufs, ss, rs)   # <-- the layer's compute belongs in this gap
+    xx = x_alias
     # Position k holds shard (me-k) mod n; own shard at position 0. Permute to shard
     # order 0..n-1, then lay out exactly as lax.all_gather(tiled=True, axis=gather_axis).
     stacked = jnp.stack([xx] + list(got), axis=0)          # (n,) + shard

@@ -376,12 +376,15 @@ def r9(mesh):
     axes = tuple(mesh.axis_names)
     start1, done1_ = _make_ag_pair(n, sds, ax, axes, slot=0)
     start2, done2_ = _make_ag_pair(n, sds, ax, axes, slot=1)
-    b1 = start1(x1)
-    x2d = x2 + 0.0 * b1[0][:1]            # start2 after start1
-    b2 = start2(x2d)
-    x1d = x1 + 0.0 * b2[0][:1]            # done1 after start2
-    g1 = done1_(x1d, *b1)
-    g2 = done2_(x2d, *b2)
+    o1_ = start1(x1)
+    xa1, bufs1, (ss1, rs1) = o1_[0], list(o1_[1:n]), o1_[n:]
+    x2d = x2 + 0.0 * bufs1[0][:1]         # start2 after start1
+    o2_ = start2(x2d)
+    xa2, bufs2, (ss2, rs2) = o2_[0], list(o2_[1:n]), o2_[n:]
+    xa1 = xa1 + 0.0 * bufs2[0][:1]        # done1 after start2
+    g1 = done1_(xa1, *bufs1, ss1, rs1)
+    g2 = done2_(xa2, *bufs2, ss2, rs2)
+    x1d, x2d = xa1, xa2
     return (jnp.stack([x1d] + list(g1)), jnp.stack([x2d] + list(g2)))
 
   f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(ax), P(ax)), out_specs=(P(ax, None), P(ax, None)), check_vma=False))
