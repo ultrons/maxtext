@@ -2695,3 +2695,34 @@ fewer steps with a static double buffer, trading kernel width for sequential ste
 Next: (1) width/scale probe, (2) replace the push implementation in `kernels/startdone.py` with
 this one and re-gate numerics + VJP (R7a/R7b), (3) AOT, (4) cluster A/B against the stock 6.864 s
 baseline with the hoist off.
+
+## VJP root cause: psum_scatter over-counts by n at a custom_vjp boundary [2026-08-19]
+
+The consumer-form R7 gradient gate failed (max err 275/512) and a CPU study (8 host devices,
+`scratchpad/vjp_cpu.py` logic) pinned it in seconds:
+
+| custom_vjp backward | median ratio vs stock autodiff | verdict |
+|---|---|---|
+| shard_map psum_scatter (what we shipped) | **8.000 exactly** (= n) | over-counts by n |
+| identity (return ct) | 1.000, max err 7.6e-06 | correct (reduction order only) |
+| with_sharding_constraint(ct, sharded) | 1.000, same | correct + reshard hint |
+
+Mechanism: `psum_scatter` is the transpose of a tiled all-gather ONLY when the cotangent arrives
+as UNSUMMED per-device partials -- which is what another `shard_map`'s transpose hands back under
+`check_vma=False` (the `_make_cv_gather` context, where it is validated and correct). A plain
+GSPMD dot consumer (DenseGeneral) delivers the already-summed LOGICAL cotangent through the
+custom_vjp boundary; psum_scatter on top multiplies by n. Stock autodiff's own transposed jaxpr
+shows a `reduce_scatter` fused inside the transposed shard_map -- the thing GSPMD builds when it
+owns both sides.
+
+**This retro-explains the hoist's 0.174 lm_loss hold-out**: `_gather` in linears.py used the same
+psum_scatter bwd against the same plain-dot consumer, so shared-expert weight grads were ~128x on
+the cluster. adamw's second-moment normalization turns a uniform grad scale into drift rather than
+explosion, which matches a 0.17 delta. Both sites now use identity + with_sharding_constraint
+(commit 886982127); the -0.208 s hoist result may be re-eligible once re-gated.
+
+Width gate at fsdp=128: **exit=0** -- the 127-buffer / 254-semaphore kernel compiles through full
+Mosaic codegen with 68 = 50+18 custom calls and ZERO SPMD shared-expert e4m3 gathers left.
+
+R7 acceptance updated: bit-exact or reduction-order-only (rel < 1e-5); a factor-n bug reads as
+rel ~ n-1, three orders away.
