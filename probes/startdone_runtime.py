@@ -400,36 +400,53 @@ def r9(mesh):
 def r10(_unused):
   """MULTI-AXIS mesh: gather over fsdp with a held ep axis -- the cluster's shape.
 
-  sag1g halted inside shard_map/while at 512 chips with an HLO-located assertion.
-  Every prior rig gate ran a 1-AXIS fsdp mesh; the model's mesh is multi-axis, so the
-  dict device_id (peer rank on the gather axis, OTHER AXES HELD via lax.axis_index)
-  and the barrier fan-out had never executed on hardware with a held axis. 16 devices
-  as (ep=2, fsdp=8): two independent gather groups that must not cross-talk.
+  sag1g halted inside shard_map/while at 512 chips. Every prior rig gate ran a 1-AXIS
+  fsdp mesh; the model's mesh is multi-axis, so the dict device_id (peer rank on the
+  gather axis, OTHER AXES HELD via lax.axis_index) and the barrier fan-out had never
+  executed on hardware with a held axis. Mirror DenseGeneral exactly: the weight is
+  fsdp-SHARDED and ep-REPLICATED at top level; each ep group must gather without
+  cross-talking the other.
   """
   from maxtext.kernels.startdone import split_all_gather
 
   nd = jax.device_count()
-  ep = 2
-  fs = nd // ep
+  ep, fs = 2, nd // 2
   mesh2 = jax.sharding.Mesh(np.array(jax.devices()).reshape(ep, fs), ("ep", "fsdp"))
   K, C = 1024, 256
   rng = np.random.default_rng(3)
-  host = rng.standard_normal((ep, K, C)).astype(np.float32)   # different data per ep rank
-  in_spec, out_spec = P("ep", "fsdp", None), P("ep", None, None)
-  w = jax.device_put(jnp.asarray(host),
-                     jax.sharding.NamedSharding(mesh2, in_spec))
+  host = rng.standard_normal((K, C)).astype(np.float32)
+  in_spec, out_spec = P("fsdp", None), P(None, None)   # ep unmentioned = replicated
+  w = jax.device_put(jnp.asarray(host), jax.sharding.NamedSharding(mesh2, in_spec))
 
-  def body(xx):
-    # xx: (1, K/fs, C) per device; gather over fsdp on axis 1 of the squeezed shard
-    g = split_all_gather(xx[0], mesh2, "fsdp", 0, P("fsdp", None), P(None, None))
-    return g[None]
+  def ours(w):
+    return split_all_gather(w, mesh2, "fsdp", 0, in_spec, out_spec)
 
-  f = jax.jit(jax.shard_map(body, mesh=mesh2, in_specs=(in_spec,), out_specs=out_spec,
-                            check_vma=False))
-  got = np.asarray(f(w))
-  ok = all(np.array_equal(got[e], host[e]) for e in range(ep))
-  gate("R10 multi-axis mesh (ep x fsdp) gathers correctly per group", ok,
-       "no cross-group leakage" if ok else "WRONG (cross-group or misplaced)")
+  def stock(w):
+    return jax.shard_map(lambda x: jax.lax.all_gather(x, "fsdp", axis=0, tiled=True),
+                         mesh=mesh2, in_specs=(in_spec,), out_specs=out_spec,
+                         check_vma=False)(w)
+
+  go, gs = np.asarray(jax.jit(ours)(w)), np.asarray(jax.jit(stock)(w))
+  gate("R10 multi-axis (ep held) forward matches", np.array_equal(go, gs),
+       f"max|err|={np.max(np.abs(go - gs)):.3e}")
+
+  xh = rng.standard_normal((512, K)).astype(np.float32)
+  x = jax.device_put(jnp.asarray(xh), jax.sharding.NamedSharding(mesh2, P("ep", None)))
+
+  def loss(f):
+    def _l(w, x):
+      y = jax.lax.dot_general(x, f(w), (((1,), (0,)), ((), ())),
+                              precision=jax.lax.Precision.HIGHEST)
+      return jnp.sum(y)
+    return _l
+
+  do = np.asarray(jax.jit(jax.grad(loss(ours)))(w, x))
+  ds = np.asarray(jax.jit(jax.grad(loss(stock)))(w, x))
+  scale = np.max(np.abs(ds)) + 1e-30
+  rel = np.max(np.abs(do - ds)) / scale
+  gate("R10 multi-axis gradient matches", np.array_equal(do, ds) or rel < 1e-5,
+       f"max|err|={np.max(np.abs(do - ds)):.3e} rel={rel:.2e}")
+
 
 
 if __name__ == "__main__":
