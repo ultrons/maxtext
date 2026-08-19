@@ -2726,3 +2726,19 @@ Mosaic codegen with 68 = 50+18 custom calls and ZERO SPMD shared-expert e4m3 gat
 
 R7 acceptance updated: bit-exact or reduction-order-only (rel < 1e-5); a factor-n bug reads as
 rel ~ n-1, three orders away.
+
+## Split all-gather numerics gate GREEN [2026-08-19]
+
+R7 on v7x 2x2x1, image `1410-up2-splitag4`, real kernel shapes at fsdp=8:
+
+| gate | result |
+|---|---|
+| forward vs lax.all_gather, axis 0 (wi 7168x2048) | bit-exact |
+| forward vs lax.all_gather, axis 1 (wo 2048x7168) | bit-exact |
+| gradient through consumer, axis 0 | rel 2.98e-07 (reduction order) |
+| gradient through consumer, axis 1 | **bit-exact** |
+
+The earlier axis-0 rel 2e-3 was consumer bf16 lowering divergence in the TEST (the two gradient
+paths lowered x^T@ones differently under default TPU matmul precision); at HIGHEST precision it
+collapses to 3e-7. Kernel + VJP are correct on hardware. Remaining before cluster: re-AOT exit +
+bwd lowering check (reduce_scatter vs AR+slice), then the sag0/sag1 A/B.
