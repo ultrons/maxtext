@@ -449,6 +449,57 @@ def r10(_unused):
 
 
 
+def r11(_unused):
+  """CLUSTER-CONDITIONS microcosm on 8 devices: everything sag1g had except width.
+
+  4-axis mesh with size-1 extremes ("dp","ep","fsdp","tp") = (1,2,4,1); bf16; the EXACT
+  unaligned shard shapes of fsdp=128 (wi shard (56,2048), wo shard (2048,56) -- lane dim
+  56 is BELOW the 128 tile, never tested); THREE pairs per scan iteration with slots
+  0/1/2 (the MlpBlock structure); 8 scan iterations. Prior gates covered each dimension
+  separately; sag1g ran them together.
+  """
+  from maxtext.kernels.startdone import split_all_gather
+
+  nd = jax.device_count()
+  ep, fs = 2, nd // 2
+  mesh4 = jax.sharding.Mesh(np.array(jax.devices()).reshape(1, ep, fs, 1),
+                            ("dp", "ep", "fsdp", "tp"))
+  Kwi, Cwi = 56 * fs, 2048          # wi full (224, 2048) -> shard (56, 2048)
+  Kwo, Cwo = 2048, 56 * fs          # wo full (2048, 224) -> shard (2048, 56), lane 56
+  rng = np.random.default_rng(4)
+  wi0 = jnp.asarray(rng.standard_normal((Kwi, Cwi)), dtype=jnp.bfloat16)
+  wi1 = jnp.asarray(rng.standard_normal((Kwi, Cwi)), dtype=jnp.bfloat16)
+  wo = jnp.asarray(rng.standard_normal((Kwo, Cwo)), dtype=jnp.bfloat16)
+  swi = jax.sharding.NamedSharding(mesh4, P("fsdp", None))
+  swo = jax.sharding.NamedSharding(mesh4, P(None, "fsdp"))
+  wi0, wi1, wo = jax.device_put(wi0, swi), jax.device_put(wi1, swi), jax.device_put(wo, swo)
+
+  def gathers(fn0, fn1, fn2):
+    def step(c, _):
+      g0 = fn0(wi0)
+      g1 = fn1(wi1)
+      g2 = fn2(wo)
+      c = c + jnp.float32(jnp.sum(g0[:1, :8])) + jnp.float32(jnp.sum(g1[:1, :8])) \
+            + jnp.float32(jnp.sum(g2[:1, :8]))
+      return c, None
+    return jax.jit(lambda: jax.lax.scan(step, jnp.float32(0.0), None, length=8)[0])
+
+  ours = gathers(
+      lambda w: split_all_gather(w, mesh4, "fsdp", 0, P("fsdp", None), P(None, None), 0),
+      lambda w: split_all_gather(w, mesh4, "fsdp", 0, P("fsdp", None), P(None, None), 1),
+      lambda w: split_all_gather(w, mesh4, "fsdp", 1, P(None, "fsdp"), P(None, None), 2),
+  )
+  def stock_ag(spec_in, ax_dim):
+    return lambda w: jax.shard_map(
+        lambda x: jax.lax.all_gather(x, "fsdp", axis=ax_dim, tiled=True),
+        mesh=mesh4, in_specs=(spec_in,), out_specs=P(None, None), check_vma=False)(w)
+  stock = gathers(stock_ag(P("fsdp", None), 0), stock_ag(P("fsdp", None), 0),
+                  stock_ag(P(None, "fsdp"), 1))
+  co, cs = float(ours()), float(stock())
+  gate("R11 cluster-conditions microcosm (bf16, lane-56, 3 pairs, scan, 4-axis mesh)",
+       abs(co - cs) <= 1e-4 * max(1.0, abs(cs)), f"ours={co:.4f} stock={cs:.4f}")
+
+
 if __name__ == "__main__":
   print(f"jax {jax.__version__}  devices={jax.device_count()}", flush=True)
   dev = jax.devices()[0]
@@ -457,7 +508,7 @@ if __name__ == "__main__":
 
   import os
   sel = os.environ.get("GATES", "")
-  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r7": (r7, (mesh,)), "r8": (r8, (mesh,)), "r9": (r9, (mesh,)), "r10": (r10, (mesh,)), "r4": (r4, (dev,))}
+  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r7": (r7, (mesh,)), "r8": (r8, (mesh,)), "r9": (r9, (mesh,)), "r10": (r10, (mesh,)), "r11": (r11, (mesh,)), "r4": (r4, (dev,))}
   chosen = [allg[k] for k in (sel.split(",") if sel else allg) if k in allg]
   for fn, args in chosen:
     try:
