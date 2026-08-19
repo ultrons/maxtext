@@ -296,8 +296,14 @@ def r7(mesh):
 
     do = np.asarray(jax.jit(jax.grad(loss(ours)))(w, x))
     ds = np.asarray(jax.jit(jax.grad(loss(stock)))(w, x))
+    # Acceptance: bit-exact OR reduction-order-only (~1e-7 relative). Our identity+reshard
+    # bwd lets GSPMD pick the reduction order, which may differ from stock's fused
+    # reduce_scatter; a factor-n bug shows up as rel ~ (n-1), orders of magnitude away.
+    scale = np.max(np.abs(ds)) + 1e-30
+    rel = np.max(np.abs(do - ds)) / scale
     gate(f"R7{tag}2 split AG grad matches stock THROUGH consumer (axis {g_axis})",
-         np.array_equal(do, ds), f"max|err|={np.max(np.abs(do - ds)):.3e}")
+         np.array_equal(do, ds) or rel < 1e-5,
+         f"max|err|={np.max(np.abs(do - ds)):.3e} rel={rel:.2e}")
 
   check("a", (7168, 2048), 0, P(ax, None))   # wi: embed-sharded on axis 0
   check("b", (2048, 7168), 1, P(None, ax))   # wo: embed-sharded on axis 1

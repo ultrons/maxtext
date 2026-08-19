@@ -217,10 +217,17 @@ def _sag_fwd(w, mesh, axis_name, gather_axis, in_spec, out_spec):
 
 
 def _sag_bwd(mesh, axis_name, gather_axis, in_spec, out_spec, _res, ct):
-  g = jax.shard_map(
-      lambda c: jax.lax.psum_scatter(c, axis_name, scatter_dimension=gather_axis, tiled=True),
-      mesh=mesh, in_specs=(out_spec,), out_specs=in_spec, check_vma=False,
-  )(ct)
+  # The gather is LOGICALLY the identity (tiled all-gather of a tiled-sharded array), so the
+  # logical cotangent IS the weight grad; a sharding constraint reshards it and lets GSPMD
+  # fuse the pending partial-sum + slice into one reduce-scatter.
+  #
+  # Do NOT psum_scatter here. That transpose is correct only when the cotangent arrives as
+  # UNSUMMED per-device partials, which is what another shard_map's transpose hands back
+  # under check_vma=False (the `_make_cv_gather` context). Our consumer is the plain GSPMD
+  # dot in DenseGeneral, whose autodiff delivers the already-summed logical cotangent --
+  # psum_scatter on top of that over-counts by exactly n (CPU study: median ratio 8.000 at
+  # n=8; identity ratio 1.000). The same defect explains the hoist's 0.174 lm_loss delta.
+  g = jax.lax.with_sharding_constraint(ct, jax.sharding.NamedSharding(mesh, in_spec))
   return (g,)
 
 

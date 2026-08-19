@@ -362,14 +362,13 @@ class DenseGeneral(nnx.Module):
       )(w)
       return w_full, None  # no residual: the sharded param is a leaf, always available
 
-    def _gather_bwd(_res, ct):  # transpose of a tiled all-gather = tiled psum_scatter
-      g = jax.shard_map(
-          lambda gg: jax.lax.psum_scatter(gg, ag_axes, scatter_dimension=gather_axis, tiled=True),
-          mesh=self.mesh,
-          in_specs=(out_spec,),
-          out_specs=in_spec,
-          check_vma=False,
-      )(ct)
+    def _gather_bwd(_res, ct):
+      # Logical identity: the summed cotangent IS the weight grad; reshard only. A
+      # psum_scatter here over-counts by n against the plain-dot consumer (CPU study,
+      # ratio exactly n) -- the likely cause of the hoist's 0.174 lm_loss delta.
+      g = jax.lax.with_sharding_constraint(
+          ct, jax.sharding.NamedSharding(self.mesh, in_spec)
+      )
       return (g,)
 
     _gather.defvjp(_gather_fwd, _gather_bwd)
