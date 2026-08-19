@@ -351,6 +351,48 @@ def r8(mesh):
        abs(co - cs) <= 1e-5 * max(1.0, abs(cs)), f"ours={co:.6f} stock={cs:.6f}")
 
 
+def r9(mesh):
+  """INTERLEAVED pairs: two independent split gathers with both starts before both dones.
+
+  The model runs THREE pairs per layer (wi_0, wi_1, wo); identical scratch signatures mean
+  identical physical semaphore slots, and XLA schedules the starts together -- so pair B's
+  send completions can satisfy pair A's done waits (anonymous counters). Hypothesized root
+  cause of the sag1d halt; every earlier gate ran ONE pair at a time. Data deps force the
+  interleave: start1 -> start2 -> done1 -> done2.
+  """
+  from maxtext.kernels.startdone import _make_ag_pair
+
+  ax = "fsdp"
+  n = mesh.shape[ax]
+  K, C = 1024, 256
+  rng = np.random.default_rng(2)
+  h1 = rng.standard_normal((K, C)).astype(np.float32)
+  h2 = rng.standard_normal((K, C)).astype(np.float32)
+  sh = jax.sharding.NamedSharding(mesh, P(ax, None))
+  w1, w2 = jax.device_put(jnp.asarray(h1), sh), jax.device_put(jnp.asarray(h2), sh)
+
+  def body(x1, x2):
+    start, done = _make_ag_pair(n, jax.ShapeDtypeStruct(x1.shape, x1.dtype), ax, tuple(mesh.axis_names))
+    b1 = start(x1)
+    x2d = x2 + 0.0 * b1[0][0, :1]            # start2 after start1
+    b2 = start(x2d)
+    x1d = x1 + 0.0 * b2[0][0, :1]            # done1 after start2
+    g1 = done(x1d, *b1)
+    g2 = done(x2d, *b2)
+    return (jnp.stack([x1d] + list(g1)), jnp.stack([x2d] + list(g2)))
+
+  f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(ax), P(ax)), out_specs=(P(ax, None), P(ax, None)), check_vma=False))
+  o1, o2 = f(jnp.asarray(h1.reshape(-1)), jnp.asarray(h2.reshape(-1)))
+  o1, o2 = np.asarray(o1).reshape(n, n, -1), np.asarray(o2).reshape(n, n, -1)
+  hh1, hh2 = h1.reshape(n, -1), h2.reshape(n, -1)
+  ok = all(np.array_equal(o1[j, (j - k) % n if False else 0], o1[j, 0]) for j in range(1) for k in [0])
+  # position k on device j holds shard (j-k) mod n
+  ok1 = all(np.array_equal(o1[j, k], hh1[(j - k) % n]) for j in range(n) for k in range(n))
+  ok2 = all(np.array_equal(o2[j, k], hh2[(j - k) % n]) for j in range(n) for k in range(n))
+  gate("R9 interleaved pairs deliver correctly", ok1 and ok2,
+       "both pairs correct" if (ok1 and ok2) else f"corrupt (pair1={ok1} pair2={ok2})")
+
+
 if __name__ == "__main__":
   print(f"jax {jax.__version__}  devices={jax.device_count()}", flush=True)
   dev = jax.devices()[0]
@@ -359,7 +401,7 @@ if __name__ == "__main__":
 
   import os
   sel = os.environ.get("GATES", "")
-  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r7": (r7, (mesh,)), "r8": (r8, (mesh,)), "r4": (r4, (dev,))}
+  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r7": (r7, (mesh,)), "r8": (r8, (mesh,)), "r9": (r9, (mesh,)), "r4": (r4, (dev,))}
   chosen = [allg[k] for k in (sel.split(",") if sel else allg) if k in allg]
   for fn, args in chosen:
     try:
