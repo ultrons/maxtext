@@ -2842,3 +2842,27 @@ below-cluster gate green (R7/R8/R9, AOT exit=0, 19.16 GiB compile RSS) and the s
 baseline banked at 6.879. Retry sag1f unchanged when the cluster is healthy, ideally after a
 capacity check (kubectl get nodes / recent eviction events) and NOT immediately after deleting a
 failed sibling, to dodge the freed-node trap.
+
+## sag1g: HLO-LOCATED kernel halt at 512 chips; rig elimination tree [2026-08-19]
+
+sag1g (v6) halted at first execution, zero steps, with a REAL signature this time:
+`TensorCoreSequencer:42:0x41ef ... no debugging message ... HLO: shard_map.5457, while.147` --
+our pair, inside the scan. This also reopens the sag1e/f attribution (bare slice failures may
+have been this same death with the origin log lost; the churn exoneration was premature).
+
+Rig elimination since, each dimension the cluster has and prior gates lacked:
+
+| gate | dimension added | result |
+|---|---|---|
+| R10 | multi-axis mesh, held ep axis, dict device_id, cross-group isolation | **PASS** (fwd exact, grad 1.4e-7) |
+| R11 | bf16 + EXACT fsdp=128 shard shapes incl. lane-56 sub-tile (2048,56) + 3 pairs/iter with slots 0/1/2 + scan + 4-axis mesh with size-1 axes | **PASS** |
+| R12 | 127 outstanding DMAs armed by ONE core before any wait (queue depth is a sender property; rig never exceeded 7) | running |
+
+R12 is the last width-scaling suspect reachable below the cluster. If it passes too, the halt
+needs a genuinely-128-wide ingredient (127 distinct REMOTE peers, ICI route diversity, or the
+barrier's 128-way fan-in) and the next step is either a 16-device half-step or a debug-flagged
+cluster attempt to make 0x41ef name itself.
+
+Caveat on R11's power: the three gathers are loop-invariant in the probe's scan, so XLA may have
+hoisted them out of the loop despite has_side_effects; the 3-pair interleave within one execution
+is tested regardless, the 8x repetition claim is weaker than it looks.
