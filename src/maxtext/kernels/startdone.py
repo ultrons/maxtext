@@ -144,15 +144,23 @@ def _peer_id(axis_name, mesh_axes, d):
 
 def _make_ag_pair(n, shard_sds, axis_name, mesh_axes):
   """Build the start/done pallas_call pair for an n-way static-destination all-gather."""
-  # One (send, recv) DMA semaphore pair per step. IDENTICAL in both halves (R5/R6).
-  scratch = [pltpu.SemaphoreType.DMA] * (2 * (n - 1))
+  # ONE shared (send, recv) DMA semaphore pair for ALL n-1 sends -- constant in n.
+  # Per-step PAIRS halted at n=128: 2*(n-1) = 254 scratch semaphores overflows the
+  # sync-flag budget ("Semaphore (scratch argument 253) has a nonzero value upon exit",
+  # siv-cn-sag1b, zero steps), invisible at the rig's 14 and at compile time. DMA
+  # semaphores are counters, so concurrent copies sharing a pair is legal: each
+  # descriptor's wait decrements its own byte count (the ladder's shared-pair rungs
+  # passed). Buffers stay per-step -- STATIC destinations are what correctness requires.
+  # IDENTICAL in both halves (R5/R6).
+  scratch = [pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA]
 
   def descriptors(x_ref, bufs, sems):
+    ss, rs = sems
     me = jax.lax.axis_index(axis_name)
     for i, k in enumerate(range(1, n)):
       peer = jax.lax.rem(me + k, n)
       yield pltpu.make_async_remote_copy(
-          x_ref, bufs[i], sems[2 * i], sems[2 * i + 1],
+          x_ref, bufs[i], ss, rs,
           device_id=_peer_id(axis_name, mesh_axes, peer),
       )
 
@@ -171,7 +179,7 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes):
     ins = list(rest[: n - 1])            # aliased to the outputs; nothing loaded here
     sems = list(rest[2 * (n - 1):])
     for dma in descriptors(x_ref, ins, sems):
-      dma.wait()
+      dma.wait()   # sequential waits on the shared pair; each decrements its own bytes
 
   shapes = [shard_sds] * (n - 1)
   start = pl.pallas_call(start_body, in_specs=[_HBM], out_specs=[_HBM] * (n - 1),
