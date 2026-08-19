@@ -318,6 +318,39 @@ def r7(mesh):
 
 
 
+def r8(mesh):
+  """Sequential-execution smoke: 64 chained split gathers, the scan+remat shape.
+
+  The sag1c halt was epoch skew across REPEATED executions sharing physical semaphore
+  slots -- a hazard no single-shot probe can see. Chain 64 executions with a data
+  dependency (each input depends on the previous mean) and require completion + a final
+  value matching the stock chain. On one host devices are near-lockstep, so a pass here
+  is NECESSARY not sufficient for the cluster; a halt here is definitive.
+  """
+  from maxtext.kernels.startdone import split_all_gather
+
+  ax = "fsdp"
+  in_spec, out_spec = P(ax, None), P(None, None)
+  K, C, STEPS = 1024, 256, 64
+  rng = np.random.default_rng(1)
+  w = jax.device_put(jnp.asarray(rng.standard_normal((K, C)).astype(np.float32)),
+                     jax.sharding.NamedSharding(mesh, in_spec))
+
+  def chain(fn):
+    def step(c, _):
+      g = fn(w + c)          # depends on the carry, so executions are sequential
+      return jnp.float32(jnp.mean(g)), None
+    return jax.jit(lambda w0: jax.lax.scan(step, jnp.float32(0.0), None, length=STEPS)[0])
+
+  ours = chain(lambda x: split_all_gather(x, mesh, ax, 0, in_spec, out_spec))
+  stock = chain(lambda x: jax.shard_map(
+      lambda xx: jax.lax.all_gather(xx, ax, axis=0, tiled=True),
+      mesh=mesh, in_specs=(in_spec,), out_specs=out_spec, check_vma=False)(x))
+  co, cs = float(ours(w)), float(stock(w))
+  gate("R8 64 chained executions complete and match",
+       abs(co - cs) <= 1e-5 * max(1.0, abs(cs)), f"ours={co:.6f} stock={cs:.6f}")
+
+
 if __name__ == "__main__":
   print(f"jax {jax.__version__}  devices={jax.device_count()}", flush=True)
   dev = jax.devices()[0]
@@ -326,7 +359,7 @@ if __name__ == "__main__":
 
   import os
   sel = os.environ.get("GATES", "")
-  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r7": (r7, (mesh,)), "r4": (r4, (dev,))}
+  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r7": (r7, (mesh,)), "r8": (r8, (mesh,)), "r4": (r4, (dev,))}
   chosen = [allg[k] for k in (sel.split(",") if sel else allg) if k in allg]
   for fn, args in chosen:
     try:
