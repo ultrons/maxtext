@@ -140,6 +140,7 @@ class DenseGeneral(nnx.Module):
       debug_sharding: bool = False,
       hoist_weight_ag_sched_group: int = -1,
       hoist_weight_ag_split: int = 0,
+      hoist_weight_ag_group: int = 0,
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
   ):
@@ -188,6 +189,7 @@ class DenseGeneral(nnx.Module):
     self.use_two_stage_all_gather = use_two_stage_all_gather
     self.hoist_weight_ag_sched_group = hoist_weight_ag_sched_group
     self.hoist_weight_ag_split = hoist_weight_ag_split
+    self.hoist_weight_ag_group = hoist_weight_ag_group
     self.debug_sharding = debug_sharding
 
     # Parameter initialization
@@ -340,7 +342,8 @@ class DenseGeneral(nnx.Module):
         from maxtext.kernels.startdone import split_all_gather
 
         return split_all_gather(kernel, self.mesh, ag_axes[0], gather_axis, in_spec, out_spec,
-                                slot=max(0, int(self.hoist_weight_ag_split) - 1))
+                                slot=max(0, int(self.hoist_weight_ag_split) - 1),
+                                group=int(self.hoist_weight_ag_group or 0))
       return kernel
 
     @jax.custom_vjp
@@ -641,6 +644,7 @@ class MlpBlock(nnx.Module):
           kernel_axes=("embed", "num_activations", "mlp"),
           hoist_weight_ag_sched_group=self._hoist_wag_sg(0),
           hoist_weight_ag_split=self._hoist_wag_split(0),
+          hoist_weight_ag_group=self._hoist_wag_group(),
           quant=self.quant,
           use_bias=self.use_bias,
           shard_mode=self.config.shard_mode,
@@ -662,6 +666,7 @@ class MlpBlock(nnx.Module):
             kernel_axes=self._wi_kernel_axes(),
             hoist_weight_ag_sched_group=self._hoist_wag_sg(idx),
             hoist_weight_ag_split=self._hoist_wag_split(idx),
+            hoist_weight_ag_group=self._hoist_wag_group(),
             quant=self.quant,
             use_bias=self.use_bias,
             shard_mode=self.config.shard_mode,
@@ -682,6 +687,7 @@ class MlpBlock(nnx.Module):
         kernel_axes=self._wo_kernel_axes(),
         hoist_weight_ag_sched_group=self._hoist_wag_sg(2),
         hoist_weight_ag_split=self._hoist_wag_split(2),
+        hoist_weight_ag_group=self._hoist_wag_group(),
         quant=self.quant,
         use_bias=self.use_bias,
         shard_mode=self.config.shard_mode,
@@ -759,6 +765,9 @@ class MlpBlock(nnx.Module):
         getattr(self, "_is_shared_expert", False)
     )
     return (pair_idx + 1) if on else 0
+
+  def _hoist_wag_group(self):
+    return int(getattr(self.config, "shared_expert_weight_ag_split_group", 0) or 0)
 
   def _wi_kernel_axes(self):
     return (None, "mlp") if self._replicate_embed() else ("embed", "mlp")

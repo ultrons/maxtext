@@ -1138,6 +1138,15 @@ class MoEGeneral(BaseModel):
           "to a full sort. Grouped routing measures 2.256 s/step (vreuse 8.997 vs vnogrp 6.741)."
       ),
   )
+  shared_expert_weight_ag_split_group: int = Field(
+      0,
+      description=(
+          "Subgroup size for the TWO-STAGE bounded-fan-out split all-gather (0/1 = single "
+          "stage). With fsdp=128 and group=16, stage 1 gathers within 16-rank subgroups and "
+          "stage 2 exchanges blocks across the 8 supergroups; per-kernel peer fan-out drops "
+          "from 127 to 15."
+      ),
+  )
   shared_expert_weight_ag_split: bool = Field(
       False,
       description=(
