@@ -2742,3 +2742,28 @@ The earlier axis-0 rel 2e-3 was consumer bf16 lowering divergence in the TEST (t
 paths lowered x^T@ones differently under default TPU matmul precision); at HIGHEST precision it
 collapses to 3e-7. Kernel + VJP are correct on hardware. Remaining before cluster: re-AOT exit +
 bwd lowering check (reduce_scatter vs AR+slice), then the sag0/sag1 A/B.
+
+## Split AG halts at n=128: semaphore WIDTH, not the pattern [2026-08-19]
+
+A/B attempt: `sag0` (stock) **6.880 s** mean(10-19), lm_loss 9.196 -- reproduces 6.864 within
+noise. `sag1` failed twice without a step: first `SLICE_FAILURE_SW_INJECT_ERROR` (origin
+unattributed), then the relaunch `sag1b` gave the real origin:
+
+```
+Node 0 halted ... Semaphore (scratch argument 253) has a nonzero value upon exit from a
+Mosaic kernel. Make sure every DMA is awaited.
+```
+
+Arg 253 = the last of 2*(n-1) = 254 per-step DMA semaphores at fsdp=128. The per-step-pair
+design overflows the sync-flag budget at width; invisible at the rig's 14 sems AND at compile
+time (the fsdp=128 AOT passed -- allocation succeeds, the failure is runtime). Program-level
+termination validation catches it as an unawaited residue.
+
+Fix (v3, commit d8bd2d984): ONE shared (send, recv) DMA semaphore pair for all n-1 sends --
+DMA semaphores are counters, each descriptor's wait decrements its own byte count, and the
+ladder's shared-pair rungs already passed. Scratch = 2 semaphores, constant in n. Buffers stay
+per-step: static destinations are the correctness requirement, semaphore count never was.
+
+Note for the record: sag0's lm_loss 9.196 vs rwag0's 9.312 (same config, different image) is
+0.116, marginally above the 0.093 same-path/different-image noise reference. Same-image A/B
+(sag0 vs sag1c) remains the only comparison we read.
