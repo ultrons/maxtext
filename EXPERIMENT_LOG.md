@@ -2794,3 +2794,15 @@ My earlier probes were not wrong so much as pre-canonical: they proved the semap
 cross the kernel boundary, then reconstructed instead of passing because the first passing
 attempt put the semaphore in the wrong memory space as a host input. The canonical form is
 what the reconstruct-based R1-R6 results converge to.
+
+## Same-image stock baseline BANKED; sag1e infra-failed twice, kernel exonerated [2026-08-19]
+
+`sag0e` (stock, image `splitag10`): **6.879 s** mean(10-19), lm_loss 9.290. Third independent
+stock reproduction (6.864 rwag0 / 6.880 sag0 / 6.879 sag0e) -- the baseline is rock solid and
+the A/B is now same-image in both directions.
+
+`sag1e` (split, v5): failed twice WITHOUT the kernel signature. All 128 workers scanned: zero
+`halted`/`Semaphore (scratch` hits; bare `SLICE_FAILURE_SW_INJECT` during an abnormally slow
+init, before first execution. Every genuine kernel failure (sag1b/c/d) printed its semaphore
+detail on worker 0. The same-night, same-image, same-cluster stock arm ran clean, so the slice
+failures are churn, not code. Kueue then suspended/requeued sag1e; watching for resume.
