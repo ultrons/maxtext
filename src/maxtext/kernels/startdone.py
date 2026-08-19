@@ -266,6 +266,8 @@ def _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot=0, group=
                              mesh_axes, slot=slot, n_steps=group - 1, peer_fn=p1)
     xa1, b1, ss1, rs1 = st1(xx)
     g1 = dn1(xa1, b1, ss1, rs1)
+    # off/gi are legal HERE (shard_map body, outside the pallas kernel).
+    off = jax.lax.rem(me, group)
     order1 = jax.lax.rem(off - jnp.arange(group) + group, group)
     block = _assemble(xa1, g1, order1, gather_axis, group)     # this subgroup's block
 
@@ -276,6 +278,7 @@ def _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot=0, group=
                              mesh_axes, slot=slot + 3, n_steps=s2 - 1, peer_fn=p2)
     xa2, b2, ss2, rs2 = st2(block)
     g2 = dn2(xa2, b2, ss2, rs2)
+    gi = me // group
     order2 = jax.lax.rem(gi - jnp.arange(s2) + s2, s2)
     return _assemble(xa2, g2, order2, gather_axis, s2)
 
