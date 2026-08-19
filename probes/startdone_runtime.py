@@ -292,7 +292,15 @@ def r7(mesh):
     x = jax.device_put(jnp.asarray(xh), jax.sharding.NamedSharding(mesh, P(ax, None)))
 
     def loss(f):
-      return lambda w, x: jnp.sum(x @ f(w))
+      # HIGHEST precision so the ct math (x^T @ ones) is f32-exact on TPU. With default
+      # (bf16) precision the two gradient paths can lower differently (reduce vs bf16 dot)
+      # and diverge at bf16 epsilon -- rel 2e-3 on axis 0 -- which is consumer lowering,
+      # not the VJP under test. CPU (always f32) passes at 1e-7 with the identical code.
+      def _l(w, x):
+        y = jax.lax.dot_general(x, f(w), (((1,), (0,)), ((), ())),
+                                precision=jax.lax.Precision.HIGHEST)
+        return jnp.sum(y)
+      return _l
 
     do = np.asarray(jax.jit(jax.grad(loss(ours)))(w, x))
     ds = np.asarray(jax.jit(jax.grad(loss(stock)))(w, x))
