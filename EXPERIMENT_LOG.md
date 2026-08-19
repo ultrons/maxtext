@@ -2767,3 +2767,30 @@ per-step: static destinations are the correctness requirement, semaphore count n
 Note for the record: sag0's lm_loss 9.196 vs rwag0's 9.312 (same config, different image) is
 0.116, marginally above the 0.093 same-path/different-image noise reference. Same-image A/B
 (sag0 vs sag1c) remains the only comparison we read.
+
+## Split AG v5 (canonical async pattern) passes ALL rig gates incl. the R9 repro [2026-08-19]
+
+The fix that ended the halt series came from the internal Pallas Async Ops pattern (user
+pointer; reference jax/tests/pallas/tpu_pallas_async_test.py): `start` RETURNS its DMA
+semaphores as pallas_call OUTPUTS (`SemaphoreType.DMA(())` out_shape, `SEMAPHORE` memory-space
+out_spec) and `done` takes them as INPUTS. XLA keeps the sync flags alive and threads them
+through the dataflow. `x` is aliased through `start` ({0:0}), keeping the source buffer alive
+under the in-flight sends -- a latent bug every earlier version had.
+
+This makes the two killer classes UNREPRESENTABLE rather than patched: no reconstruction
+against deterministic slots (R5 hang class), and each pair's semaphores are distinct XLA
+buffers so co-scheduled pairs cannot alias (the sag1d halt class, which resisted three slot-
+displacement attempts: REGULAR padding, DMA-pool padding, liveness pinning -- semaphore
+allocation is simply not positional-by-signature, and `pl.semaphore_signal` rejects DMA sems).
+
+| gate | v5 |
+|---|---|
+| R7 forward, both axes | bit-exact |
+| R7 gradient through consumer | bit-exact / rel 3e-7 |
+| R8 64 chained executions | pass, values match |
+| **R9 interleaved pairs (the banked repro)** | **PASS, both pairs correct** |
+
+My earlier probes were not wrong so much as pre-canonical: they proved the semaphore CAN
+cross the kernel boundary, then reconstructed instead of passing because the first passing
+attempt put the semaphore in the wrong memory space as a host input. The canonical form is
+what the reconstruct-based R1-R6 results converge to.
