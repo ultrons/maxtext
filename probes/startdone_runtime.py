@@ -352,7 +352,7 @@ def r8(mesh):
 
 
 def r9(mesh):
-  """INTERLEAVED pairs: two independent split gathers with both starts before both dones.
+  """INTERLEAVED pairs on DISTINCT slots: must pass where same-slot pairs halted (banked FAIL).
 
   The model runs THREE pairs per layer (wi_0, wi_1, wo); identical scratch signatures mean
   identical physical semaphore slots, and XLA schedules the starts together -- so pair B's
@@ -372,13 +372,16 @@ def r9(mesh):
   w1, w2 = jax.device_put(jnp.asarray(h1), sh), jax.device_put(jnp.asarray(h2), sh)
 
   def body(x1, x2):
-    start, done = _make_ag_pair(n, jax.ShapeDtypeStruct(x1.shape, x1.dtype), ax, tuple(mesh.axis_names))
-    b1 = start(x1)
+    sds = jax.ShapeDtypeStruct(x1.shape, x1.dtype)
+    axes = tuple(mesh.axis_names)
+    start1, done1_ = _make_ag_pair(n, sds, ax, axes, slot=0)
+    start2, done2_ = _make_ag_pair(n, sds, ax, axes, slot=1)
+    b1 = start1(x1)
     x2d = x2 + 0.0 * b1[0][:1]            # start2 after start1
-    b2 = start(x2d)
+    b2 = start2(x2d)
     x1d = x1 + 0.0 * b2[0][:1]            # done1 after start2
-    g1 = done(x1d, *b1)
-    g2 = done(x2d, *b2)
+    g1 = done1_(x1d, *b1)
+    g2 = done2_(x2d, *b2)
     return (jnp.stack([x1d] + list(g1)), jnp.stack([x2d] + list(g2)))
 
   f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(ax), P(ax)), out_specs=(P(ax, None), P(ax, None)), check_vma=False))

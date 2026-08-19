@@ -139,7 +139,7 @@ class DenseGeneral(nnx.Module):
       use_two_stage_all_gather: bool = False,
       debug_sharding: bool = False,
       hoist_weight_ag_sched_group: int = -1,
-      hoist_weight_ag_split: bool = False,
+      hoist_weight_ag_split: int = 0,
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
   ):
@@ -307,7 +307,7 @@ class DenseGeneral(nnx.Module):
     machinery NaN'd on cluster round 2 and lost 5.302 vs 5.106.
     """
     sg = self.hoist_weight_ag_sched_group
-    split = bool(self.hoist_weight_ag_split)
+    split = int(self.hoist_weight_ag_split or 0) > 0
     if ((sg is None or sg < 0) and not split) or self.mesh is None:
       return kernel
     if not any(self.mesh.shape.get(ax, 1) > 1 for ax in FSDP_MESH_AXES):
@@ -339,7 +339,8 @@ class DenseGeneral(nnx.Module):
       if len(ag_axes) == 1:
         from maxtext.kernels.startdone import split_all_gather
 
-        return split_all_gather(kernel, self.mesh, ag_axes[0], gather_axis, in_spec, out_spec)
+        return split_all_gather(kernel, self.mesh, ag_axes[0], gather_axis, in_spec, out_spec,
+                                slot=max(0, int(self.hoist_weight_ag_split) - 1))
       return kernel
 
     @jax.custom_vjp
@@ -639,7 +640,7 @@ class MlpBlock(nnx.Module):
           kernel_init=self.kernel_init,
           kernel_axes=("embed", "num_activations", "mlp"),
           hoist_weight_ag_sched_group=self._hoist_wag_sg(0),
-          hoist_weight_ag_split=self._hoist_wag_split(),
+          hoist_weight_ag_split=self._hoist_wag_split(0),
           quant=self.quant,
           use_bias=self.use_bias,
           shard_mode=self.config.shard_mode,
@@ -660,7 +661,7 @@ class MlpBlock(nnx.Module):
             kernel_init=self.kernel_init,
             kernel_axes=self._wi_kernel_axes(),
             hoist_weight_ag_sched_group=self._hoist_wag_sg(idx),
-            hoist_weight_ag_split=self._hoist_wag_split(),
+            hoist_weight_ag_split=self._hoist_wag_split(idx),
             quant=self.quant,
             use_bias=self.use_bias,
             shard_mode=self.config.shard_mode,
@@ -680,7 +681,7 @@ class MlpBlock(nnx.Module):
         kernel_init=self.kernel_init,
         kernel_axes=self._wo_kernel_axes(),
         hoist_weight_ag_sched_group=self._hoist_wag_sg(2),
-        hoist_weight_ag_split=self._hoist_wag_split(),
+        hoist_weight_ag_split=self._hoist_wag_split(2),
         quant=self.quant,
         use_bias=self.use_bias,
         shard_mode=self.config.shard_mode,
@@ -747,11 +748,17 @@ class MlpBlock(nnx.Module):
       return -1
     return base + offset
 
-  def _hoist_wag_split(self):
-    """Split-phase start/done weight AG -- shared expert opt-in, like the sched-group hoist."""
-    return bool(getattr(self.config, "shared_expert_weight_ag_split", False)) and bool(
+  def _hoist_wag_split(self, pair_idx=0):
+    """Split-phase start/done weight AG -- shared expert opt-in.
+
+    Returns 0 (off) or pair_idx+1; DenseGeneral passes slot = value-1 to the kernel so
+    wi_0/wi_1/wo land on DISTINCT physical semaphore slots (co-scheduled pairs sharing
+    slots alias their counters and halt -- reproduced in probe R9).
+    """
+    on = bool(getattr(self.config, "shared_expert_weight_ag_split", False)) and bool(
         getattr(self, "_is_shared_expert", False)
     )
+    return (pair_idx + 1) if on else 0
 
   def _wi_kernel_axes(self):
     return (None, "mlp") if self._replicate_embed() else ("embed", "mlp")

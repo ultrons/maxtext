@@ -129,9 +129,13 @@ split_copy.defvjp(_split_copy_fwd, _split_copy_bwd)
 # re-traces there intact, so the forward conversion covers it.
 # =============================================================================
 
-_AG_CP = pltpu.CompilerParams(
-    collective_id=7, allow_collective_id_without_custom_barrier=True, has_side_effects=True
-)
+def _ag_cp(slot):
+  # Distinct collective_id per pair: the entry barrier is keyed by it, and co-scheduled
+  # pairs sharing one barrier counter alias exactly like the DMA semaphores did.
+  return pltpu.CompilerParams(
+      collective_id=7 + slot, allow_collective_id_without_custom_barrier=True,
+      has_side_effects=True,
+  )
 
 
 def _peer_id(axis_name, mesh_axes, d):
@@ -142,8 +146,16 @@ def _peer_id(axis_name, mesh_axes, d):
   return {a: (d if a == axis_name else jax.lax.axis_index(a)) for a in mesh_axes}
 
 
-def _make_ag_pair(n, shard_sds, axis_name, mesh_axes):
-  """Build the start/done pallas_call pair for an n-way static-destination all-gather."""
+def _make_ag_pair(n, shard_sds, axis_name, mesh_axes, slot=0):
+  """Build the start/done pallas_call pair for an n-way static-destination all-gather.
+
+  `slot` separates CO-SCHEDULED pairs. Scratch semaphores are allocated at the same
+  physical sync-flag slots for every kernel with the same signature, and DMA semaphores
+  are anonymous counters -- so when XLA interleaves two pairs' starts before their dones
+  (the model runs three pairs per layer), pair B's completions satisfy pair A's waits.
+  REPRODUCED at n=8 (probe R9, same halt signature as sag1d). `slot` leading dummy
+  REGULAR semaphores displace this pair's DMA semaphores to distinct physical flags.
+  """
   # ONE shared (send, recv) DMA semaphore pair for ALL n-1 sends -- constant in n.
   # Per-step PAIRS halted at n=128: 2*(n-1) = 254 scratch semaphores overflows the
   # sync-flag budget ("Semaphore (scratch argument 253) has a nonzero value upon exit",
@@ -162,10 +174,11 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes):
   # complete its i-th exit wait until every device has signaled its i-th, because each
   # device's cumulative signals are bounded by its own completed dones. Hard serialization
   # of executions; skew across epochs becomes impossible rather than unlikely.
-  scratch = [pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.REGULAR]
+  scratch = [pltpu.SemaphoreType.REGULAR] * slot + [
+      pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.REGULAR]
 
   def descriptors(x_ref, bufs, sems):
-    ss, rs = sems[0], sems[1]
+    ss, rs = sems[slot], sems[slot + 1]
     me = jax.lax.axis_index(axis_name)
     for i, k in enumerate(range(1, n)):
       peer = jax.lax.rem(me + k, n)
@@ -191,7 +204,7 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes):
     for dma in descriptors(x_ref, ins, sems):
       dma.wait()   # sequential waits on the shared pair; each decrements its own bytes
     # Epoch fence (see scratch comment): no device leaves done_i before all finished done_i.
-    exit_sem = sems[2]
+    exit_sem = sems[slot + 2]
     me = jax.lax.axis_index(axis_name)
     for k in range(n):
       pl.semaphore_signal(
@@ -200,21 +213,22 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes):
     pl.semaphore_wait(exit_sem, n)
 
   shapes = [shard_sds] * (n - 1)
+  cp = _ag_cp(slot)
   start = pl.pallas_call(start_body, in_specs=[_HBM], out_specs=[_HBM] * (n - 1),
-                         out_shape=shapes, scratch_shapes=scratch, compiler_params=_AG_CP)
+                         out_shape=shapes, scratch_shapes=scratch, compiler_params=cp)
   done = pl.pallas_call(done_body, in_specs=[_HBM] * n, out_specs=[_HBM] * (n - 1),
-                        out_shape=shapes, scratch_shapes=scratch, compiler_params=_AG_CP,
+                        out_shape=shapes, scratch_shapes=scratch, compiler_params=cp,
                         input_output_aliases={i + 1: i for i in range(n - 1)})
   return start, done
 
 
-def _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec):
+def _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot=0):
   n = mesh.shape[axis_name]
   mesh_axes = tuple(mesh.axis_names)
 
   def body(xx):
     start, done = _make_ag_pair(n, jax.ShapeDtypeStruct(xx.shape, xx.dtype),
-                                axis_name, mesh_axes)
+                                axis_name, mesh_axes, slot=slot)
     bufs = start(xx)
     got = done(xx, *bufs)                # <-- the layer's compute belongs in this gap
     # Position k holds shard (me-k) mod n; own shard at position 0. Permute to shard
@@ -232,17 +246,17 @@ def _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec):
                        check_vma=False)(w)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4, 5))
-def split_all_gather(w, mesh, axis_name, gather_axis, in_spec, out_spec):
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4, 5, 6))
+def split_all_gather(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot=0):
   """FSDP weight all-gather whose placement we own. Backward is XLA's reduce-scatter."""
-  return _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec)
+  return _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot)
 
 
-def _sag_fwd(w, mesh, axis_name, gather_axis, in_spec, out_spec):
-  return _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec), None
+def _sag_fwd(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot=0):
+  return _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot), None
 
 
-def _sag_bwd(mesh, axis_name, gather_axis, in_spec, out_spec, _res, ct):
+def _sag_bwd(mesh, axis_name, gather_axis, in_spec, out_spec, slot, _res, ct):
   # The gather is LOGICALLY the identity (tiled all-gather of a tiled-sharded array), so the
   # logical cotangent IS the weight grad; a sharding constraint reshards it and lets GSPMD
   # fuse the pending partial-sum + slice into one reduce-scatter.
