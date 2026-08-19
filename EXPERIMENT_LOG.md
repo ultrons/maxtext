@@ -2820,3 +2820,25 @@ revert to infra churn (the same night's stock arm also lost a worker; no kernel 
 any of 128 workers across three attempts). v6 ships on its merits, not as a fix for those.
 
 sag1f launched: image `splitag12`, single flag vs the banked same-image stock 6.879.
+
+## sag1f: 4th bare slice failure -- CLUSTER NODE FAILURES CONFIRMED EXTERNALLY; holding [2026-08-19]
+
+sag1f (v6, splitag12) died with the identical profile: param-init memory report 06:48, bare
+SLICE_FAILURE 06:50, no kernel signature, 12 NotReady pods. v6's 60x-smaller kernel operands
+changed nothing, which itself argued the failure was never graph-size.
+
+Decisive external evidence: cluster events show ANOTHER tenant's jobsets (zxhe-ubench) evicted
+for "no replacement for unhealthy node" and "multiple TAS assigned node failures" at 60m/39m/8m
+ago -- the 8m one lands exactly at sag1f's death. The cluster has actively failing nodes tonight,
+tenant-independent.
+
+The split-arm correlation has a mundane mechanism: Kueue TAS assigns a new workload the FREED
+nodes, i.e. exactly the set its predecessor churned on. sag0e ran clean on different nodes while
+sag1e still held the bad ones; each split relaunch re-inherited the sick set. No
+ephemeral-storage evictions on our pods (Mosaic-scratch theory unsupported).
+
+DECISION: hold all launches until the node pool recovers. The kernel enters the hold with every
+below-cluster gate green (R7/R8/R9, AOT exit=0, 19.16 GiB compile RSS) and the same-image stock
+baseline banked at 6.879. Retry sag1f unchanged when the cluster is healthy, ideally after a
+capacity check (kubectl get nodes / recent eviction events) and NOT immediately after deleting a
+failed sibling, to dodge the freed-node trap.
