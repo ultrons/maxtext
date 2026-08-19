@@ -368,25 +368,26 @@ def r9(mesh):
   rng = np.random.default_rng(2)
   h1 = rng.standard_normal((K, C)).astype(np.float32)
   h2 = rng.standard_normal((K, C)).astype(np.float32)
-  sh = jax.sharding.NamedSharding(mesh, P(ax, None))
-  w1, w2 = jax.device_put(jnp.asarray(h1), sh), jax.device_put(jnp.asarray(h2), sh)
 
   def body(x1, x2):
+    # 2-D shards, the model's case: buf.at[i] on a 1-D-shard buffer squeezes the sublane
+    # dim and Mosaic rejects it ("All tiled squeezed dimensions must be of size 1").
     sds = jax.ShapeDtypeStruct(x1.shape, x1.dtype)
     axes = tuple(mesh.axis_names)
     start1, done1_ = _make_ag_pair(n, sds, ax, axes, slot=0)
     start2, done2_ = _make_ag_pair(n, sds, ax, axes, slot=1)
     xa1, buf1, ss1, rs1 = start1(x1)
-    x2d = x2 + 0.0 * buf1[0, :1]          # start2 after start1
+    x2d = x2 + 0.0 * buf1[0, :1, :1]      # start2 after start1
     xa2, buf2, ss2, rs2 = start2(x2d)
-    xa1 = xa1 + 0.0 * buf2[0, :1]         # done1 after start2
+    xa1 = xa1 + 0.0 * buf2[0, :1, :1]     # done1 after start2
     g1 = done1_(xa1, buf1, ss1, rs1)
     g2 = done2_(xa2, buf2, ss2, rs2)
     x1d = xa1
     return (jnp.concatenate([x1d[None], g1]), jnp.concatenate([x2d[None], g2]))
 
-  f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(ax), P(ax)), out_specs=(P(ax, None), P(ax, None)), check_vma=False))
-  o1, o2 = f(jnp.asarray(h1.reshape(-1)), jnp.asarray(h2.reshape(-1)))
+  f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(ax, None), P(ax, None)),
+                            out_specs=(P(ax, None, None), P(ax, None, None)), check_vma=False))
+  o1, o2 = f(jnp.asarray(h1), jnp.asarray(h2))
   o1, o2 = np.asarray(o1).reshape(n, n, -1), np.asarray(o2).reshape(n, n, -1)
   hh1, hh2 = h1.reshape(n, -1), h2.reshape(n, -1)
   # position k on device j holds shard (j-k) mod n
