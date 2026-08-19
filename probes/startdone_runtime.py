@@ -500,6 +500,84 @@ def r11(_unused):
        abs(co - cs) <= 1e-4 * max(1.0, abs(cs)), f"ours={co:.4f} stock={cs:.4f}")
 
 
+def r12(_unused):
+  """WIDTH on 8 devices: 127 outstanding DMAs armed by one core before any wait.
+
+  Queue depth is a property of the SENDING core, not the peer count. The model at
+  fsdp=128 arms 127 remote copies per start; the rig never exceeded 7. Round-robin 127
+  sends over the 7 available peers into 127 distinct static slots, waits only in done.
+  A descriptor-ring limit reproduces the sag1g halt here; a pass kills the last
+  width-scaling suspect below the real cluster.
+  """
+  nd = jax.device_count()
+  mesh1 = jax.sharding.Mesh(np.array(jax.devices()).reshape(nd), ("fsdp",))
+  NSEND = 127
+  SH = (8, 256)                       # small per-send payload, bf16-tile aligned
+  sem = pltpu.SemaphoreType.DMA(())
+  SEM = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+  cp = pltpu.CompilerParams(collective_id=7, allow_collective_id_without_custom_barrier=True,
+                            has_side_effects=True)
+
+  def descriptors(x_ref, buf, ss, rs):
+    me = jax.lax.axis_index("fsdp")
+    for i in range(NSEND):
+      peer = jax.lax.rem(me + 1 + (i % (nd - 1)), nd)
+      yield pltpu.make_async_remote_copy(x_ref, buf.at[i], ss, rs, device_id={"fsdp": peer})
+
+  def start_body(x_ref, x_alias, buf, ss, rs):
+    bar = pltpu.get_barrier_semaphore()
+    me = jax.lax.axis_index("fsdp")
+    for k in range(nd):
+      pl.semaphore_signal(bar, device_id={"fsdp": jax.lax.rem(me + k, nd)})
+    pl.semaphore_wait(bar, nd)
+    for dma in descriptors(x_ref, buf, ss, rs):
+      dma.start()                      # 127 in flight, no wait here
+
+  def done_body(x_ref, buf, ss, rs, _o, exit_sem):
+    for _ in range(NSEND):
+      pltpu.make_async_copy(x_ref, x_ref, ss).wait()
+    for i in range(NSEND):
+      pltpu.make_async_copy(buf.at[i], buf.at[i], rs).wait()
+    me = jax.lax.axis_index("fsdp")
+    for k in range(nd):
+      pl.semaphore_signal(exit_sem, device_id={"fsdp": jax.lax.rem(me + k, nd)})
+    pl.semaphore_wait(exit_sem, nd)
+
+  xs = jax.ShapeDtypeStruct(SH, jnp.float32)
+  bufs = jax.ShapeDtypeStruct((NSEND,) + SH, jnp.float32)
+  start = pl.pallas_call(start_body, in_specs=[HBM], out_shape=(xs, bufs, sem, sem),
+                         out_specs=(HBM, HBM, SEM, SEM), input_output_aliases={0: 0},
+                         compiler_params=cp)
+  done = pl.pallas_call(done_body, in_specs=[HBM, HBM, SEM, SEM], out_specs=HBM,
+                        out_shape=bufs, input_output_aliases={1: 0},
+                        scratch_shapes=[pltpu.SemaphoreType.REGULAR], compiler_params=cp)
+
+  def body(xx):
+    xa, buf, ss, rs = start(xx)
+    got = done(xa, buf, ss, rs)
+    return jnp.concatenate([xa[None], got], axis=0)
+
+  host = np.arange(nd * SH[0] * SH[1]).reshape((nd * SH[0], SH[1])).astype(np.float32)
+  w = jax.device_put(jnp.asarray(host), jax.sharding.NamedSharding(mesh1, P("fsdp", None)))
+  f = jax.jit(jax.shard_map(body, mesh=mesh1, in_specs=(P("fsdp", None),),
+                            out_specs=P("fsdp", None, None), check_vma=False))
+  print("    r12: executing 127-deep fan-out ...", flush=True)
+  got = np.asarray(f(w)).reshape(nd, NSEND + 1, SH[0], SH[1])
+  shards = host.reshape(nd, SH[0], SH[1])
+  # device j receives send i from peer p = (j - 1 - (i % (nd-1))) mod nd into slot i+1... verify
+  # by checking each landed slot equals SOME sender's shard and slot0 is own.
+  ok_own = all(np.array_equal(got[j, 0], shards[j]) for j in range(nd))
+  ok_slots = True
+  for j in range(nd):
+    for i in range(NSEND):
+      p = (j - 1 - (i % (nd - 1))) % nd
+      if not np.array_equal(got[j, i + 1], shards[p]):
+        ok_slots = False
+        break
+  gate("R12 127 outstanding DMAs from one core deliver correctly", ok_own and ok_slots,
+       "all 127 slots correct" if (ok_own and ok_slots) else f"own={ok_own} slots={ok_slots}")
+
+
 if __name__ == "__main__":
   print(f"jax {jax.__version__}  devices={jax.device_count()}", flush=True)
   dev = jax.devices()[0]
@@ -508,7 +586,7 @@ if __name__ == "__main__":
 
   import os
   sel = os.environ.get("GATES", "")
-  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r7": (r7, (mesh,)), "r8": (r8, (mesh,)), "r9": (r9, (mesh,)), "r10": (r10, (mesh,)), "r11": (r11, (mesh,)), "r4": (r4, (dev,))}
+  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r7": (r7, (mesh,)), "r8": (r8, (mesh,)), "r9": (r9, (mesh,)), "r10": (r10, (mesh,)), "r11": (r11, (mesh,)), "r12": (r12, (mesh,)), "r4": (r4, (dev,))}
   chosen = [allg[k] for k in (sel.split(",") if sel else allg) if k in allg]
   for fn, args in chosen:
     try:
