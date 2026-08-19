@@ -430,36 +430,6 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes, slot=0, n_steps=None, peer
   return start, done
 
 
-def _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot=0):
-  if w.ndim < 2:
-    # buf.at[i] on a (n-1,)+(S,) landing buffer squeezes to 1-D, which Mosaic rejects
-    # ("All tiled squeezed dimensions must be of size 1"). Every model weight is >=2-D.
-    raise ValueError(f"split_all_gather requires a >=2-D shard, got shape {w.shape}")
-  n = mesh.shape[axis_name]
-  mesh_axes = tuple(mesh.axis_names)
-
-  def body(xx):
-    start, done = _make_ag_pair(n, jax.ShapeDtypeStruct(xx.shape, xx.dtype),
-                                axis_name, mesh_axes, slot=slot)
-    x_alias, buf, ss, rs = start(xx)
-    got = done(x_alias, buf, ss, rs)     # <-- the layer's compute belongs in this gap; (n-1,)+shard
-    xx = x_alias
-    # Position k holds shard (me-k) mod n; own shard at position 0. Permute to shard
-    # order 0..n-1, then lay out exactly as lax.all_gather(tiled=True, axis=gather_axis).
-    stacked = jnp.concatenate([xx[None], got], axis=0)     # (n,) + shard
-    me = jax.lax.axis_index(axis_name)
-    order = jax.lax.rem(me - jnp.arange(n) + n, n)         # position of shard s
-    permuted = jnp.take(stacked, order, axis=0)
-    shard = xx.shape
-    return jnp.moveaxis(permuted, 0, gather_axis).reshape(
-        shard[:gather_axis] + (n * shard[gather_axis],) + shard[gather_axis + 1:]
-    )
-
-  return jax.shard_map(body, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec,
-                       check_vma=False)(w)
-
-
-@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4, 5, 6, 7))
 def split_all_gather(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot=0, group=0):
   """FSDP weight all-gather whose placement we own. Backward is XLA's reduce-scatter.
 
