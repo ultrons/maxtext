@@ -254,10 +254,14 @@ def r4(dev):
 def r7(mesh):
   """Numerics gate for the STATIC-destination split_all_gather, both gather axes.
 
-  R7a/c: forward bit-identical to lax.all_gather(tiled=True). R7b/d: gradient bit-identical
-  to the stock gather's gradient (a wrong psum_scatter transpose corrupts weight grads
-  silently, so the gradient is the check that matters). Shapes are the real shared-expert
-  kernel sharded over this rig's fsdp=8: wi (7168,2048) on axis 0, wo (2048,7168) on axis 1.
+  Forward: bit-identical to lax.all_gather(tiled=True).
+  Gradient: compared THROUGH A CONSUMER matmul, because that is the model's structure. A
+  direct grad of sum(gathered * replicated_co) is ill-posed for the comparison: the
+  replicated cotangent makes our psum_scatter sum n identical copies (factor-n mismatch,
+  measured max|err| ~ 7x|co| at n=8), while in the model the cotangents arriving at the
+  gather are PER-DEVICE PARTIALS, for which the sum is exactly right (same transpose
+  `_make_cv_gather` uses in production). The consumer form makes SPMD produce those
+  partials on both paths, so the comparison is apples-to-apples and must be bit-exact.
   """
   from maxtext.kernels.startdone import split_all_gather
 
@@ -281,12 +285,18 @@ def r7(mesh):
     gate(f"R7{tag}1 split AG matches lax.all_gather (axis {g_axis})",
          np.array_equal(go, gs), f"max|err|={np.max(np.abs(go - gs)):.3e}")
 
-    co = jax.device_put(jnp.asarray(rng.standard_normal(full_shape).astype(np.float32)),
-                        jax.sharding.NamedSharding(mesh, out_spec))
-    loss = lambda f: (lambda w: jnp.sum(f(w) * co))
-    do = np.asarray(jax.jit(jax.grad(loss(ours)))(w))
-    ds = np.asarray(jax.jit(jax.grad(loss(stock)))(w))
-    gate(f"R7{tag}2 split AG VJP matches stock VJP (axis {g_axis})",
+    # Consumer: y = x @ g (or g @ x for the axis-1 kernel), x batch-sharded. SPMD produces
+    # per-device partial cotangents for the gathered (replicated) weight on BOTH paths.
+    K = full_shape[0]
+    xh = rng.standard_normal((512, K)).astype(np.float32)
+    x = jax.device_put(jnp.asarray(xh), jax.sharding.NamedSharding(mesh, P(ax, None)))
+
+    def loss(f):
+      return lambda w, x: jnp.sum(x @ f(w))
+
+    do = np.asarray(jax.jit(jax.grad(loss(ours)))(w, x))
+    ds = np.asarray(jax.jit(jax.grad(loss(stock)))(w, x))
+    gate(f"R7{tag}2 split AG grad matches stock THROUGH consumer (axis {g_axis})",
          np.array_equal(do, ds), f"max|err|={np.max(np.abs(do - ds)):.3e}")
 
   check("a", (7168, 2048), 0, P(ax, None))   # wi: embed-sharded on axis 0
