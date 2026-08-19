@@ -152,10 +152,20 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes):
   # descriptor's wait decrements its own byte count (the ladder's shared-pair rungs
   # passed). Buffers stay per-step -- STATIC destinations are what correctness requires.
   # IDENTICAL in both halves (R5/R6).
-  scratch = [pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA]
+  # [send, recv, exit]. The REGULAR `exit` semaphore is the EPOCH FENCE: the pair runs
+  # 116x/step under scan+remat, every instance reuses the same physical sync-flag slots,
+  # and DMA semaphores are anonymous counters -- so without a fence a fast device can pass
+  # the entry barrier for execution i+1 on a laggard's execution-i signals and arm sends
+  # into a peer still waiting in done_i, which consumes the wrong epoch's bytes and leaves
+  # the residue the halt reported ("Semaphore (scratch argument 0) has a nonzero value",
+  # sag1c). done therefore ends with signal-all + wait-n on `exit`: a device cannot
+  # complete its i-th exit wait until every device has signaled its i-th, because each
+  # device's cumulative signals are bounded by its own completed dones. Hard serialization
+  # of executions; skew across epochs becomes impossible rather than unlikely.
+  scratch = [pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.REGULAR]
 
   def descriptors(x_ref, bufs, sems):
-    ss, rs = sems
+    ss, rs = sems[0], sems[1]
     me = jax.lax.axis_index(axis_name)
     for i, k in enumerate(range(1, n)):
       peer = jax.lax.rem(me + k, n)
@@ -180,6 +190,14 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes):
     sems = list(rest[2 * (n - 1):])
     for dma in descriptors(x_ref, ins, sems):
       dma.wait()   # sequential waits on the shared pair; each decrements its own bytes
+    # Epoch fence (see scratch comment): no device leaves done_i before all finished done_i.
+    exit_sem = sems[2]
+    me = jax.lax.axis_index(axis_name)
+    for k in range(n):
+      pl.semaphore_signal(
+          exit_sem, device_id=_peer_id(axis_name, mesh_axes, jax.lax.rem(me + k, n))
+      )
+    pl.semaphore_wait(exit_sem, n)
 
   shapes = [shard_sds] * (n - 1)
   start = pl.pallas_call(start_body, in_specs=[_HBM], out_specs=[_HBM] * (n - 1),
