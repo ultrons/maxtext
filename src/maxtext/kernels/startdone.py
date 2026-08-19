@@ -168,42 +168,44 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes, slot=0):
   sem = pltpu.SemaphoreType.DMA(())
   SEM = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
 
-  def descriptors(x_ref, bufs, ss, rs):
+  def descriptors(x_ref, buf, ss, rs):
+    # ONE stacked (n-1,)+shard landing buffer; buf.at[i] with a PYTHON-int i is a STATIC
+    # destination (the refuted addressing was DYNAMIC me-indexing). This collapses the
+    # kernel from ~n operands/outputs to 4, i.e. the HLO shrinks ~100x -- separate
+    # per-step buffers made every pallas_call a ~256-operand node at fsdp=128, 6x/layer,
+    # a plausible host-side compile blowup on the workers.
     me = jax.lax.axis_index(axis_name)
     for i, k in enumerate(range(1, n)):
       peer = jax.lax.rem(me + k, n)
       yield pltpu.make_async_remote_copy(
-          x_ref, bufs[i], ss, rs, device_id=_peer_id(axis_name, mesh_axes, peer)
+          x_ref, buf.at[i], ss, rs, device_id=_peer_id(axis_name, mesh_axes, peer)
       )
 
-  def start_body(x_ref, x_alias, *rest):
-    bufs, (ss, rs) = list(rest[: n - 1]), rest[n - 1:]
+  def start_body(x_ref, x_alias, buf, ss, rs):
     bar = pltpu.get_barrier_semaphore()
     me = jax.lax.axis_index(axis_name)
     for k in range(n):
       pl.semaphore_signal(bar, device_id=_peer_id(axis_name, mesh_axes, jax.lax.rem(me + k, n)))
     pl.semaphore_wait(bar, n)
-    for dma in descriptors(x_ref, bufs, ss, rs):
+    for dma in descriptors(x_ref, buf, ss, rs):
       dma.start()
 
+  buf_sds = jax.ShapeDtypeStruct((n - 1,) + shard_sds.shape, shard_sds.dtype)
   start = pl.pallas_call(
       start_body,
       in_specs=[_HBM],
-      out_shape=(shard_sds,) + (shard_sds,) * (n - 1) + (sem, sem),
-      out_specs=((_HBM,) * n) + (SEM, SEM),
+      out_shape=(shard_sds, buf_sds, sem, sem),
+      out_specs=(_HBM, _HBM, SEM, SEM),
       input_output_aliases={0: 0},
       compiler_params=cp,
   )
 
-  def done_body(x_ref, *rest):
-    bufs = list(rest[: n - 1])
-    ss, rs = rest[n - 1], rest[n]
-    exit_sem = rest[-1]                                   # scratch, appended last
-    # outputs rest[n+1:-1] are aliased to bufs; nothing is loaded here.
+  def done_body(x_ref, buf, ss, rs, _o, exit_sem):
+    # _o is aliased to buf; nothing is loaded here.
     for _ in range(n - 1):
       pltpu.make_async_copy(x_ref, x_ref, ss).wait()      # one send completion each
-    for b in bufs:
-      pltpu.make_async_copy(b, b, rs).wait()              # one arrival each
+    for i in range(n - 1):
+      pltpu.make_async_copy(buf.at[i], buf.at[i], rs).wait()   # one arrival each
     # Epoch fence: scan reuses buffers, hence sync-flag addresses, across executions.
     me = jax.lax.axis_index(axis_name)
     for k in range(n):
@@ -212,10 +214,10 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes, slot=0):
 
   done = pl.pallas_call(
       done_body,
-      in_specs=[_HBM] * n + [SEM, SEM],
-      out_specs=(_HBM,) * (n - 1),
-      out_shape=(shard_sds,) * (n - 1),
-      input_output_aliases={i + 1: i for i in range(n - 1)},
+      in_specs=[_HBM, _HBM, SEM, SEM],
+      out_specs=_HBM,
+      out_shape=buf_sds,
+      input_output_aliases={1: 0},
       scratch_shapes=[pltpu.SemaphoreType.REGULAR],
       compiler_params=cp,
   )
@@ -229,13 +231,12 @@ def _sag_impl(w, mesh, axis_name, gather_axis, in_spec, out_spec, slot=0):
   def body(xx):
     start, done = _make_ag_pair(n, jax.ShapeDtypeStruct(xx.shape, xx.dtype),
                                 axis_name, mesh_axes, slot=slot)
-    outs = start(xx)
-    x_alias, bufs, (ss, rs) = outs[0], list(outs[1:n]), outs[n:]
-    got = done(x_alias, *bufs, ss, rs)   # <-- the layer's compute belongs in this gap
+    x_alias, buf, ss, rs = start(xx)
+    got = done(x_alias, buf, ss, rs)     # <-- the layer's compute belongs in this gap; (n-1,)+shard
     xx = x_alias
     # Position k holds shard (me-k) mod n; own shard at position 0. Permute to shard
     # order 0..n-1, then lay out exactly as lax.all_gather(tiled=True, axis=gather_axis).
-    stacked = jnp.stack([xx] + list(got), axis=0)          # (n,) + shard
+    stacked = jnp.concatenate([xx[None], got], axis=0)     # (n,) + shard
     me = jax.lax.axis_index(axis_name)
     order = jax.lax.rem(me - jnp.arange(n) + n, n)         # position of shard s
     permuted = jnp.take(stacked, order, axis=0)
