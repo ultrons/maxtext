@@ -397,6 +397,41 @@ def r9(mesh):
        "both pairs correct" if (ok1 and ok2) else f"corrupt (pair1={ok1} pair2={ok2})")
 
 
+def r10(_unused):
+  """MULTI-AXIS mesh: gather over fsdp with a held ep axis -- the cluster's shape.
+
+  sag1g halted inside shard_map/while at 512 chips with an HLO-located assertion.
+  Every prior rig gate ran a 1-AXIS fsdp mesh; the model's mesh is multi-axis, so the
+  dict device_id (peer rank on the gather axis, OTHER AXES HELD via lax.axis_index)
+  and the barrier fan-out had never executed on hardware with a held axis. 16 devices
+  as (ep=2, fsdp=8): two independent gather groups that must not cross-talk.
+  """
+  from maxtext.kernels.startdone import split_all_gather
+
+  nd = jax.device_count()
+  ep = 2
+  fs = nd // ep
+  mesh2 = jax.sharding.Mesh(np.array(jax.devices()).reshape(ep, fs), ("ep", "fsdp"))
+  K, C = 1024, 256
+  rng = np.random.default_rng(3)
+  host = rng.standard_normal((ep, K, C)).astype(np.float32)   # different data per ep rank
+  in_spec, out_spec = P("ep", "fsdp", None), P("ep", None, None)
+  w = jax.device_put(jnp.asarray(host),
+                     jax.sharding.NamedSharding(mesh2, in_spec))
+
+  def body(xx):
+    # xx: (1, K/fs, C) per device; gather over fsdp on axis 1 of the squeezed shard
+    g = split_all_gather(xx[0], mesh2, "fsdp", 0, P("fsdp", None), P(None, None))
+    return g[None]
+
+  f = jax.jit(jax.shard_map(body, mesh=mesh2, in_specs=(in_spec,), out_specs=out_spec,
+                            check_vma=False))
+  got = np.asarray(f(w))
+  ok = all(np.array_equal(got[e], host[e]) for e in range(ep))
+  gate("R10 multi-axis mesh (ep x fsdp) gathers correctly per group", ok,
+       "no cross-group leakage" if ok else "WRONG (cross-group or misplaced)")
+
+
 if __name__ == "__main__":
   print(f"jax {jax.__version__}  devices={jax.device_count()}", flush=True)
   dev = jax.devices()[0]
@@ -405,7 +440,7 @@ if __name__ == "__main__":
 
   import os
   sel = os.environ.get("GATES", "")
-  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r7": (r7, (mesh,)), "r8": (r8, (mesh,)), "r9": (r9, (mesh,)), "r4": (r4, (dev,))}
+  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r7": (r7, (mesh,)), "r8": (r8, (mesh,)), "r9": (r9, (mesh,)), "r10": (r10, (mesh,)), "r4": (r4, (dev,))}
   chosen = [allg[k] for k in (sel.split(",") if sel else allg) if k in allg]
   for fn, args in chosen:
     try:
