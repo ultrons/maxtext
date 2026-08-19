@@ -174,11 +174,18 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes, slot=0):
   # complete its i-th exit wait until every device has signaled its i-th, because each
   # device's cumulative signals are bounded by its own completed dones. Hard serialization
   # of executions; skew across epochs becomes impossible rather than unlikely.
-  scratch = [pltpu.SemaphoreType.REGULAR] * slot + [
-      pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.REGULAR]
+  # Pad WITHIN EACH POOL: Mosaic allocates DMA and REGULAR semaphores separately, so
+  # REGULAR-only padding left the DMA slots shared (R9 still halted with it). Layout:
+  # [2*slot dummy DMA] [ss] [rs] [slot dummy REGULAR] [exit].
+  scratch = (
+      [pltpu.SemaphoreType.DMA] * (2 * slot)
+      + [pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA]
+      + [pltpu.SemaphoreType.REGULAR] * slot
+      + [pltpu.SemaphoreType.REGULAR]
+  )
 
   def descriptors(x_ref, bufs, sems):
-    ss, rs = sems[slot], sems[slot + 1]
+    ss, rs = sems[2 * slot], sems[2 * slot + 1]
     me = jax.lax.axis_index(axis_name)
     for i, k in enumerate(range(1, n)):
       peer = jax.lax.rem(me + k, n)
@@ -204,7 +211,7 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes, slot=0):
     for dma in descriptors(x_ref, ins, sems):
       dma.wait()   # sequential waits on the shared pair; each decrements its own bytes
     # Epoch fence (see scratch comment): no device leaves done_i before all finished done_i.
-    exit_sem = sems[slot + 2]
+    exit_sem = sems[2 * slot + 2 + slot]
     me = jax.lax.axis_index(axis_name)
     for k in range(n):
       pl.semaphore_signal(
