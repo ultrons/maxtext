@@ -578,6 +578,57 @@ def r12(_unused):
        "all 127 slots correct" if (ok_own and ok_slots) else f"own={ok_own} slots={ok_slots}")
 
 
+def r13(mesh):
+  """TWO-STAGE bounded-fan-out gather: group=4 on 8 devices (fan-out 3 then 1).
+
+  Bit-exact forward vs lax.all_gather on both axes at real-ish shapes, plus the gradient
+  through a consumer. Same acceptance as R7.
+  """
+  from maxtext.kernels.startdone import split_all_gather
+
+  ax = "fsdp"
+  rng = np.random.default_rng(5)
+
+  def check(tag, full_shape, g_axis, in_spec):
+    out_spec = P(None, None)
+
+    def ours(w):
+      return split_all_gather(w, mesh, ax, g_axis, in_spec, out_spec, 0, 4)
+
+    def stock(w):
+      return jax.shard_map(
+          lambda x: jax.lax.all_gather(x, ax, axis=g_axis, tiled=True),
+          mesh=mesh, in_specs=(in_spec,), out_specs=out_spec, check_vma=False)(w)
+
+    host = rng.standard_normal(full_shape).astype(np.float32)
+    w = jax.device_put(jnp.asarray(host), jax.sharding.NamedSharding(mesh, in_spec))
+    go, gs = np.asarray(jax.jit(ours)(w)), np.asarray(jax.jit(stock)(w))
+    gate(f"R13{tag}1 two-stage AG matches lax.all_gather (axis {g_axis})",
+         np.array_equal(go, gs), f"max|err|={np.max(np.abs(go - gs)):.3e}")
+
+    K = full_shape[0]
+    xh = rng.standard_normal((512, K)).astype(np.float32)
+    x = jax.device_put(jnp.asarray(xh), jax.sharding.NamedSharding(mesh, P(ax, None)))
+
+    def loss(f):
+      def _l(w, x):
+        y = jax.lax.dot_general(x, f(w), (((1,), (0,)), ((), ())),
+                                precision=jax.lax.Precision.HIGHEST)
+        return jnp.sum(y)
+      return _l
+
+    do = np.asarray(jax.jit(jax.grad(loss(ours)))(w, x))
+    ds = np.asarray(jax.jit(jax.grad(loss(stock)))(w, x))
+    scale = np.max(np.abs(ds)) + 1e-30
+    rel = np.max(np.abs(do - ds)) / scale
+    gate(f"R13{tag}2 two-stage AG grad matches (axis {g_axis})",
+         np.array_equal(do, ds) or rel < 1e-5,
+         f"max|err|={np.max(np.abs(do - ds)):.3e} rel={rel:.2e}")
+
+  check("a", (7168, 2048), 0, P(ax, None))
+  check("b", (2048, 7168), 1, P(None, ax))
+
+
 if __name__ == "__main__":
   print(f"jax {jax.__version__}  devices={jax.device_count()}", flush=True)
   dev = jax.devices()[0]
@@ -586,7 +637,7 @@ if __name__ == "__main__":
 
   import os
   sel = os.environ.get("GATES", "")
-  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r7": (r7, (mesh,)), "r8": (r8, (mesh,)), "r9": (r9, (mesh,)), "r10": (r10, (mesh,)), "r11": (r11, (mesh,)), "r12": (r12, (mesh,)), "r4": (r4, (dev,))}
+  allg = {"r1_r2": (r1_r2, (dev,)), "r3": (r3, (mesh,)), "r5": (r5, (dev,)), "r6": (r6, (dev,)), "r7": (r7, (mesh,)), "r8": (r8, (mesh,)), "r9": (r9, (mesh,)), "r10": (r10, (mesh,)), "r11": (r11, (mesh,)), "r12": (r12, (mesh,)), "r13": (r13, (mesh,)), "r4": (r4, (dev,))}
   chosen = [allg[k] for k in (sel.split(",") if sel else allg) if k in allg]
   for fn, args in chosen:
     try:
