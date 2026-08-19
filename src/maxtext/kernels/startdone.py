@@ -194,8 +194,19 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes, slot=0):
           device_id=_peer_id(axis_name, mesh_axes, peer),
       )
 
+  def _pin_dummies(sems):
+    # Dummy padding semaphores are dead code unless referenced, and Mosaic's DCE strips
+    # unreferenced scratch BEFORE allocation -- which collapses every pair back to slots
+    # 0/1 and is why both padding variants still failed R9. A self-balanced signal+wait
+    # forces liveness at ~ns cost. Dummies: DMA sems [0, 2*slot) and REGULAR sems
+    # [2*slot+2, 2*slot+2+slot).
+    for i in list(range(2 * slot)) + list(range(2 * slot + 2, 2 * slot + 2 + slot)):
+      pl.semaphore_signal(sems[i], 1)
+      pl.semaphore_wait(sems[i], 1)
+
   def start_body(x_ref, *rest):
     bufs, sems = list(rest[: n - 1]), list(rest[n - 1:])
+    _pin_dummies(sems)
     # A peer must not write into our buffers before this kernel is entered.
     bar = pltpu.get_barrier_semaphore()
     me = jax.lax.axis_index(axis_name)
@@ -208,6 +219,7 @@ def _make_ag_pair(n, shard_sds, axis_name, mesh_axes, slot=0):
   def done_body(x_ref, *rest):
     ins = list(rest[: n - 1])            # aliased to the outputs; nothing loaded here
     sems = list(rest[2 * (n - 1):])
+    _pin_dummies(sems)
     for dma in descriptors(x_ref, ins, sems):
       dma.wait()   # sequential waits on the shared pair; each decrements its own bytes
     # Epoch fence (see scratch comment): no device leaves done_i before all finished done_i.
