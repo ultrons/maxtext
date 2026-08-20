@@ -646,24 +646,6 @@ def calculate_load_balance_updates(top_k_indices, num_experts, rate):
   return output
 
 
-_EXPERT_HIST_ROWS = []
-
-
-def _expert_hist_sink(counts):
-  """Host-side accumulator for record_expert_histogram (ordered io_callback target)."""
-  import numpy as _np, os as _os, jax as _jax
-  _EXPERT_HIST_ROWS.append(_np.asarray(counts))
-  n_layers = int(_os.environ.get("EXPERT_HIST_LAYERS", "61"))
-  if len(_EXPERT_HIST_ROWS) % n_layers == 0 and _jax.process_index() == 0:
-    step = len(_EXPERT_HIST_ROWS) // n_layers - 1
-    d = "/tmp/expert_hist"; _os.makedirs(d, exist_ok=True)
-    _np.savez_compressed(f"{d}/step_{step:05d}.npz",
-                         hist=_np.stack(_EXPERT_HIST_ROWS[-n_layers:]))
-    dst = _os.environ.get("EXPERT_HIST_GCS", "")
-    if dst and step % 20 == 19:
-      _os.system(f"gsutil -q -m rsync -r {d} {dst} >/dev/null 2>&1 &")
-
-
 class Tid2EidVar(nnx.Variable):
   """Custom variable to hold tid2eid without trainable param overhead."""
 
@@ -1374,12 +1356,13 @@ class RoutedMoE(nnx.Module):
         gate_logits, pre_bias_logits, rngs, input_ids, saved_indices=None if saved_sort is None else saved_sort[0]
     )
     if getattr(self.config, "record_expert_histogram", False):
-      # Per-layer per-batch expert histogram via ORDERED io_callback: rows arrive in
-      # program order, so layer identity is row index within a step; the host fn batches
-      # rows into step files and process 0 rsyncs to GCS. An nnx Variable cannot be
-      # mutated here (trace-level error under the bridge+scan), hence the callback.
+      # Per-layer per-batch expert histogram, sown as an nnx Intermediate -- the same
+      # mechanism as record_internal_nn_metrics' activation stats, proven under
+      # scan+remat. (Variable mutation and io_callback are both rejected here: trace
+      # levels and remat effects respectively.) Collected in train_step via suffix and
+      # dumped per step by the train loop.
       _counts = jnp.bincount(selected_experts.ravel(), length=self.config.num_experts).astype(jnp.int32)
-      jax.experimental.io_callback(_expert_hist_sink, None, _counts, ordered=True)
+      self.sow(nnx.Intermediate, "expert_counts", _counts)
 
     lb_loss = None
     if self.config.load_balance_loss_weight > 0.0 and not self.is_hash_routing:

@@ -646,6 +646,10 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   }
   if getattr(config, "record_internal_nn_metrics", False):
     record_activation_metrics(metrics, intermediate_outputs, config)
+  if getattr(config, "record_expert_histogram", False):
+    _eh = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "expert_counts")
+    if _eh:
+      metrics["expert_hist"] = jnp.concatenate([jnp.reshape(v, (-1, v.shape[-1])) for v in _eh], axis=0)
 
   if isinstance(model, nn.Module):
     return new_state, metrics
@@ -812,6 +816,17 @@ def training_loop_iteration(
     max_utils.print_mem_stats("After params initialized")
 
   metric_logger_instance.buffer_and_write_metrics(metrics, step, step_time_delta)
+  if getattr(config, "record_expert_histogram", False) and "expert_hist" in metrics:
+    try:
+      import numpy as _np, os as _os
+      if jax.process_index() == 0:
+        _d = "/tmp/expert_hist"; _os.makedirs(_d, exist_ok=True)
+        _np.savez_compressed(f"{_d}/step_{step:05d}.npz", hist=_np.asarray(jax.device_get(metrics["expert_hist"])))
+        if step % 20 == 19 and str(config.base_output_directory).startswith("gs://"):
+          _os.system(f"gsutil -q -m rsync -r {_d} {config.base_output_directory}/{config.run_name}/expert_hist/ >/dev/null 2>&1 &")
+    except Exception as _e:
+      max_logging.log(f"expert_hist dump failed at step {step}: {_e}")
+    metrics.pop("expert_hist", None)
 
   # Pack mutated state back to dicts
   jax_device_state["state"] = state
