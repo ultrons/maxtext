@@ -454,6 +454,23 @@ class DenseGeneral(nnx.Module):
       out_sharding = None
 
     contract_ind = tuple(range(0, len(self.axis)))
+    # PROBE (env-gated): pin this dot -- and therefore the SPMD-inserted weight all-gather
+    # feeding it -- to the TC ("device") compute type, exempting it from global SparseCore
+    # collective offload. jax>=0.11 compute_on per-op steering.
+    if os.environ.get("DENSE_COMPUTE_ON") == "device":
+      from jax.experimental.compute_on import compute_on as _co
+      with _co("device"):
+        output = _compute_dot_general_nnx(
+            inputs, kernel, norm_axis, contract_ind, self.matmul_precision,
+            self.quant_dot_general if slice_bounds is None else None, _initializing, out_sharding,
+        )
+      if self.bias is not None:
+        bias = jnp.asarray(self.bias[...], self.dtype)
+        if slice_bounds is not None:
+          begin, end = slice_bounds
+          bias = bias[..., begin:end]
+        output += bias
+      return output
     output = _compute_dot_general_nnx(
         inputs,
         kernel,
