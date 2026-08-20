@@ -2901,3 +2901,11 @@ die at 512 chips while passing every 8-device gate. The one dimension no rig gat
 MULTI-HOST (all rig tests are single-host 2x2x1; the cluster's remote DMAs cross host
 boundaries). Next step when resumed: R7/R9/R13 on a 2-host spot-2x2x2-mh pool (needs gang-probe
 plumbing). Parked per user direction to move to compute_on / deep-chunking / imbalance chapters.
+
+## Overnight 2026-08-20: compute_on chapter opened — full report in ~/performance/OVERNIGHT_2026-08-20.md
+Headlines: per-op SC/TC collective steering via jax compute_on proven end-to-end (hardware, both
+0.10/0.11); model AOT under full flags = weight AGs TC (12/12) while 373 ops stay SC; cluster A/B
+−246 ms on jax 0.11 (7.267→7.021, loss in noise); production-0.10 port REGRESSES to 12.736 (fusion
+break) → adoption gated on the deps bump (+0.39 tax, unroot-caused); imbalance measured 6.7x via
+barrier-AR stall (1.660 vs 0.247 ms/layer real-vs-synthetic); chunk4 neutral vs same-night c2
+control (5.078 vs 5.030); table-driven-pi rebalance design written.
