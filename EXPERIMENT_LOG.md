@@ -2892,3 +2892,12 @@ shadowing, a swallowed decorator) now guarded by parse-and-assert patch scripts.
 
 Next: fsdp=128 AOT with group=16 (running), then the cluster A/B: sag2a (split+group16) vs the
 banked stock 6.879.
+
+## Split-gather arc PARKED [2026-08-20]
+
+sag2b (two-stage, fan-out 15/7) halted identically to sag1g (zero steps, semaphore residue,
+scratch arg 5) -> the per-peer/width theory is REFUTED; two designs with 127 vs 15/7 peers both
+die at 512 chips while passing every 8-device gate. The one dimension no rig gate ever touched:
+MULTI-HOST (all rig tests are single-host 2x2x1; the cluster's remote DMAs cross host
+boundaries). Next step when resumed: R7/R9/R13 on a 2-host spot-2x2x2-mh pool (needs gang-probe
+plumbing). Parked per user direction to move to compute_on / deep-chunking / imbalance chapters.
