@@ -279,7 +279,10 @@ class DeepSeekGenericLayer(nnx.Module):
     if self.config.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
       self.sow(nnx.Intermediate, "moe_lb_loss", load_balance_loss)
 
-    if self.config.routed_bias and self.config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
+    if moe_bias_updates is not None and (
+        (self.config.routed_bias and self.config.routed_bias_update_rate > 0.0)
+        or getattr(self.config, "record_expert_histogram", False)
+    ):
       self.sow(nnx.Intermediate, "moe_bias_updates", moe_bias_updates)
 
     if getattr(self.config, "record_internal_nn_metrics", False):

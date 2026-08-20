@@ -1355,15 +1355,6 @@ class RoutedMoE(nnx.Module):
     weights, selected_experts = self.get_topk(
         gate_logits, pre_bias_logits, rngs, input_ids, saved_indices=None if saved_sort is None else saved_sort[0]
     )
-    if getattr(self.config, "record_expert_histogram", False):
-      # Per-layer per-batch expert histogram, sown as an nnx Intermediate -- the same
-      # mechanism as record_internal_nn_metrics' activation stats, proven under
-      # scan+remat. (Variable mutation and io_callback are both rejected here: trace
-      # levels and remat effects respectively.) Collected in train_step via suffix and
-      # dumped per step by the train loop.
-      _counts = jnp.bincount(selected_experts.ravel(), length=self.config.num_experts).astype(jnp.int32)
-      self.sow(nnx.Intermediate, "expert_counts", _counts)
-
     lb_loss = None
     if self.config.load_balance_loss_weight > 0.0 and not self.is_hash_routing:
       softmax_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
@@ -1377,6 +1368,14 @@ class RoutedMoE(nnx.Module):
       )
     else:
       bias_updates = None
+    if getattr(self.config, "record_expert_histogram", False):
+      # Ride the EXISTING bias_updates channel (MoE return -> deepseek.post_process sow ->
+      # intermediates), the only per-layer path proven under bridge+scan+remat. Mutually
+      # exclusive with routed_bias (validated in types.py): when recording, bias_updates
+      # carries the RAW per-layer expert bincount for this batch instead of sign updates.
+      bias_updates = jnp.bincount(
+          selected_experts.ravel(), length=self.config.num_experts
+      ).astype(jnp.float32)
 
     if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
       # weights will be of shape (batch_size, seq_len, num_experts_per_tok)

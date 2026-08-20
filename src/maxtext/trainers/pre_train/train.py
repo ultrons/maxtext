@@ -647,7 +647,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   if getattr(config, "record_internal_nn_metrics", False):
     record_activation_metrics(metrics, intermediate_outputs, config)
   if getattr(config, "record_expert_histogram", False):
-    _eh = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "expert_counts")
+    _eh = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "moe_bias_updates")
     if _eh:
       metrics["expert_hist"] = jnp.concatenate([jnp.reshape(v, (-1, v.shape[-1])) for v in _eh], axis=0)
 
