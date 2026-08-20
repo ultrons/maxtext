@@ -812,24 +812,6 @@ def training_loop_iteration(
     max_utils.print_mem_stats("After params initialized")
 
   metric_logger_instance.buffer_and_write_metrics(metrics, step, step_time_delta)
-  if getattr(config, "record_expert_histogram", False):
-    # Dump the [num_layers, num_experts] per-batch expert histogram recorded by the
-    # routers this step. Leaves are found by path name so no assumption about the state
-    # pytree layout; every process sees the replicated values but only process 0 writes.
-    try:
-      import numpy as _np, os as _os
-      _leaves = jax.tree_util.tree_flatten_with_path(state)[0]
-      _h = [jax.device_get(v) for (kp, v) in _leaves if "expert_counts" in jax.tree_util.keystr(kp)]
-      if _h and jax.process_index() == 0:
-        _d = _os.path.join(config.base_output_directory or "/tmp", "expert_hist") \
-            if not str(config.base_output_directory).startswith("gs://") else "/tmp/expert_hist"
-        _os.makedirs(_d, exist_ok=True)
-        _np.savez_compressed(_os.path.join(_d, f"step_{step:05d}.npz"),
-                             *[_np.asarray(a) for a in _h])
-        if str(config.base_output_directory).startswith("gs://") and step % 20 == 0:
-          _os.system(f"gsutil -q -m rsync -r {_d} {config.base_output_directory}/expert_hist/ &")
-    except Exception as _e:  # never let recording kill training
-      max_logging.log(f"expert_histogram dump failed at step {step}: {_e}")
 
   # Pack mutated state back to dicts
   jax_device_state["state"] = state
