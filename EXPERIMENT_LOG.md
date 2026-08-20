@@ -2909,3 +2909,26 @@ Headlines: per-op SC/TC collective steering via jax compute_on proven end-to-end
 break) → adoption gated on the deps bump (+0.39 tax, unroot-caused); imbalance measured 6.7x via
 barrier-AR stall (1.660 vs 0.247 ms/layer real-vs-synthetic); chunk4 neutral vs same-night c2
 control (5.078 vs 5.030); table-driven-pi rebalance design written.
+
+## Expert-histogram recorder: PARKED at a hard trainer limitation [2026-08-20]
+
+Five implementations, each rejected by a different wall, the last one structural:
+1. nnx.Variable mutation -- TraceContextError (bridge trace levels).
+2. ordered io_callback -- effects unsupported in remat partial-eval.
+3. sow in RoutedMoE -- module mutation blocked at that level.
+4. sow at the deepseek layer via the bias_updates channel (proven pattern) -- compiles (AOT
+   green) but collects ZERO leaves at runtime.
+5. Diagnosis (CPU mini real-jit, minutes per iteration): **intermediates from SCANNED layers are
+   dropped entirely in this trainer; only unscanned (MTP) sows survive.** activ_mean=1 leaf =
+   MTP only. This also explains the routed_bias apply crash ((256,58) vs (256,)): active
+   loss-free balancing has only ever seen the MTP gate's sow here -- the mechanism is broken
+   for the scanned decoder in this lineage, independent of our recorder.
+
+Correct fix (designed, not built): thread per-layer counts as EXPLICIT lax.scan ys through
+`layer_fn_wrapped` in nnx_decoders (+ layer return contract + train_step aux). Touches the scan
+wrapper's contract; budgeted as its own task, not an overnight tail.
+
+Salvage: the CPU mini real-jit harness (deepseek3-671b + override_model_config tiny dims) is the
+iteration vehicle that turned cluster-scale mysteries into minutes -- keep using it. Both bias1
+and histconv "Completed" while crashing because the launcher's tee masked exit codes;
+xpk_variant_logsave.sh fixes that for all future runs.

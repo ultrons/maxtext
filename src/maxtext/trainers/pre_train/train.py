@@ -648,6 +648,13 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     record_activation_metrics(metrics, intermediate_outputs, config)
   if getattr(config, "record_expert_histogram", False):
     _eh = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "moe_bias_updates")
+    if not _eh:
+      max_logging.log(
+          "record_expert_histogram: 0 leaves collected -- intermediates from SCANNED layers "
+          "are dropped in this trainer (only unscanned/MTP sows survive), so the recorder is "
+          "INOPERATIVE under scan. Needs counts threaded as explicit lax.scan ys. See "
+          "EXPERIMENT_LOG 2026-08-20."
+      )
     if _eh:
       metrics["expert_hist"] = jnp.concatenate([jnp.reshape(v, (-1, v.shape[-1])) for v in _eh], axis=0)
 
