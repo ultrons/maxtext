@@ -650,6 +650,10 @@ class Tid2EidVar(nnx.Variable):
   """Custom variable to hold tid2eid without trainable param overhead."""
 
 
+class ExpertCountsVar(nnx.Variable):
+  """Per-layer expert-histogram recorder (s32[num_experts]); non-trainable, scan-stacked."""
+
+
 class GateLogit(nnx.Module):
   """A layer used to compute gate logits, allowing to return the pre bias values for DeepSeek routing."""
 
@@ -904,6 +908,8 @@ class RoutedMoE(nnx.Module):
         shard_mode=config.shard_mode,
         rngs=self.rngs,
     )
+    if getattr(self.config, "record_expert_histogram", False):
+      self.expert_counts = ExpertCountsVar(jnp.zeros((self.config.num_experts,), jnp.int32))
     rule = qpl.get_current_rule("gmm")
     sparsity_rule = None
     if rule is not None:
@@ -1355,6 +1361,15 @@ class RoutedMoE(nnx.Module):
     weights, selected_experts = self.get_topk(
         gate_logits, pre_bias_logits, rngs, input_ids, saved_indices=None if saved_sort is None else saved_sort[0]
     )
+    if getattr(self.config, "record_expert_histogram", False):
+      # Global per-layer expert histogram for this batch: bincount over the LOGICAL
+      # selected_experts (GSPMD inserts the cross-device sum). Stored in a non-trainable
+      # variable; under scan it stacks to [num_layers, num_experts] in state, and the
+      # train loop dumps it per step. Cost: one tiny bincount + a [256] all-reduce.
+      self.expert_counts.value = jnp.bincount(
+          selected_experts.ravel(), length=self.config.num_experts
+      ).astype(jnp.int32)
+
     lb_loss = None
     if self.config.load_balance_loss_weight > 0.0 and not self.is_hash_routing:
       softmax_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1).astype(self.dtype)

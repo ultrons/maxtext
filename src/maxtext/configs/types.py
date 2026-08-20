@@ -1138,6 +1138,14 @@ class MoEGeneral(BaseModel):
           "to a full sort. Grouped routing measures 2.256 s/step (vreuse 8.997 vs vnogrp 6.741)."
       ),
   )
+  record_expert_histogram: bool = Field(
+      False,
+      description=(
+          "Record the per-layer per-batch expert histogram (bincount of selected_experts) into "
+          "a non-trainable variable each step; the train loop dumps it as npy per step. For "
+          "expert-assignment (EPLB-style) analysis."
+      ),
+  )
   shared_expert_weight_ag_split_group: int = Field(
       0,
       description=(
