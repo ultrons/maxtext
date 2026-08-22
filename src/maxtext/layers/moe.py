@@ -17,6 +17,7 @@
 
 import enum
 import functools
+import os
 import math
 import random
 from typing import Iterable, Optional, Tuple, Union
@@ -1368,6 +1369,14 @@ class RoutedMoE(nnx.Module):
       )
     else:
       bias_updates = None
+    if os.environ.get("EXPERT_HIST_PRINT") == "1":
+      # ONE-SHOT capture path: jax.debug.print is remat-compatible (unlike io_callback and
+      # sow, both rejected -- see EXPERIMENT_LOG 2026-08-20). Each layer prints its [E]
+      # bincount; remat duplicates rows (fwd + recompute) -- dedup at parse time. For a
+      # few steps of data this is sufficient for assignment (pi/LPT) analysis.
+      _c = jnp.bincount(selected_experts.ravel(), length=self.config.num_experts)
+      jax.debug.print("EXPERT_HIST {}", _c)
+
     if getattr(self.config, "record_expert_histogram", False):
       # Ride the EXISTING bias_updates channel (MoE return -> deepseek.post_process sow ->
       # intermediates), the only per-layer path proven under bridge+scan+remat. Mutually
