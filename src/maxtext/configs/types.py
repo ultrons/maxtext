@@ -1146,6 +1146,14 @@ class MoEGeneral(BaseModel):
           "expert-assignment (EPLB-style) analysis."
       ),
   )
+  moe_fp8_token_ag: bool = Field(
+      False,
+      description=(
+          "Ring-path token dispatch all-gather in e4m3 with per-token scales (wire-only: dequant "
+          "on arrival; sort/GMM unchanged). Straight-through backward. PR#4895's lever ported to "
+          "the ring/record stack."
+      ),
+  )
   expert_assignment_path: str = Field(
       "",
       description=(

@@ -2416,6 +2416,39 @@ class RoutedMoE(nnx.Module):
 
           _ep_g.defvjp(_ep_g_fwd, _ep_g_bwd)
           x, logits, pre_bias_logits = tuple(_ep_g(z) for z in (x, logits, pre_bias_logits))
+        elif getattr(self.config, "moe_fp8_token_ag", False) and isinstance(self._expert_parallelism_name, str):
+          # moe_fp8_token_ag (PR#4895's lever, wire-only port): send the ring token dispatch
+          # all-gather as e4m3 qvalues with PER-TOKEN scales (scales ride their own tiny
+          # [tokens,1] gather; no cross-shard amax reduction needed) and dequant on arrival.
+          # Numerically ~free under fp8_full: the GMM re-quantizes activations per-row over the
+          # SAME contraction axis, so this relocates an existing rounding (e4m3 round-trip is
+          # idempotent, verified on the r3002 campaign). Backward is STRAIGHT-THROUGH (the
+          # transpose reduce-scatter runs on the bf16 cotangent): differentiating through the
+          # quantize NaNs on all-zero token rows (scale 1e-20 -> 1/scale overflow), root-caused
+          # 2026-08-17. Sort/GMM downstream are untouched -- this halves ICI wire bytes only.
+          ep_axis = self._expert_parallelism_name
+
+          @jax.custom_vjp
+          def _fp8_ag(z):  # PRIMAL (recompute path): plain gather, bit-compatible fallback
+            return jax.lax.all_gather(z, axis_name=ep_axis, tiled=True)
+
+          def _fp8_ag_fwd(z):
+            _amax = jnp.max(jnp.abs(z.astype(jnp.float32)), axis=-1, keepdims=True)
+            _scale = (_amax / 448.0 + 1e-20).astype(jnp.float32)
+            _q = jnp.clip(z.astype(jnp.float32) / _scale, -448.0, 448.0).astype(jnp.float8_e4m3fn)
+            _qg = jax.lax.all_gather(_q, axis_name=ep_axis, tiled=True)
+            _sg = jax.lax.all_gather(_scale, axis_name=ep_axis, tiled=True)
+            return (_qg.astype(jnp.float32) * _sg).astype(z.dtype), None
+
+          def _fp8_ag_bwd(_res, ct):
+            return (jax.lax.psum_scatter(ct, axis_name=ep_axis, scatter_dimension=0, tiled=True),)
+
+          _fp8_ag.defvjp(_fp8_ag_fwd, _fp8_ag_bwd)
+          x = _fp8_ag(x)
+          logits, pre_bias_logits = tuple(
+              jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True)
+              for z in (logits, pre_bias_logits)
+          )
         else:
           # Duplicate inputs to all expert shards.
           x, logits, pre_bias_logits = tuple(
