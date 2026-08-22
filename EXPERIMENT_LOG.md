@@ -3047,3 +3047,23 @@ moe_x_sorted=device, rbf=2, chunks=2, pdbs=1, synthetic random routing, steps=25
   MOE_FP8_CT_WIRE=1 + moe_fp8_token_ag. vs rbf=2+tokag 4.160: the rbf=-1 tax is +0.40 on
   today's code (historical band 0.26-0.63). lm_loss 8.219@19 (rbf=2 arms 8.231 -- different
   buffer regime, expected).
+
+## PR #4971: in-kernel drhs quant + bwd dtype (second upstream PR) [2026-08-22]
+
+https://github.com/AI-Hypercomputer/maxtext/pull/4971 — stacked on #4895+#4969 (base =
+test_964807349, branch sivaibhav-moe-bwd-inkernel-quant on the ultrons fork). Ships
+moe_bwd_inkernel_quant (drhs-only) + bwd_quantization_dtype; tgmm_v2 quantize_operands kernel
+diff applies clean (upstream tgmm untouched since our base).
+
+**The dlhs half is NOT shippable on the upstream recipe**: moe_bwd_inkernel_quant_dlhs Mosaic-fails
+("2nd minor dimension aligned to the tile", left_fill_zero/dma_start) at their pdbs=4/fsdp=64
+shapes, with default AND our tile sets; drhs-only + control both compile. Consistent with our own
+verdict (dlhs standalone net-negative; only pays inside the shared-cotangent composite). Trimmed:
+dlhs flag, share-cotangent logic, gmm-kernel wide-lhs enable, acc pin all removed from the PR
+branch (live on ours). Port fix worth remembering: upstream's raw cotangent reaches the tgmm as
+f32 (ours was bf16) -> width-align drhs_dout to lhs.dtype when inkernel fires, else tgmm asserts
+sublane mismatch.
+
+Gates: dropless pdbs=1 rbf=-1 flag-on 51.7G temps GREEN; flag-off recipe GREEN; flag-on at their
+pdbs=4 rbf=2 compiles but temps 112.9G (>HBM; documented as not-the-target regime — the flag is
+for dropless).
