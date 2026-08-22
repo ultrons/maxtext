@@ -651,6 +651,15 @@ class Tid2EidVar(nnx.Variable):
   """Custom variable to hold tid2eid without trainable param overhead."""
 
 
+class ExpertPermVar(nnx.Variable):
+  """Per-layer expert placement permutation (EPLB-style), non-trainable.
+
+  Identity by default; when expert_assignment_path is set, the post-restore hook writes the
+  measured pi. float32 storage for the same reason as Tid2EidVar (the variable tree can be
+  dtype-cast wholesale); cast to int32 at the use site.
+  """
+
+
 class GateLogit(nnx.Module):
   """A layer used to compute gate logits, allowing to return the pre bias values for DeepSeek routing."""
 
@@ -838,6 +847,11 @@ class RoutedMoE(nnx.Module):
     self.quant = quant
     self.rngs = rngs
     self.is_hash_routing = is_hash_routing
+
+    # Expert placement permutation, identity unless expert_assignment_path is set (declared
+    # unconditionally so abstract/eval_shape graphdefs always carry it).
+    self.expert_perm = ExpertPermVar(jnp.arange(num_experts, dtype=jnp.float32))
+    self.expert_invperm = ExpertPermVar(jnp.arange(num_experts, dtype=jnp.float32))
 
     # DeepSeek V4 Hash Routing
     if self.is_hash_routing:
@@ -1148,6 +1162,9 @@ class RoutedMoE(nnx.Module):
 
     if saved_indices is not None:
       top_k_indices = saved_indices
+      if getattr(self.config, "expert_assignment_path", ""):
+        # saved indices are dispatch SLOTS; weights must be read at the ORIGINAL expert ids.
+        top_k_indices = self.expert_invperm.value.astype(jnp.int32)[saved_indices]
       if self.is_hash_routing or self.config.model_name.startswith(("deepseek3", "deepseek4")):
         # hash routing and deepseek_routing both weight via take_along_axis(pre_bias_logits, idx).
         top_k_weights = jnp.take_along_axis(pre_bias_logits, top_k_indices, axis=-1)
@@ -1186,6 +1203,11 @@ class RoutedMoE(nnx.Module):
       # Normalization of router weights (e.g. used by Qwen3, Gemma4).
       if self.config.norm_topk_prob:
         top_k_weights /= top_k_weights.sum(axis=-1, keepdims=True)
+
+    if getattr(self.config, "expert_assignment_path", ""):
+      # Selection (and its weights) happened in the original expert space above; only the
+      # DISPATCH target changes. Integer gather, no gradient path.
+      top_k_indices = self.expert_perm.value.astype(jnp.int32)[top_k_indices]
 
     return top_k_weights, top_k_indices
 

@@ -19,9 +19,13 @@ for f in files:
     h = np.concatenate([a.reshape(-1, a.shape[-1]) for a in arrs], axis=0)  # [layers, E]
     H.append(h)
 H = np.stack(H)                       # [steps, layers, E]
+# Drop dense/MTP slots: rows that record no tokens in any step are not MoE layers.
+moe_rows = H.sum(axis=(0, 2)) > 0
+H = H[:, moe_rows, :]
 S, L, E = H.shape
 R = 8                                  # EP ranks
-print(f"steps={S} layers={L} experts={E} ranks={R}")
+print(f"steps={S} moe_layers={L} (of {moe_rows.size} slots) experts={E} ranks={R}")
+print(f"per-layer tokensxtopk per step: {sorted(set(H.sum(-1)[0].astype(int)))}")
 
 def lpt(load, R):
     order = np.argsort(-load)

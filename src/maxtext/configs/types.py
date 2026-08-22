@@ -1146,6 +1146,17 @@ class MoEGeneral(BaseModel):
           "expert-assignment (EPLB-style) analysis."
       ),
   )
+  expert_assignment_path: str = Field(
+      "",
+      description=(
+          "npz (local or gs://) with per-layer expert placement permutations 'perm' and 'invperm' "
+          "[num_layers, num_experts] plus 'moe_mask' [num_layers], measured from recorded "
+          "histograms. Top-k SELECTION stays in the model's original expert space (grouped-routing "
+          "semantics unchanged); dispatch indices are remapped to balanced slots and the "
+          "routed-expert weights are permuted to match after checkpoint restore. Same math, "
+          "different EP rank placement."
+      ),
+  )
   shared_expert_weight_ag_split_group: int = Field(
       0,
       description=(
@@ -4115,6 +4126,13 @@ class MaxTextConfig(
         )
       if self.routed_bias and self.routed_bias_update_rate > 0.0 and self.decoder_block != DecoderBlockType.DEEPSEEK:
         raise ValueError("Loss-free load balancing is only supported for the DeepSeek decoder block.")
+      if getattr(self, "expert_assignment_path", "") and self.use_random_routing:
+        raise ValueError("expert_assignment_path rebalances REAL routing; disable use_random_routing.")
+      if getattr(self, "expert_assignment_path", "") and self.routed_bias and self.routed_bias_update_rate > 0.0:
+        raise ValueError(
+            "expert_assignment_path with ACTIVE loss-free balancing is unsupported: bias updates are "
+            "accumulated in slot space but applied to original-space logits."
+        )
       if self.model_name.startswith("deepseek4") and self.first_num_hash_layers > 0 and self.use_ring_of_experts:
         raise ValueError("DeepSeek V4 hash routing is currently not supported with ring of experts.")
       self.validate_ragged_buffer_factor()

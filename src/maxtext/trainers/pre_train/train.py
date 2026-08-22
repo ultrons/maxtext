@@ -854,6 +854,77 @@ def training_loop_iteration(
   python_vars["last_step_completion"] = last_step_completion
 
 
+
+def _apply_expert_assignment(state, config):
+  """Rebalance EP placement from a measured pi: write the per-layer perm tables into the
+  ExpertPermVar leaves and permute the routed-expert weights (wi_0/wi_1/wi/wo) to match.
+
+  Selection stays in the original expert space (moe.get_topk remaps only the dispatch
+  indices), so this changes WHERE each expert lives, not what the model computes.
+  """
+  import io as _io
+  import numpy as _np
+  from tensorflow import io as _tfio
+
+  with _tfio.gfile.GFile(config.expert_assignment_path, "rb") as f:
+    z = _np.load(_io.BytesIO(f.read()))
+  # perm_scan rows correspond 1:1 to the SCANNED decoder MoE layers, in scan order; the
+  # producer resolves recorder-row -> scan-slot mapping (production: rows 3..60 of the
+  # 61-slot capture, the leading 3 being the dense layers).
+  perm_moe = z["perm_scan"].astype(_np.int32)           # [n_scan_layers, E]
+  invperm_moe = z["invperm_scan"].astype(_np.int32)
+  n_moe, num_e = perm_moe.shape
+
+  leaves, treedef = jax.tree_util.tree_flatten_with_path(state)
+  out, n_perm, n_w = [], 0, 0
+  for kp, v in leaves:
+    ks = jax.tree_util.keystr(kp)
+    if not hasattr(v, "shape"):
+      out.append(v)
+      continue
+    if "expert_perm" in ks or "expert_invperm" in ks:
+      tbl = invperm_moe if "expert_invperm" in ks else perm_moe
+      if v.shape == (n_moe, num_e):
+        nv = jax.device_put(jnp.asarray(tbl, dtype=v.dtype), v.sharding)
+        n_perm += 1
+      elif v.shape == (num_e,):
+        nv = v  # unscanned MoE (MTP): no measured histogram, keep identity placement
+      else:
+        raise ValueError(f"expert_assignment: perm leaf {ks} has shape {v.shape}, "
+                         f"expected {(n_moe, num_e)} or {(num_e,)}")
+      out.append(nv)
+      continue
+    # Scanned routed-expert weights (and their adamw mu/nu copies) are [E, n_scan, ...]:
+    # Params stack on param_scan_axis=1, expert axis stays 0. Shared-expert / dense mlp
+    # kernels live under different path segments and never match 'MoeBlock'.
+    is_routed_w = (
+        "MoeBlock" in ks
+        and any(f"'{t}'" in ks for t in ("wi_0", "wi_1", "wo", "wi"))
+        and "shared" not in ks
+        and "expert_perm" not in ks
+        and "expert_invperm" not in ks
+        and v.ndim >= 3
+        and v.shape[:2] == (num_e, n_moe)
+    )
+    if is_routed_w:
+      inv = jnp.asarray(invperm_moe)                     # [n_scan, E]
+      nv = jax.vmap(lambda w2, ip: w2[ip], in_axes=(1, 0), out_axes=1)(v, inv)
+      nv = jax.device_put(nv, v.sharding)
+      out.append(nv)
+      n_w += 1
+      max_logging.log(f"expert_assignment: permuted {ks} {v.shape}")
+      continue
+    out.append(v)
+  if n_perm == 0 or n_w == 0:
+    dump = [f"{jax.tree_util.keystr(kp)} {getattr(v, 'shape', None)}" for kp, v in leaves
+            if hasattr(v, "shape") and any(t in jax.tree_util.keystr(kp)
+                                           for t in ("wi", "wo", "expert_"))]
+    raise ValueError("expert_assignment matched nothing; candidate leaves:\n" + "\n".join(dump))
+  max_logging.log(f"expert_assignment applied: {n_perm} perm leaves, {n_w} weight leaves, "
+                  f"{n_moe} layers x {num_e} experts")
+  return jax.tree_util.tree_unflatten(treedef, out)
+
+
 def train_loop(config, recorder, state=None):
   """Main Training loop."""
   (
@@ -884,6 +955,8 @@ def train_loop(config, recorder, state=None):
     jit_model = model
   else:
     jit_model, state = nnx.split(state)
+  if getattr(config, "expert_assignment_path", "") and not isinstance(model, nn.Module) and not config.enable_diloco:
+    state = _apply_expert_assignment(state, config)
 
   if config.pure_nnx and config.enable_diloco:
     # DiLoCoTrainState.params already holds the param shardings the inner step needs;
