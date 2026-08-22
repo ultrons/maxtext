@@ -2995,3 +2995,33 @@ for free. CPU mini gate: random nontrivial pi == identity to ALL printed loss di
 
 **A/B in flight:** hbal0 (baseline, record on) vs hbal1 (+pi), both splitag23, steps=25,
 trained-gate real-c4 seed 1234. Judge: step time, lm_loss parity, slot-space histogram balance.
+
+## PR#4895 audit + 1927-repro + token-AG fp8 A/B [2026-08-22]
+
+**PR#4895 == the 3002.patch verbatim** (all 6 code files line-identical modulo google3 import
+spelling; PR omits only internal launch recipes/BUILD). Delta to our record stack: the PR carries
+the fp8-GMM/QArray plumbing + both quantized AGs; our ring cotangent-AG and x_sorted save are not
+in it. Its one NEW lever vs our record: moe_quantize_token_all_gather (token-AG fp8).
+
+**Repro arms (8x8x8, record flags: fp8_full + cv-wag fixed,-1,1 + moe_ring_cotangent_ag +
+moe_x_sorted=device, rbf=2, chunks=2, pdbs=1, synthetic random routing, steps=25):**
+
+| arm | image | s/step@19 | lm_loss@19 |
+|---|---|---|---|
+| siv-cn-r1927 (current code) | splitag23 | 4.647 | 8.231 |
+| siv-cn-r1927o (record image dafb04634) | dafb04634 | 4.657 | 8.232 |
+| **siv-cn-r1927tag (+moe_fp8_token_ag)** | tokag1 | **4.160** | 8.231 (matches base every step) |
+
+- **moe_fp8_token_ag = −0.49 s (−10.5%) on this stack** — the PR's lever, ported wire-only
+  (per-token e4m3 scales on their own tiny gather, dequant on arrival, straight-through bwd from
+  the r3002 NaN root-cause). 4.160 s/step = ~1969 TPS/chip, BELOW the 4.251 record. Loss
+  trajectory matches baseline to every printed digit — wire quantize numerically invisible.
+- **The 4.251 record did NOT reproduce with the reconstructed flags** — r1927o on the ORIGINAL
+  image matches current code (4.65/8.23), so it is not code drift; the xsretest launch (profile
+  2026-08-10 16:57, BEFORE the ring-ct/x_sorted commits at 17:00 — dirty-build window) had some
+  flag/code state the reconstruction misses. compare_profiles: +409 ms/step, SC lane +500 ms,
+  binder flipped TC→SC; repro has an exposed 1.6 GB all-gather.412 (795 ms) absent from the
+  record profile, RS.31 987→1143 ms. Suspects: fwd combine RS placement (moe_ring_combine_rs)
+  and the x_sorted save variant. Probing with r1927tagrs (+moe_ring_combine_rs).
+- Loss 8.23 vs the record's 8.784 on fixed-seed synthetic: post-08-10 fp8-path numerics changes
+  (bfdf9dbff review fixes et al.) — expected, not noise.
