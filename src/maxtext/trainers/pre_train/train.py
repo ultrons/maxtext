@@ -647,16 +647,21 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   if getattr(config, "record_internal_nn_metrics", False):
     record_activation_metrics(metrics, intermediate_outputs, config)
   if getattr(config, "record_expert_histogram", False):
+    # Scanned-layer sows are NOT in intermediate_outputs -- they ride new_state (stacked by
+    # the scan) and are filtered at the nnx return below (`nnx.Not(nnx.Intermediate)`).
+    # Harvest them here, before the drop.
     _eh = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "moe_bias_updates")
-    if not _eh:
-      max_logging.log(
-          "record_expert_histogram: 0 leaves collected -- intermediates from SCANNED layers "
-          "are dropped in this trainer (only unscanned/MTP sows survive), so the recorder is "
-          "INOPERATIVE under scan. Needs counts threaded as explicit lax.scan ys. See "
-          "EXPERIMENT_LOG 2026-08-20."
-      )
+    if not isinstance(model, nn.Module):
+      _istate = nnx.state(new_state, nnx.Intermediate)
+      _eh = _eh + [
+          v for kp, v in jax.tree_util.tree_leaves_with_path(_istate)
+          if "moe_bias_updates" in jax.tree_util.keystr(kp) and hasattr(v, "shape")
+      ]
     if _eh:
-      metrics["expert_hist"] = jnp.concatenate([jnp.reshape(v, (-1, v.shape[-1])) for v in _eh], axis=0)
+      metrics["expert_hist"] = jnp.concatenate(
+          [jnp.reshape(v, (-1, v.shape[-1])) for v in _eh], axis=0)
+    else:
+      max_logging.log("record_expert_histogram: 0 leaves found in intermediates OR state")
 
   if isinstance(model, nn.Module):
     return new_state, metrics
