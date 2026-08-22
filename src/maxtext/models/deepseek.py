@@ -98,13 +98,14 @@ class DeepSeekGenericLayer(nnx.Module):
     self.config = config
     self.model_mode = model_mode
     self.mesh = mesh
-    if getattr(config, "record_expert_histogram", False):
-      # PRE-DECLARED Intermediate: sows born inside the manual layer scan cannot extend the
-      # ys structure and are silently dropped; a variable declared at init is part of the
-      # scanned state, so per-layer assignment in post_process survives to new_state where
-      # the trainer harvests it before the nnx.Not(Intermediate) drop.
-      import jax.numpy as _jnp
-      self.expert_counts_rec = nnx.Intermediate(_jnp.zeros((config.num_experts,), _jnp.float32))
+    # PRE-DECLARED Intermediate for the expert-histogram recorder. UNCONDITIONAL so every
+    # construction path (incl. eval_shape/abstract graphdefs used by the layer scan) carries
+    # it -- a flag-gated attribute left some scan-merged instances without it. Sows born
+    # inside the manual scan cannot extend the ys structure; a pre-declared variable is part
+    # of the scanned state and survives to new_state, where the trainer harvests it before
+    # the nnx.Not(Intermediate) drop. Cost: one [num_experts] f32 per layer.
+    import jax.numpy as _jnp
+    self.expert_counts_rec = nnx.Intermediate(_jnp.zeros((config.num_experts,), _jnp.float32))
     self.quant = quant
     self.rngs = rngs
     self.is_mhc_enabled = config.mhc_expansion_rate > 1
