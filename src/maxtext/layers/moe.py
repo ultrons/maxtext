@@ -3596,6 +3596,11 @@ class RoutedMoE(nnx.Module):
       )
     else:
       bias_updates = None
+    if getattr(self.config, "record_expert_histogram", False):
+      # Same recorder ride-along as the sparse path (see the block near line 1372).
+      bias_updates = jnp.bincount(
+          top_k_indices.ravel(), length=self.config.num_experts
+      ).astype(jnp.float32)
 
     batch_size = inputs.shape[0]
     seq_len = inputs.shape[1]
