@@ -832,12 +832,19 @@ def training_loop_iteration(
   metric_logger_instance.buffer_and_write_metrics(metrics, step, step_time_delta)
   if getattr(config, "record_expert_histogram", False) and "expert_hist" in metrics:
     try:
-      import numpy as _np, os as _os
+      import numpy as _np, os as _os, io as _io
       if jax.process_index() == 0:
+        _h = _np.asarray(jax.device_get(metrics["expert_hist"]))
         _d = "/tmp/expert_hist"; _os.makedirs(_d, exist_ok=True)
-        _np.savez_compressed(f"{_d}/step_{step:05d}.npz", hist=_np.asarray(jax.device_get(metrics["expert_hist"])))
-        if step % 20 == 19 and str(config.base_output_directory).startswith("gs://"):
-          _os.system(f"gsutil -q -m rsync -r {_d} {config.base_output_directory}/{config.run_name}/expert_hist/ >/dev/null 2>&1 &")
+        _np.savez_compressed(f"{_d}/step_{step:05d}.npz", hist=_h)
+        if str(config.base_output_directory).startswith("gs://"):
+          # gsutil is absent/broken in the run image; stream straight through TF's GCS
+          # support (same auth path as checkpointing), one object per step.
+          from tensorflow import io as _tfio  # pylint: disable=g-import-not-at-top
+          _b = _io.BytesIO(); _np.savez_compressed(_b, hist=_h)
+          with _tfio.gfile.GFile(
+              f"{config.base_output_directory}/{config.run_name}/expert_hist/step_{step:05d}.npz", "wb") as _f:
+            _f.write(_b.getvalue())
     except Exception as _e:
       max_logging.log(f"expert_hist dump failed at step {step}: {_e}")
     metrics.pop("expert_hist", None)
