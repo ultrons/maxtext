@@ -79,6 +79,16 @@ def _detached_linen_module_stack():
     ctx.module_stack.extend(saved)
 
 
+class ExpertCountsRec(nnx.Variable):
+  """Per-layer expert-histogram recorder slot (non-trainable, carried in train state).
+
+  A REGULAR Variable, deliberately not nnx.Intermediate: the train state excludes
+  Intermediates (they appear only after a forward and would mismatch
+  state_mesh_shardings), so the model merged inside train_step never carries them.
+  A variable pre-declared at init is in the shardings from the start and survives the
+  state round trip -- the Tid2EidVar precedent."""
+
+
 class DeepSeekGenericLayer(nnx.Module):
   """Generic DeepSeek layer with Multi-Head Latent Attention.
 
@@ -105,7 +115,7 @@ class DeepSeekGenericLayer(nnx.Module):
     # of the scanned state and survives to new_state, where the trainer harvests it before
     # the nnx.Not(Intermediate) drop. Cost: one [num_experts] f32 per layer.
     import jax.numpy as _jnp
-    self.expert_counts_rec = nnx.Intermediate(_jnp.zeros((config.num_experts,), _jnp.float32))
+    self.expert_counts_rec = ExpertCountsRec(_jnp.zeros((config.num_experts,), _jnp.float32))
     self.quant = quant
     self.rngs = rngs
     self.is_mhc_enabled = config.mhc_expansion_rate > 1

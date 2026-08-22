@@ -652,9 +652,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     # Harvest them here, before the drop.
     _eh = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "expert_counts_rec")
     if not isinstance(model, nn.Module):
-      _istate = nnx.state(new_state, nnx.Intermediate)
       _eh = _eh + [
-          v for kp, v in jax.tree_util.tree_leaves_with_path(_istate)
+          v for kp, v in jax.tree_util.tree_leaves_with_path(new_state)
           if "expert_counts_rec" in jax.tree_util.keystr(kp) and hasattr(v, "shape")
       ]
     if os.environ.get("EH_DEBUG") == "1" and not isinstance(model, nn.Module):

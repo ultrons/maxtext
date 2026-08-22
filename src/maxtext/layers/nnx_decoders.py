@@ -648,6 +648,11 @@ class NNXDecoder(nnx.Module):
     )
     num_moe = config.num_decoder_layers - config.first_num_dense_layers
     self.moe_layers = self._create_scanned_layers(moe_cls, length=num_moe, metadata_axis_name="moe_layers", rngs=rngs)
+    import os as _os
+    if _os.environ.get("EH_DEBUG") == "1":
+      import sys as _sys
+      _paths = [jax.tree_util.keystr(kp) for kp, _ in jax.tree_util.tree_leaves_with_path(nnx.state(self.moe_layers))]
+      print(f"EH_DEBUG stacked-module has ehrec: {any('expert_counts_rec' in p_ for p_ in _paths)} ({len(_paths)} leaves)", file=_sys.stderr)
 
   def _init_scanned_gemma3(self, decoder_block_classes, rngs, mesh):
     """Initializes scanned Gemma3 layers."""
@@ -962,6 +967,11 @@ class NNXDecoder(nnx.Module):
     policy = self.get_remat_policy()
     prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
     graphdef, params, state = nnx.split(layers, nnx.Param, ...)
+    import os as _os
+    if _os.environ.get("EH_DEBUG") == "1":
+      import sys as _sys
+      _sp = [jax.tree_util.keystr(kp) for kp, _ in jax.tree_util.tree_leaves_with_path(state)]
+      print(f"EH_DEBUG runtime-split state has ehrec: {any('expert_counts_rec' in p_ for p_ in _sp)} ({len(_sp)} leaves)", file=_sys.stderr)
 
     scan_axis = self.config.param_scan_axis
     if scan_axis != 0:
