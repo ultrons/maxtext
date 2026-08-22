@@ -2932,3 +2932,20 @@ Salvage: the CPU mini real-jit harness (deepseek3-671b + override_model_config t
 iteration vehicle that turned cluster-scale mysteries into minutes -- keep using it. Both bias1
 and histconv "Completed" while crashing because the launcher's tee masked exit codes;
 xpk_variant_logsave.sh fixes that for all future runs.
+
+## Chunking thesis CLOSED: slicing deeper loses in both regimes [2026-08-22]
+
+Full matrix, bump image (jax 0.11), 512 chips, same-image within columns:
+| | balanced | real routing |
+|---|---|---|
+| c2 | 4.669 | 7.040 |
+| c4 | (infra; earlier 0.10 result: neutral) | 7.379 (+0.34) |
+| c4 + DENSE_COMPUTE_ON | 5.154 (+0.49) | 7.367 (+0.33) |
+
+The skew-smoother hypothesis is REFUTED: c4 loses MORE under real routing than balanced. GMM
+efficiency loss dominates; scheduler-mediated overlap never materializes (0.10 and 0.11 alike).
+Pinning washes out at c4 (smaller per-chunk comm ops); its -246 ms stands at c2/real only.
+OPERATING POINT: chunk=2. The surviving chunking-shaped idea is STRUCTURAL comm-in-kernel
+overlap (fused-a2a K1/K2, 2.88x on its bench, parked on placement grounds) -- re-price that
+rather than slicing further. Also: the bump toolchain is -0.36 balanced / +0.25-0.39 real vs
+production -- regime-dependent scheduler change, still the top diagnosis target.
