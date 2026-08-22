@@ -650,13 +650,16 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     # Scanned-layer sows are NOT in intermediate_outputs -- they ride new_state (stacked by
     # the scan) and are filtered at the nnx return below (`nnx.Not(nnx.Intermediate)`).
     # Harvest them here, before the drop.
-    _eh = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "moe_bias_updates")
+    _eh = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "expert_counts_rec")
     if not isinstance(model, nn.Module):
       _istate = nnx.state(new_state, nnx.Intermediate)
       _eh = _eh + [
           v for kp, v in jax.tree_util.tree_leaves_with_path(_istate)
-          if "moe_bias_updates" in jax.tree_util.keystr(kp) and hasattr(v, "shape")
+          if "expert_counts_rec" in jax.tree_util.keystr(kp) and hasattr(v, "shape")
       ]
+    if os.environ.get("EH_DEBUG") == "1" and not isinstance(model, nn.Module):
+      _paths = [jax.tree_util.keystr(kp) for kp, _ in jax.tree_util.tree_leaves_with_path(nnx.state(new_state, nnx.Intermediate))]
+      max_logging.log(f"EH_DEBUG intermediate paths in new_state: {_paths[:10]}")
     if _eh:
       metrics["expert_hist"] = jnp.concatenate(
           [jnp.reshape(v, (-1, v.shape[-1])) for v in _eh], axis=0)

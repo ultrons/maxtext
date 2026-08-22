@@ -98,6 +98,13 @@ class DeepSeekGenericLayer(nnx.Module):
     self.config = config
     self.model_mode = model_mode
     self.mesh = mesh
+    if getattr(config, "record_expert_histogram", False):
+      # PRE-DECLARED Intermediate: sows born inside the manual layer scan cannot extend the
+      # ys structure and are silently dropped; a variable declared at init is part of the
+      # scanned state, so per-layer assignment in post_process survives to new_state where
+      # the trainer harvests it before the nnx.Not(Intermediate) drop.
+      import jax.numpy as _jnp
+      self.expert_counts_rec = nnx.Intermediate(_jnp.zeros((config.num_experts,), _jnp.float32))
     self.quant = quant
     self.rngs = rngs
     self.is_mhc_enabled = config.mhc_expansion_rate > 1
@@ -280,10 +287,11 @@ class DeepSeekGenericLayer(nnx.Module):
       self.sow(nnx.Intermediate, "moe_lb_loss", load_balance_loss)
 
     if moe_bias_updates is not None and (
-        (self.config.routed_bias and self.config.routed_bias_update_rate > 0.0)
-        or getattr(self.config, "record_expert_histogram", False)
+        self.config.routed_bias and self.config.routed_bias_update_rate > 0.0
     ):
       self.sow(nnx.Intermediate, "moe_bias_updates", moe_bias_updates)
+    if getattr(self.config, "record_expert_histogram", False) and moe_bias_updates is not None:
+      self.expert_counts_rec.value = moe_bias_updates.astype(jnp.float32)
 
     if getattr(self.config, "record_internal_nn_metrics", False):
       self.sow(nnx.Intermediate, "activation_mean", jnp.mean(layer_output))
