@@ -3025,3 +3025,25 @@ moe_x_sorted=device, rbf=2, chunks=2, pdbs=1, synthetic random routing, steps=25
   and the x_sorted save variant. Probing with r1927tagrs (+moe_ring_combine_rs).
 - Loss 8.23 vs the record's 8.784 on fixed-seed synthetic: post-08-10 fp8-path numerics changes
   (bfdf9dbff review fixes et al.) — expected, not noise.
+
+## PR #4969 opened + moe_ring_combine_rs 512-chip halt + best rbf=-1 [2026-08-22]
+
+- **PR https://github.com/AI-Hypercomputer/maxtext/pull/4969** — incremental on #4895 (base =
+  its head branch test_964807349, so the diff is only ours): moe_ring_cotangent_ag +
+  moe_x_sorted + kernels/ring_ag.py (AG only), ~330 lines. Branch sivaibhav-moe-ring-collectives
+  (worktree /mnt/disks/scratch/maxtext-pr4895-stack, pushed to ultrons fork). AOT gates green on
+  the stacked branch: #4895 recipe + ring flag at pdbs=4 (85.5G), + x_sorted=device at pdbs=1
+  (59.9G); x_sorted=device at pdbs=4 = 185G OOM (batch-scaled, documented in the PR).
+  Gate infra note: upstream tokamax api device-checks jax.devices() and refuses CPU-hosted AOT --
+  gated via an in-container shim on tokamax op.py; upstream legacy-megablox fallback is broken on
+  this config independent of our change (reshape (4,2048,896)); tokamax v1 (no use_gmm_v2) dies in
+  pallas pipeline zip() on AOT -- pin use_gmm_v2=true.
+- **moe_ring_combine_rs HALTS at 512 chips**: r1927tagrs gang-wide silent stall (all workers'
+  last log 15:25-15:26, no step for 50+ min, no crash). First-ever cluster execution of the
+  FORWARD ring RS kernel at this scale; the backward ring AG twin runs clean (r1927tag). Dropped
+  from the PR (flag + kernel trimmed); park with the split-gather 512-chip halts.
+- **Best rbf=-1 on the tokag stack (siv-cn-rbf1a): 4.559 s/step**, clean 25 steps, NO sanitizer,
+  no NaN. Stack = record flags + rbf=-1 + moe_bwd_inkernel_quant(+_dlhs) + fold_wo + bwd e4m3 +
+  MOE_FP8_CT_WIRE=1 + moe_fp8_token_ag. vs rbf=2+tokag 4.160: the rbf=-1 tax is +0.40 on
+  today's code (historical band 0.26-0.63). lm_loss 8.219@19 (rbf=2 arms 8.231 -- different
+  buffer regime, expected).
