@@ -2965,3 +2965,33 @@ bootstrap, drift) is written and waiting. The robust capture is the scan-ys reco
 another print variant. Interim evidence for the imbalance case stands on: 6.7x barrier-stall
 (real vs synthetic), vbal bracket (4.651 balanced-assignment vs 6.87 real-gate), and the
 0.3-vs-80 GB/s same-op collective spread.
+
+## Histogram-based expert rebalance (pi): capture -> analysis -> implementation [2026-08-22]
+
+**Capture finally landed (hcap7).** Root cause of the hcap4/5/6 harvest misses: gsutil in the run
+image silently does nothing (also explains every missed logsave upload). Fix: the dump streams each
+step's npz straight to GCS via tf.io.gfile (checkpointing's auth path) -- commit 1d828643f, image
+splitag22. hcap6 crashed on a recipe slip (mlperf tfds is pre-tokenized: needs
+train_data_columns=ids + tokenize_train_data=false); hcap7 = 25 steps trained-gate real-c4, all 25
+npz delivered.
+
+**Analysis (25 steps x 58 MoE layers x 256 experts, 131072 tokensxtopk/layer/step sampled):**
+- today (contiguous groups of 32 = rank): max/mean rank load **2.004** mean over layers, worst 3.09
+- capacity-constrained LPT (exactly 32 experts/rank): **1.004** on the mean load (worst 1.018)
+- static early-pi (steps 0-3) applied to later k-step batches: 1.096 (k=1) improving to 1.069
+  (k=16) -- a pi inferred early HOLDS and gets better at larger effective GBS, pdbs unchanged
+- static-pi per-step: mean 1.060, p95 1.127, max 1.358; drift corr early/late quartile 0.909
+Answers the standing questions: yes there is a much better assignment (2.0x -> 1.06x expected
+hot-rank load), and yes it transfers to larger GBS.
+
+**Implementation (commit d67e4df86, image splitag23):** flag `expert_assignment_path` (npz with
+perm_scan/invperm_scan [58,256], gs://sivaibhav-exp/1410-a2a/hcap7-pi-full.npz).
+Selection stays in ORIGINAL expert space (grouped-routing semantics untouched); get_topk remaps
+dispatch indices to slots via per-layer ExpertPermVar; post-restore hook permutes routed
+wi_0/wi_1/wo (+ adamw mu/nu) along expert axis. Scanned stacking is [E, n_scan, ...] (params scan
+axis 1); perm variables are [n_scan, E]. Saved-indices replay inverts to original space before the
+weight take_along_axis. Recorder now records SLOT space under pi -- on-cluster balance verification
+for free. CPU mini gate: random nontrivial pi == identity to ALL printed loss digits, 3 steps.
+
+**A/B in flight:** hbal0 (baseline, record on) vs hbal1 (+pi), both splitag23, steps=25,
+trained-gate real-c4 seed 1234. Judge: step time, lm_loss parity, slot-space histogram balance.
