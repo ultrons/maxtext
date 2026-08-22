@@ -3564,6 +3564,8 @@ class RoutedMoE(nnx.Module):
           pre_bias_logits, ("activation_batch_moe", "activation_length_moe", None)
       )
     top_k_weights, top_k_indices = self.get_topk(gate_logits, pre_bias_logits, self.rngs, input_ids=input_ids)
+    if os.environ.get("EXPERT_HIST_PRINT") == "1":
+      jax.debug.print("EXPERT_HIST {}", jnp.bincount(top_k_indices.ravel(), length=self.config.num_experts))
     is_llama4_decoder_layer = self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4
     if is_llama4_decoder_layer:
       router_scores = jax.nn.sigmoid(top_k_weights.astype(jnp.float32)).astype(self.dtype)
