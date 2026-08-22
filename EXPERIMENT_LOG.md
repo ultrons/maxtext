@@ -2949,3 +2949,19 @@ OPERATING POINT: chunk=2. The surviving chunking-shaped idea is STRUCTURAL comm-
 overlap (fused-a2a K1/K2, 2.88x on its bench, parked on placement grounds) -- re-price that
 rather than slicing further. Also: the bump toolchain is -0.36 balanced / +0.25-0.39 real vs
 production -- regime-dependent scheduler change, still the top diagnosis target.
+
+## Expert-histogram capture: NOT yet obtained; debug-print path crashes at scale [2026-08-22]
+
+Direct answer to "did we capture the imbalance histogram": NO — three cluster attempts failed
+(phantom config flag; the steps<profiler-window trap AGAIN; then a hard native crash at 512
+chips, most plausibly the jax.debug.print host callback flood: 61 layers x [256] prints x remat
+duplication x 128 processes — the 8-device CPU mini that validated the mechanism cannot see
+that regime). kubectl retained only the faulthandler footer, and the logsave gsutil upload
+failed inside the container (needs auth check — separate bug).
+
+STATUS: the assignment-headroom question remains DATA-BLOCKED. Analysis (LPT/pi, GBS
+bootstrap, drift) is written and waiting. The robust capture is the scan-ys recorder
+(explicit lax.scan outputs through nnx_decoders) — that design is the prerequisite, not
+another print variant. Interim evidence for the imbalance case stands on: 6.7x barrier-stall
+(real vs synthetic), vbal bracket (4.651 balanced-assignment vs 6.87 real-gate), and the
+0.3-vs-80 GB/s same-op collective spread.
