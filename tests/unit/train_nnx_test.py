@@ -678,11 +678,22 @@ class TestTrainingLoopIterationEvalRetry(unittest.TestCase):
   _PRIMARY_LOSS = 999.0
   _DROPLESS_LOSS = -1.0
 
-  def _run(self, retry_when_tokens_dropped, has_overflow, with_dropless):
-    """Runs training_loop_iteration with fake step fns and returns (eval loss used, dropless call count)."""
+  def _run(self, retry_when_tokens_dropped, has_overflow, with_dropless, retry_dropless_first_steps=0, train_calls=None):
+    """Runs training_loop_iteration with fake step fns and returns (eval loss used, dropless call count).
+
+    When train_calls is a list, a fake p_train_step_dropless is provided and each train step call appends
+    "normal" or "dropless" to it.
+    """
 
     def p_train_step(state, batch, *rng_args):
       del batch, rng_args
+      if train_calls is not None:
+        train_calls.append("normal")
+      return state, {"scalar": {}, "scalars": {}}
+
+    def p_train_step_dropless(state, batch, *rng_args):
+      del batch, rng_args
+      train_calls.append("dropless")
       return state, {"scalar": {}, "scalars": {}}
 
     def p_eval_step(state, batch, *rng_args):
@@ -704,6 +715,7 @@ class TestTrainingLoopIterationEvalRetry(unittest.TestCase):
         elastic_enabled=False,
         enable_diloco=False,
         retry_when_tokens_dropped=retry_when_tokens_dropped,
+        retry_dropless_first_steps=retry_dropless_first_steps,
         logical_axis_rules_for_eval=(),
     )
     metric_logger_instance = mock.MagicMock()
@@ -715,7 +727,7 @@ class TestTrainingLoopIterationEvalRetry(unittest.TestCase):
         "init_rng": None,
         "mesh": mesh,
         "p_train_step": p_train_step,
-        "p_train_step_dropless": None,
+        "p_train_step_dropless": p_train_step_dropless if train_calls is not None else None,
         "p_eval_step": p_eval_step,
         "p_eval_step_dropless": p_eval_step_dropless if with_dropless else None,
     }
@@ -775,6 +787,31 @@ class TestTrainingLoopIterationEvalRetry(unittest.TestCase):
     used_loss, dropless_call_count = self._run(retry_when_tokens_dropped=False, has_overflow=True, with_dropless=True)
     self.assertEqual(used_loss, self._PRIMARY_LOSS)
     self.assertEqual(dropless_call_count, 0)
+
+  def test_first_steps_run_dropless_train_program(self):
+    # step 0, start_step -1: step - start_step = 1 < retry_dropless_first_steps = 2.
+    train_calls = []
+    self._run(
+        retry_when_tokens_dropped=True,
+        has_overflow=False,
+        with_dropless=True,
+        retry_dropless_first_steps=2,
+        train_calls=train_calls,
+    )
+    self.assertEqual(train_calls, ["dropless"])
+
+  def test_steps_after_first_phase_attempt_normal_train_program(self):
+    # step - start_step = 1 is not < retry_dropless_first_steps = 1, so the normal program runs and the
+    # overflow-free step is kept without a replay.
+    train_calls = []
+    self._run(
+        retry_when_tokens_dropped=True,
+        has_overflow=False,
+        with_dropless=True,
+        retry_dropless_first_steps=1,
+        train_calls=train_calls,
+    )
+    self.assertEqual(train_calls, ["normal"])
 
 
 if __name__ == "__main__":

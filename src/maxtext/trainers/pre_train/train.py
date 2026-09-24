@@ -719,7 +719,16 @@ def training_loop_iteration(
       step_rng_args = ()
     with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
       with jax.set_mesh(mesh), logical_axis_rules(logical_axis_rules_for_train):
-        if config.retry_when_tokens_dropped and p_train_step_dropless is not None:
+        if (
+            config.retry_dropless_first_steps > 0
+            and step - start_step < config.retry_dropless_first_steps
+            and p_train_step_dropless is not None
+        ):
+          # First-phase schedule: the steps right after (re)start overflow the ragged buffer most often,
+          # so run them directly with the dropless program instead of attempt + discard + replay.
+          max_logging.log(f"Step {step}: dropless first-phase program")
+          state, metrics = p_train_step_dropless(state, example_batch, *step_rng_args)
+        elif config.retry_when_tokens_dropped and p_train_step_dropless is not None:
           candidate_state, metrics = p_train_step(state, example_batch, *step_rng_args)
           if bool(metrics.get("has_moe_overflow")):
             max_logging.log(
@@ -820,6 +829,46 @@ def training_loop_iteration(
   return metrics
 
 
+def build_dropless_graphdef(config, jit_model, state):
+  """Graphdef of the dropless retry program: RoutedMoE force_dropless + token chunks + barrier, decoder full remat."""
+  reconstructed = nnx.merge(jit_model, state)
+  for _, module in nnx.iter_graph(reconstructed):
+    if type(module).__name__ == "RoutedMoE":
+      module.force_dropless = True
+      module.num_moe_token_chunks = getattr(config, "retry_num_moe_token_chunks", 2)
+      module.moe_chunk_barrier = True
+    elif hasattr(module, "get_remat_policy"):  # NNXDecoder; the old "Decoder" name matched nothing
+      module.remat_policy_override = "full"
+  jit_model_dropless, _ = nnx.split(reconstructed)
+  del reconstructed, _
+  gc.collect()
+  return jit_model_dropless
+
+
+def build_eval_graphdef(config, jit_model, state):
+  """Graphdef for the eval program with config.eval_ragged_buffer_factor on RoutedMoE; None when unset (-1)."""
+  if config.eval_ragged_buffer_factor <= 0:
+    return None
+  reconstructed = nnx.merge(jit_model, state)
+  n_moe = 0
+  for _, module in nnx.iter_graph(reconstructed):
+    if type(module).__name__ == "RoutedMoE":
+      module.ragged_buffer_factor_override = float(config.eval_ragged_buffer_factor)
+      n_moe += 1
+  max_logging.log(f"eval graphdef: ragged_buffer_factor_override={config.eval_ragged_buffer_factor} on {n_moe} RoutedMoE")
+  jit_model_eval, _ = nnx.split(reconstructed)
+  del reconstructed, _
+  gc.collect()
+  return jit_model_eval
+
+
+def aot_compile_step(p_step, lower_args, compiler_options, prefix):
+  """Lowers and compiles p_step ahead of time (warms the executable cache) and prints its memory stats."""
+  compiled = p_step.lower(*lower_args).compile(compiler_options=compiler_options)
+  max_utils.print_compiled_memory_stats(compiled.memory_analysis(), prefix=prefix)
+  return compiled
+
+
 def train_loop(config, recorder, state=None):
   """Main Training loop."""
   (
@@ -844,6 +893,7 @@ def train_loop(config, recorder, state=None):
   train_utils.validate_completed_steps(start_step, config.steps)
 
   jit_model_dropless = None
+  jit_model_eval = None
 
   if config.enable_diloco:
     # state is the DiLoCoTrainState; `model` is already the TrainStateNNX graphdef the inner step needs.
@@ -851,17 +901,8 @@ def train_loop(config, recorder, state=None):
   else:
     jit_model, state = nnx.split(state)
     if config.retry_when_tokens_dropped:
-      reconstructed = nnx.merge(jit_model, state)
-      for _, module in nnx.iter_graph(reconstructed):
-        if type(module).__name__ == "RoutedMoE":
-          module.force_dropless = True
-          module.num_moe_token_chunks = getattr(config, "retry_num_moe_token_chunks", 2)
-          module.moe_chunk_barrier = True
-        elif type(module).__name__ == "Decoder":
-          module.remat_policy_override = "full"
-      jit_model_dropless, _ = nnx.split(reconstructed)
-      del reconstructed, _
-      gc.collect()
+      jit_model_dropless = build_dropless_graphdef(config, jit_model, state)
+    jit_model_eval = build_eval_graphdef(config, jit_model, state)
 
   if config.enable_diloco:
     # DiLoCoTrainState.params already holds the param shardings the inner step needs;
@@ -881,6 +922,16 @@ def train_loop(config, recorder, state=None):
       eval_data_iterator,
       params_shardings,
   )
+
+  if jit_model_eval is not None and p_eval_step is not None:
+    # eval_ragged_buffer_factor > 0: the eval program uses its own graphdef (RoutedMoE buffer factor override).
+    p_eval_step = train_utils.jit_eval_step(
+        config,
+        jit_model_eval,
+        state_mesh_shardings,
+        sharding.get_input_data_sharding(config, mesh, rules=config.logical_axis_rules_for_eval),
+        eval_step,
+    )
 
   p_train_step_dropless = None
   p_eval_step_dropless = None
@@ -922,6 +973,9 @@ def train_loop(config, recorder, state=None):
       compiled = p_train_step.lower(*lower_args).compile(compiler_options=compiler_options)
       compiled_stats = compiled.memory_analysis()
       max_utils.print_compiled_memory_stats(compiled_stats, prefix="train")
+      if p_train_step_dropless is not None:
+        # Precompile the dropless retry program here so no compile happens inside the timed loop.
+        aot_compile_step(p_train_step_dropless, lower_args, compiler_options, prefix="train_dropless")
 
   # Ahead-of-time compile the evaluation step alongside the training step to
   # warm up the XLA executable cache and avoid JIT compilation pause on the
@@ -938,6 +992,8 @@ def train_loop(config, recorder, state=None):
       compiled_eval = p_eval_step.lower(*eval_lower_args).compile(compiler_options=compiler_options)
       compiled_eval_stats = compiled_eval.memory_analysis()
       max_utils.print_compiled_memory_stats(compiled_eval_stats, prefix="eval")
+      if p_eval_step_dropless is not None:
+        aot_compile_step(p_eval_step_dropless, eval_lower_args, compiler_options, prefix="eval_dropless")
   prof = profiler.Profiler(config, offset_step=start_step)
   metric_logger_instance = metric_logger.MetricLogger(
       config=config, learning_rate_schedule=learning_rate_schedule, start_step=start_step

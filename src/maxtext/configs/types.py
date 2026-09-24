@@ -1007,6 +1007,21 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to discard candidate state and replay the step with a dropless buffer if tokens are dropped.",
   )
+  retry_dropless_first_steps: int = Field(
+      0,
+      description=(
+          "With retry_when_tokens_dropped=True, run the first N steps after the loop's start step (i.e. steps with "
+          "step - start_step < N; equal to step < N when training starts at step 0) directly with the dropless "
+          "program, skipping the attempt with the normal program. 0 = off."
+      ),
+  )
+  eval_ragged_buffer_factor: float = Field(
+      -1.0,
+      description=(
+          "Ragged buffer factor for the eval program's RoutedMoE modules. -1 = same as ragged_buffer_factor; "
+          "> 0 overrides it for eval only."
+      ),
+  )
   num_moe_token_chunks: PositiveInt = Field(
       1,
       description=(
@@ -3623,6 +3638,17 @@ class MaxTextConfig(
       if self.num_moe_emb_chunks > 0:
         raise ValueError("retry_when_tokens_dropped=True does not support num_moe_emb_chunks > 0.")
 
+  def validate_retry_dropless_first_steps_and_eval_buffer(self):
+    """Validates retry_dropless_first_steps and eval_ragged_buffer_factor."""
+    if self.retry_dropless_first_steps < 0:
+      raise ValueError(f"retry_dropless_first_steps must be >= 0 (got {self.retry_dropless_first_steps}).")
+    if self.retry_dropless_first_steps > 0 and not self.retry_when_tokens_dropped:
+      raise ValueError("retry_dropless_first_steps > 0 requires retry_when_tokens_dropped=True.")
+    if not (self.eval_ragged_buffer_factor == -1 or self.eval_ragged_buffer_factor > 0):
+      raise ValueError(f"eval_ragged_buffer_factor must be -1 or > 0 (got {self.eval_ragged_buffer_factor}).")
+    if self.eval_ragged_buffer_factor > 0 and self.te_moe_block:
+      raise ValueError("eval_ragged_buffer_factor > 0 is not supported with te_moe_block=True.")
+
   def validate_ragged_buffer_factor(self):
     """Validates that ragged_buffer_factor is used with supported settings."""
     if self.te_moe_block:
@@ -4729,6 +4755,7 @@ class MaxTextConfig(
     self.validate_num_moe_emb_chunks()
     self.validate_moe_quantize_token_all_gather()
     self.validate_mllog()
+    self.validate_retry_dropless_first_steps_and_eval_buffer()
 
     if self.enable_streaming_diloco:
       if not self.scan_layers:
