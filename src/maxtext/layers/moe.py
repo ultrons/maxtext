@@ -205,20 +205,29 @@ def dequantize_rows_fp8(qvalue: jax.Array, scale: jax.Array, dtype) -> jax.Array
   return (qvalue.astype(jnp.float32) * scale).astype(dtype)
 
 
-def ep_combine_reduce_scatter(x: jax.Array, axis_name, all_gather_fn=None, bwd_qtype=None) -> jax.Array:
+def ep_combine_reduce_scatter(
+    x: jax.Array, axis_name, all_gather_fn=None, bwd_qtype=None, fwd_qtype=None, all_to_all_fn=None
+) -> jax.Array:
   """Ring-of-experts combine: sums the per-shard partial outputs over the EP axis and scatters them.
 
-  With `bwd_qtype` set, the forward (bf16 reduce-scatter) is unchanged, but the backward -- the
-  all-gather of the output cotangent to every expert shard -- carries an fp8 payload with a per-row
-  f32 scale gathered alongside, and is dequantized back to the cotangent dtype after the gather.
-  This is a precision change of the gradient (the expert GMM backward re-quantizes it to its own
-  bwd_qtype after the router-weight multiply), not a bitwise-identical transform.
+  With `bwd_qtype` set, the backward -- the all-gather of the output cotangent to every expert
+  shard -- carries an fp8 payload with a per-row f32 scale gathered alongside, and is dequantized
+  back to the cotangent dtype after the gather. This is a precision change of the gradient (the
+  expert GMM backward re-quantizes it to its own bwd_qtype after the router-weight multiply), not a
+  bitwise-identical transform.
+
+  With `fwd_qtype` set, the forward replaces the bf16 reduce-scatter by an fp8 all-to-all: each
+  shard quantizes its partial sums per row (f32 row scale), sends the slice destined for shard j to
+  shard j, and the receiver dequantizes the n slices and sums them in f32 before casting back. This
+  changes the forward activations (one fp8 rounding per expert-shard contribution). The backward
+  treats the quantization as identity (straight-through): it is the all-gather of the cotangent,
+  as for the reduce-scatter.
   """
 
   def _rs(z):
     return jax.lax.psum_scatter(z, axis_name, scatter_dimension=0, tiled=True)
 
-  if bwd_qtype is None:
+  if bwd_qtype is None and fwd_qtype is None:
     return _rs(x)
 
   def _ag(z):
@@ -226,14 +235,32 @@ def ep_combine_reduce_scatter(x: jax.Array, axis_name, all_gather_fn=None, bwd_q
       return all_gather_fn(z)
     return jax.lax.all_gather(z, axis_name=axis_name, tiled=True)
 
+  def _a2a(z):
+    if all_to_all_fn is not None:
+      return all_to_all_fn(z)
+    return jax.lax.all_to_all(z, axis_name, split_axis=0, concat_axis=0, tiled=True)
+
+  def _fp8_a2a_sum(z):
+    n = jax.lax.axis_size(axis_name)
+    qvalue, scale = quantize_rows_fp8(z, fwd_qtype)
+    parts = _a2a(qvalue).astype(jnp.float32) * _a2a(scale)
+    parts = parts.reshape((n, z.shape[0] // n) + z.shape[1:])
+    return jnp.sum(parts, axis=0).astype(z.dtype)
+
+  def _forward(z):
+    return _rs(z) if fwd_qtype is None else _fp8_a2a_sum(z)
+
   @jax.custom_vjp
   def _combine(z):
-    return _rs(z)
+    return _forward(z)
 
   def _combine_fwd(z):
-    return _rs(z), None
+    return _forward(z), None
 
   def _combine_bwd(_, g):
+    if bwd_qtype is None:
+      # Same as the transpose of the reduce-scatter (an unpinned tiled all-gather).
+      return (jax.lax.all_gather(g, axis_name=axis_name, tiled=True),)
     qvalue, scale = quantize_rows_fp8(g, bwd_qtype)
     return (dequantize_rows_fp8(_ag(qvalue), _ag(scale), g.dtype),)
 
@@ -1016,6 +1043,22 @@ class RoutedMoE(nnx.Module):
         return jax.lax.all_gather(z, axis_name=axis_name, tiled=True)
 
     return _ep_all_gather
+
+  def _ep_all_to_all_fn(self):
+    """Tiled EP all-to-all (split and concat on dim 0); SparseCore-pinned if moe_fp8_combine_pin_sparse_core."""
+    axis_name = self._expert_parallelism_name
+
+    def _a2a(z):
+      return jax.lax.all_to_all(z, axis_name, split_axis=0, concat_axis=0, tiled=True)
+
+    if self.config.moe_fp8_combine_pin_sparse_core:
+      return functools.partial(
+          compute_on,
+          compute_type="tpu_sparsecore",
+          out_memory_spaces=jax.memory.Space.Device,
+          compiler_options={"sparse_core_config": {"core_ids": [self.config.moe_ep_all_gather_sparse_core_id]}},
+      )(_a2a)
+    return _a2a
 
   def get_expert_parallelism_size(self):
     # When expert parallelism has more than one physical axes, take product of their shapes
@@ -2829,6 +2872,8 @@ class RoutedMoE(nnx.Module):
             self._expert_parallelism_name,
             all_gather_fn=self._ep_all_gather_fn(),
             bwd_qtype=jnp.dtype(self.config.moe_fp8_bwd_dispatch_qtype) if self.config.moe_fp8_bwd_dispatch else None,
+            fwd_qtype=jnp.dtype(jnp.float8_e4m3fn) if self.config.moe_fp8_combine else None,
+            all_to_all_fn=self._ep_all_to_all_fn(),
         )
         return output, routing.lb_loss, routing.bias_updates, routing.has_overflow, routing.required_rbf
 

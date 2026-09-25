@@ -2322,6 +2322,47 @@ class Fp8CommsTest(parameterized.TestCase):
     expected = moe.dequantize_rows_fp8(qvalue, scale, cot.dtype)
     np.testing.assert_array_equal(np.asarray(g_q, np.float32), np.tile(np.asarray(expected, np.float32), (n, 1, 1)))
 
+  @parameterized.named_parameters(("bf16_bwd", None), ("fp8_bwd", "float8_e4m3fn"))
+  def test_ep_combine_fp8_all_to_all_forward(self, bwd_qtype_name):
+    """moe_fp8_combine: forward = f32 sum of the per-row fp8 round trip of each shard's contribution."""
+    mesh = self._ep_mesh()
+    n = mesh.shape["expert"]
+    bwd_qtype = None if bwd_qtype_name is None else jnp.dtype(bwd_qtype_name)
+    x = jax.random.normal(jax.random.PRNGKey(6), (n * n * 2, 8, 64), jnp.float32).astype(jnp.bfloat16)
+    cot = jax.random.normal(jax.random.PRNGKey(7), (n * 2, 8, 64), jnp.float32).astype(jnp.bfloat16)
+
+    def make(fwd_qtype, bq):
+      def body(z):
+        return moe.ep_combine_reduce_scatter(z, "expert", bwd_qtype=bq, fwd_qtype=fwd_qtype)
+
+      f = jax.shard_map(body, mesh=mesh, in_specs=P("expert"), out_specs=P("expert"), check_vma=False)
+      return jax.jit(lambda z: jax.vjp(f, z))
+
+    out_ref, vjp_ref = make(None, None)(x)
+    out_q, vjp_q = make(jnp.float8_e4m3fn, bwd_qtype)(x)
+
+    # Expected: source shard i's rows for destination j, per-row fp8 round trip, summed over i in f32.
+    qvalue, scale = moe.quantize_rows_fp8(x, jnp.float8_e4m3fn)
+    dq = (qvalue.astype(jnp.float32) * scale).reshape((n, n * 2) + x.shape[1:])
+    expected = jnp.concatenate([jnp.sum(dq[:, j * 2 : (j + 1) * 2], axis=0) for j in range(n)]).astype(jnp.bfloat16)
+    np.testing.assert_allclose(np.asarray(out_q, np.float32), np.asarray(expected, np.float32), rtol=2**-7, atol=1e-6)
+    # And it is an fp8-sized perturbation of the bf16 reduce-scatter.
+    ref = np.asarray(out_ref, np.float32)
+    rel = np.linalg.norm(np.asarray(out_q, np.float32) - ref) / np.linalg.norm(ref)
+    self.assertLess(rel, 2**-4)
+    if n > 1:
+      self.assertGreater(rel, 0.0)
+
+    (g_ref,) = vjp_ref(cot)
+    (g_q,) = vjp_q(cot)
+    if bwd_qtype is None:
+      # Straight-through backward: exactly the reduce-scatter's transpose.
+      np.testing.assert_array_equal(np.asarray(g_q, np.float32), np.asarray(g_ref, np.float32))
+    else:
+      qv, sc = moe.quantize_rows_fp8(cot, bwd_qtype)
+      exp_g = moe.dequantize_rows_fp8(qv, sc, cot.dtype)
+      np.testing.assert_array_equal(np.asarray(g_q, np.float32), np.tile(np.asarray(exp_g, np.float32), (n, 1, 1)))
+
 
 class GetEinsumTest(parameterized.TestCase):
   """Tests for the quantized einsums RoutedMoE.get_einsum hands to dense_matmul."""
