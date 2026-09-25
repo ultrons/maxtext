@@ -108,6 +108,9 @@ class RouteOutput:
   # log_required_ragged_buffer_factor probe: minimum ragged_buffer_factor that would have avoided drops, max over
   # the mesh (float32 scalar). None when the probe is off.
   required_rbf: Optional[jax.Array] = None
+  # ragged_unsort_reuse_argsort: the forward ring_ragged_sort permutation, handed to ring_ragged_unsort so its
+  # backward does not recompute it by argsort. None when the flag is off.
+  sorted_argsort_indices: Optional[jax.Array] = None
 
 
 def _truncate_matrix(all_shards_group_sizes: jax.Array, buffer_size: int) -> jax.Array:
@@ -220,6 +223,25 @@ def _take_along_last_axis_dense_vjp_bwd(num_classes, indices, g):
 
 
 take_along_last_axis_dense_vjp.defvjp(_take_along_last_axis_dense_vjp_fwd, _take_along_last_axis_dense_vjp_bwd)
+
+
+def top_k_indices_by_argmax(x: jax.Array, k: int) -> jax.Array:
+  """Indices of `jax.lax.top_k(x, k)` along the last axis, from k masked argmax passes.
+
+  On the TPU, `top_k` over a 256-wide axis lowers to a full sort of the axis; k argmax reductions over the same axis
+  are fusible elementwise work (the `_top_2_in_group_sum` idea extended to k). Each pass takes the lowest index among
+  the current maxima, then masks exactly that lane, so equal values come out lowest index first, as `top_k` orders
+  them. Requires at least k entries per row that are not -inf and no NaNs (true for DeepSeek routing, where the group
+  mask leaves topk_routing_group * experts_per_group >= k finite scores).
+  """
+  lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, x.ndim - 1)
+  neg_inf = jnp.array(-jnp.inf, dtype=x.dtype)
+  picked = []
+  for _ in range(k):
+    idx = jnp.argmax(x, axis=-1).astype(jnp.int32)
+    picked.append(idx)
+    x = jnp.where(lane == idx[..., None], neg_inf, x)
+  return jnp.stack(picked, axis=-1)
 
 
 def get_batchsplit_init_kernel_axes():
@@ -1152,11 +1174,12 @@ class RoutedMoE(nnx.Module):
         identifying the selected experts for each token.
     """
     expert_mask = 1 if self.config.n_routing_groups == -1 else self.expert_group_mask(gate_logits)
-    _, top_k_indices = jax.lax.top_k(
-        jnp.where(expert_mask > 0, gate_logits, -jnp.inf),
-        k=self.num_experts_per_tok,
-    )
-    if self.config.router_topk_matmul_vjp:
+    masked_logits = jnp.where(expert_mask > 0, gate_logits, -jnp.inf)
+    if getattr(self.config, "router_topk_argmax", False):
+      top_k_indices = top_k_indices_by_argmax(masked_logits, self.num_experts_per_tok)
+    else:
+      _, top_k_indices = jax.lax.top_k(masked_logits, k=self.num_experts_per_tok)
+    if getattr(self.config, "router_topk_matmul_vjp", False):
       top_k_weights = take_along_last_axis_dense_vjp(pre_bias_logits, top_k_indices, pre_bias_logits.shape[-1])
     else:
       top_k_weights = jnp.take_along_axis(pre_bias_logits, top_k_indices, axis=-1)
@@ -1205,8 +1228,13 @@ class RoutedMoE(nnx.Module):
       forced_routed_experts=None,
       force_dropless=False,
       mesh_axis_names=None,
+      return_sort_indices=False,
   ):
-    """Permute tokens to group by expert to fit gmm call."""
+    """Permute tokens to group by expert to fit gmm call.
+
+    With `return_sort_indices=True` a tenth output is appended: the forward ring_ragged_sort permutation when the
+    ragged ring path runs and `ragged_unsort_reuse_argsort` is set, else None.
+    """
     is_qarray = isinstance(inputs, qpl.QArray)
     raw_inputs = inputs.qvalue if is_qarray else inputs
     # reshape inputs (batch, sequence, emb) to (batch * sequence, emb)
@@ -1271,7 +1299,8 @@ class RoutedMoE(nnx.Module):
       else:
         buffer_size = None
 
-      sorted_inputs, group_size, sorted_selected_experts = ring_ragged_sort(
+      reuse_argsort = return_sort_indices and getattr(self.config, "ragged_unsort_reuse_argsort", False)
+      sort_out = ring_ragged_sort(
           inputs_2d,
           topk_indices_2d,
           self.config.num_experts,
@@ -1286,8 +1315,12 @@ class RoutedMoE(nnx.Module):
           gather_bytes_accessed_override=self.config.ragged_gather_cost_estimate_bytes_accessed,
           gather_reduce_bytes_accessed_override=self.config.ragged_gather_reduce_cost_estimate_bytes_accessed,
           use_single_sparsecore=self.config.ragged_sort_use_single_sparsecore,
+          return_argsort_indices=reuse_argsort,
       )
+      sorted_inputs, group_size, sorted_selected_experts = sort_out[:3]
+      sorted_argsort_indices = sort_out[3] if reuse_argsort else None
     else:
+      sorted_argsort_indices = None
       flatten_selected_experts = jnp.ravel(selected_experts)
 
       # Must precede roll_to_expert_id: `(-1 - roll) % num_experts` wraps padding
@@ -1360,7 +1393,7 @@ class RoutedMoE(nnx.Module):
     if is_qarray:
       sorted_inputs = dataclasses.replace(inputs, qvalue=sorted_inputs)
 
-    return (
+    outputs = (
         sorted_inputs,
         sorted_selected_experts,
         weights,
@@ -1371,6 +1404,9 @@ class RoutedMoE(nnx.Module):
         local_group_size,
         has_overflow,
     )
+    if return_sort_indices:
+      outputs = outputs + (sorted_argsort_indices,)
+    return outputs
 
   def unpermute(
       self,
@@ -1381,6 +1417,7 @@ class RoutedMoE(nnx.Module):
       sequence_length,
       use_custom_sort_vjp=True,
       group_sizes=None,
+      sorted_argsort_indices=None,
   ):
     """Unpermute tokens to original order and combine weights."""
 
@@ -1405,6 +1442,7 @@ class RoutedMoE(nnx.Module):
           gather_bytes_accessed_override=self.config.ragged_gather_cost_estimate_bytes_accessed,
           gather_reduce_bytes_accessed_override=self.config.ragged_gather_reduce_cost_estimate_bytes_accessed,
           use_single_sparsecore=self.config.ragged_sort_use_single_sparsecore,
+          topk_argsort_indices=sorted_argsort_indices,
       )
     else:
       unsort_intermediate = _sort_activations(
@@ -2205,6 +2243,7 @@ class RoutedMoE(nnx.Module):
           bias_updates,
           local_group_sizes,
           has_overflow,
+          sorted_argsort_indices,
       ) = self.permute(
           x,
           logits,
@@ -2216,6 +2255,7 @@ class RoutedMoE(nnx.Module):
           forced_routed_experts=forced_routed_experts,
           force_dropless=force_dropless,
           mesh_axis_names=roe_bias_axis_names,
+          return_sort_indices=True,
       )
       required_rbf = None
       if getattr(self.config, "log_required_ragged_buffer_factor", False):
@@ -2234,6 +2274,7 @@ class RoutedMoE(nnx.Module):
               local_group_sizes=local_group_sizes,
               has_overflow=has_overflow,
               required_rbf=required_rbf,
+              sorted_argsort_indices=sorted_argsort_indices,
           ),
           RouteMetadata(
               expert_shard_id=expert_shard_id,
@@ -2790,6 +2831,7 @@ class RoutedMoE(nnx.Module):
             sequence_length=sequence_length,
             use_custom_sort_vjp=self.config.use_custom_sort_vjp,
             group_sizes=routing.group_sizes,
+            sorted_argsort_indices=routing.sorted_argsort_indices,
         )
 
         # Sum up the partial outputs across the expert shards.
@@ -2837,6 +2879,7 @@ class RoutedMoE(nnx.Module):
           sequence_length=sequence_length,
           use_custom_sort_vjp=self.config.use_custom_sort_vjp,
           group_sizes=routing.group_sizes,
+          sorted_argsort_indices=routing.sorted_argsort_indices,
       )
 
       return output, routing.lb_loss, routing.bias_updates, routing.has_overflow, routing.required_rbf

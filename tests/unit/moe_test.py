@@ -376,6 +376,7 @@ class DeepSeekRoutingTest(unittest.TestCase):
         base_moe_mlp_dim=1024,
         base_mlp_dim=1024,
         router_topk_matmul_vjp=True,
+        router_topk_argmax=True,
     )
     model = moe.RoutedMoE(
         config=cfg,
@@ -403,6 +404,79 @@ class DeepSeekRoutingTest(unittest.TestCase):
         np.asarray(jax.grad(loss)(pre_bias_logits, self.model)),
         np.asarray(jax.grad(loss)(pre_bias_logits, model)),
     )
+
+  def test_top_k_indices_by_argmax_matches_top_k(self):
+    k = 8
+    rng = np.random.default_rng(0)
+    random_rows = rng.standard_normal((64, 256)).astype(np.float32)
+    # Ties: few distinct values per row, bf16-rounded rows, a constant row, and -inf masking of half the lanes.
+    few_values = rng.integers(0, 4, size=(64, 256)).astype(np.float32)
+    bf16_rows = random_rows.astype(ml_dtypes.bfloat16).astype(np.float32) * 1e-3
+    constant_row = np.full((1, 256), 0.5, np.float32)
+    masked = np.where(rng.random((64, 256)) < 0.5, -np.inf, few_values).astype(np.float32)
+    masked[:, :k] = 1.0  # keep at least k finite, tied entries per row
+    for name, rows in (
+        ("random", random_rows),
+        ("few_values", few_values),
+        ("bf16", bf16_rows),
+        ("constant", constant_row),
+        ("masked", masked),
+    ):
+      for dtype in (jnp.float32, jnp.bfloat16):
+        x = jnp.asarray(rows, dtype)
+        _, expected = jax.lax.top_k(x, k)
+        actual = moe.top_k_indices_by_argmax(x, k)
+        np.testing.assert_array_equal(np.asarray(expected), np.asarray(actual), err_msg=f"{name} {dtype}")
+
+  def test_ring_ragged_unsort_reuse_argsort_matches(self):
+    # pylint: disable=import-outside-toplevel
+    from maxtext.kernels.ragged.ragged_sort import ring_ragged_sort, ring_ragged_unsort
+
+    tokens, hidden, num_experts, topk = 64, 256, 16, 4
+    ep = 2 if jax.device_count() >= 2 else 1
+    mesh = Mesh(np.array(jax.devices()[:ep]), ("expert",))
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.standard_normal((tokens, hidden)), jnp.bfloat16)
+    idx = jnp.asarray(np.stack([rng.choice(num_experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens * topk,)), jnp.float32)
+    ct = jnp.asarray(rng.standard_normal((tokens * ep, hidden)), jnp.float32)
+
+    def make_loss(reuse, buffer_size):
+      def body(x, idx, w):
+        out = ring_ragged_sort(
+            x,
+            idx,
+            num_experts,
+            topk,
+            "expert",
+            ep,
+            buffer_size=buffer_size,
+            enforce_gather_fallback=True,
+            enforce_gather_reduce_fallback=True,
+            return_argsort_indices=reuse,
+        )
+        sorted_x, group_sizes, revert = out[:3]
+        return ring_ragged_unsort(
+            sorted_x * 1.5,
+            group_sizes,
+            revert,
+            topk,
+            num_experts // ep,
+            "expert",
+            w,
+            enforce_gather_fallback=True,
+            enforce_gather_reduce_fallback=True,
+            topk_argsort_indices=out[3] if reuse else None,
+        )
+
+      f = jax.shard_map(body, mesh=mesh, in_specs=(P(), P(), P()), out_specs=P("expert"), check_vma=False)
+      return lambda x, w: jnp.sum(f(x, idx, w).astype(jnp.float32) * ct)
+
+    for buffer_size in (None, 96):
+      ref = jax.jit(jax.grad(make_loss(False, buffer_size), argnums=(0, 1)))(x, w)
+      new = jax.jit(jax.grad(make_loss(True, buffer_size), argnums=(0, 1)))(x, w)
+      for a, b in zip(ref, new):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
   def test_deepseek_bias_updates(self):
     num_experts = 4

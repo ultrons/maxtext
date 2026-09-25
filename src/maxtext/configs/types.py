@@ -1076,6 +1076,20 @@ class MoEGeneral(BaseModel):
       True,
       description="Whether to use a custom VJP sort for efficient backward pass processing in sparse matmul.",
   )
+  router_topk_argmax: bool = Field(
+      False,
+      description=(
+          "DeepSeek routing: select the top-k experts by k masked argmax passes instead of jax.lax.top_k (a full"
+          " sort over num_experts on the TPU). Same indices in the same order, ties included."
+      ),
+  )
+  ragged_unsort_reuse_argsort: bool = Field(
+      False,
+      description=(
+          "Ring-of-experts ragged sort: hand the forward sort permutation to ring_ragged_unsort so its backward does"
+          " not recompute it by argsort. Values unchanged."
+      ),
+  )
   router_topk_matmul_vjp: bool = Field(
       False,
       description=(
