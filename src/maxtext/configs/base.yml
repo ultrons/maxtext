@@ -372,6 +372,7 @@ routed_score_func: "" # scoring function for routing
 routed_bias: false # a flag if a learnable bias is added for routing
 routed_bias_update_rate: 0.0 # a flag indicate the update rate applied to the router bias term
 routed_bias_global_counts: false # update the routed bias once per step from expert counts summed over token chunks (and GA microbatches) rather than averaging per-chunk updates; GA > 1 always sums counts
+defer_small_all_reduces: false # ring-of-experts only: reduce the per-layer routed-bias counts and the token-overflow flag once after the layer loop rather than with one small all-reduce per layer
 mlp_bias: false # a flag if a learnable bias is added for MLP matmul, and originally implemented to support the GPT-OSS model architecture.
 n_routing_groups: -1 # number of groups for routing, disabled by default
 first_num_hash_layers: 0 # number of hash routing layers, used in DeepSeek V4 (0 means disabled)

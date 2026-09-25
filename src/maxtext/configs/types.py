@@ -1431,6 +1431,13 @@ class DeepSeekMoE(BaseModel):
       " MoE token chunks (num_moe_token_chunks) and gradient accumulation microbatches, instead of averaging the"
       " per-chunk updates. Gradient accumulation > 1 always uses summed counts.",
   )
+  defer_small_all_reduces: bool = Field(
+      False,
+      description="Ring-of-experts sparse_matmul only: drop the per-layer all-reduces of the routed-bias expert counts"
+      " and of the token-overflow flag (retry_when_tokens_dropped) from the scanned layer. Each MoE layer emits its"
+      " local partial counts and local flag, the scan stacks them, and loss_fn reduces the stacked arrays once after"
+      " the layer loop (one all-reduce each). Same sums and the same any-device-overflow semantics.",
+  )
   log_moe_bias_norms: bool = Field(False, description="Whether to log the norms of MoE router biases.")
   mlp_bias: bool = Field(
       False,
@@ -5514,6 +5521,11 @@ class MaxTextConfig(
       )
 
     self._validate_check_vma_is_supported()
+    if self.defer_small_all_reduces and not (self.use_ring_of_experts and self.sparse_matmul):
+      raise ValueError(
+          "defer_small_all_reduces requires use_ring_of_experts=True and sparse_matmul=True (the deferral is"
+          " implemented on the ring-of-experts sparse_matmul path only)."
+      )
 
     # Final string-to-enum conversions if they haven't been coerced by pydantic yet.
     if isinstance(self.decoder_block, str):

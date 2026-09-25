@@ -544,6 +544,46 @@ def combine_chunk_bias_signals(chunk_signals, config):
   return sum(chunk_signals) / len(chunk_signals)
 
 
+def finalize_deferred_bias_signal(partial_counts, config):
+  """Reduces the stacked partial expert counts of defer_small_all_reduces into the routed-bias signal.
+
+  Under defer_small_all_reduces each ring-of-experts MoE layer emits its local (per-shard) expert counts, per token
+  chunk, instead of all-reducing them inside the layer. The layer scan stacks them, so the value arrives here with
+  shape (..., num_parts, num_chunks, num_experts), where num_parts is the product of the mesh axes the counts were
+  summed over (the batch axes except EP) and the leading axes are the stacked layers, if any. The sum over num_parts
+  is the one all-reduce that replaces the per-layer ones. The rest repeats what the layer does without deferral:
+  per-chunk counts are summed (routed_bias_emits_expert_counts), or turned into one bias update per chunk and
+  averaged over chunks (combine_chunk_bias_signals). Integer counts make the result identical.
+
+  Returns:
+      (..., num_experts): int32 counts or the float bias update, as the layer emits without deferral.
+  """
+  counts = jnp.sum(partial_counts, axis=-3)
+  chunk_counts = [counts[..., c, :] for c in range(counts.shape[-2])]
+  if routed_bias_emits_expert_counts(config):
+    return chunk_counts[0] if len(chunk_counts) == 1 else sum(chunk_counts)
+  signals = [expert_counts_to_bias_updates(c, config.routed_bias_update_rate) for c in chunk_counts]
+  return signals[0] if len(signals) == 1 else combine_chunk_bias_signals(signals, config)
+
+
+def finalize_deferred_intermediates(intermediate_outputs, config):
+  """Applies finalize_deferred_bias_signal to every "moe_bias_updates" leaf when defer_small_all_reduces is on.
+
+  The "moe_has_overflow" leaves need no rewrite: under deferral they hold the per-device local flags, and every
+  consumer reduces them with jnp.any, which is the one all-reduce after the layer loop.
+  """
+  if not getattr(config, "defer_small_all_reduces", False):
+    return intermediate_outputs
+
+  def _fix(path, leaf):
+    keys = [getattr(k, "key", getattr(k, "name", None)) for k in path]
+    if "moe_bias_updates" in keys and leaf is not None and getattr(leaf, "ndim", 0) >= 3:
+      return finalize_deferred_bias_signal(leaf, config)
+    return leaf
+
+  return jax.tree_util.tree_map_with_path(_fix, intermediate_outputs)
+
+
 def _batch_axis_names(pspec) -> tuple[str, ...] | None:
   """Returns the mesh axes the (batch, sequence) dims are partitioned over."""
   if not pspec:
@@ -1440,11 +1480,14 @@ class RoutedMoE(nnx.Module):
       force_dropless=False,
       mesh_axis_names=None,
       return_sort_indices=False,
+      defer_reductions=False,
   ):
     """Permute tokens to group by expert to fit gmm call.
 
     With `return_sort_indices=True` a tenth output is appended: the forward ring_ragged_sort permutation when the
     ragged ring path runs and `ragged_unsort_reuse_argsort` is set, else None.
+    With `defer_reductions=True` (defer_small_all_reduces) the routed-bias signal is this shard's local expert counts
+    and has_overflow is this device's local flag: neither is all-reduced here (see finalize_deferred_bias_signal).
     """
     is_qarray = isinstance(inputs, qpl.QArray)
     raw_inputs = inputs.qvalue if is_qarray else inputs
@@ -1461,12 +1504,15 @@ class RoutedMoE(nnx.Module):
       lb_loss = self.load_balance_loss(selected_experts, softmax_probs)
 
     if self.should_update_load_balance():
-      bias_updates = calculate_routed_bias_signal(
-          selected_experts,
-          self.config.num_experts,
-          self.config,
-          axis_names=mesh_axis_names,
-      )
+      if defer_reductions:
+        bias_updates = calculate_expert_counts(selected_experts, self.config.num_experts)
+      else:
+        bias_updates = calculate_routed_bias_signal(
+            selected_experts,
+            self.config.num_experts,
+            self.config,
+            axis_names=mesh_axis_names,
+        )
     else:
       bias_updates = None
 
@@ -1581,7 +1627,7 @@ class RoutedMoE(nnx.Module):
       # Clamp local_group_size to buffer_size to ensure we don't exceed buffer
       # capacity by leveraging the helper _truncate_matrix.
       local_group_size = _truncate_matrix(local_group_size[:, None], buffer_size)[:, 0]
-      if self.mesh is not None and self.mesh.axis_names:
+      if self.mesh is not None and self.mesh.axis_names and not defer_reductions:
         has_overflow = jax.lax.psum(local_overflow, tuple(self.mesh.axis_names)) > 0
       else:
         has_overflow = local_overflow > 0
@@ -2363,6 +2409,10 @@ class RoutedMoE(nnx.Module):
     # Exclude the EP axis so psum doesn't redundantly reduce and scale counts by num_ep
     # for calculate_load_balance_updates().
     roe_bias_axis_names = _filter_axis_names(bias_update_axis_names, self._expert_parallelism_name)
+    # defer_small_all_reduces: the ring-of-experts layer emits local partial counts / flags (leading axis sharded over
+    # the axes the per-layer psum would have used) and loss_fn reduces the stacked arrays once after the layer loop.
+    defer_small_ars = bool(getattr(self.config, "defer_small_all_reduces", False)) and self.config.use_ring_of_experts
+    all_mesh_axes = tuple(self.mesh.axis_names) if (defer_small_ars and self.mesh is not None) else ()
 
     def quantize_and_all_gather_tokens(
         x: jax.Array,
@@ -2453,6 +2503,7 @@ class RoutedMoE(nnx.Module):
           force_dropless=force_dropless,
           mesh_axis_names=roe_bias_axis_names,
           return_sort_indices=True,
+          defer_reductions=defer_small_ars,
       )
       required_rbf = None
       if getattr(self.config, "log_required_ragged_buffer_factor", False):
@@ -3112,8 +3163,12 @@ class RoutedMoE(nnx.Module):
         out_specs=(
             output_pspec,
             P(),  # Handle None or replicate the output
-            P(),  # Handle None or replicate the output
-            P(),  # has_overflow: replicated scalar, all-reduced across entire mesh
+            # bias_updates: replicated, or under defer_small_all_reduces the local counts (1, n_chunks, E) per shard of
+            # the axes the per-layer psum would have used.
+            P(roe_bias_axis_names, None, None) if defer_small_ars else P(),
+            # has_overflow: replicated scalar, all-reduced across entire mesh, or under defer_small_all_reduces the
+            # local flag (1,) per device.
+            P(all_mesh_axes) if defer_small_ars else P(),
             P(),  # required_rbf (probe): replicated scalar max-reduced across entire mesh, or None
         ),
         check_vma=self.config.check_vma,
@@ -3208,7 +3263,11 @@ class RoutedMoE(nnx.Module):
           required_rbfs.append(req_c)
         output = jnp.concatenate(outs, axis=1)
         lb_loss = None if lb_losses[0] is None else sum(lb_losses) / n_chunks
-        bias_updates = combine_chunk_bias_signals(bias_updates_list, self.config)
+        if defer_small_ars:
+          # Local per-chunk counts, reduced over the mesh and combined over chunks in finalize_deferred_bias_signal.
+          bias_updates = None if bias_updates_list[0] is None else jnp.stack(bias_updates_list)
+        else:
+          bias_updates = combine_chunk_bias_signals(bias_updates_list, self.config)
         has_overflow = jnp.any(jnp.stack(has_overflows))
         # Each chunk has its own buffer, so the step needs the largest per-chunk factor.
         required_rbf = None if required_rbfs[0] is None else jnp.max(jnp.stack(required_rbfs))
@@ -3216,6 +3275,12 @@ class RoutedMoE(nnx.Module):
 
       force_dropless = getattr(self, "force_dropless", False)
       out, lb_loss, bias_updates, has_overflow, required_rbf = _route_and_compute(force_dropless=force_dropless)
+      if defer_small_ars:
+        if bias_updates is not None:
+          if bias_updates.ndim == 1:  # unchunked path: one chunk
+            bias_updates = bias_updates[None, :]
+          bias_updates = bias_updates[None]  # (1, n_chunks, E): this shard's partial counts
+        has_overflow = jnp.reshape(jnp.asarray(has_overflow, dtype=jnp.bool_), (1,))  # this device's local flag
       return out, lb_loss, bias_updates, has_overflow, required_rbf
 
     # Note: SparseCore pinning (`moe_pin_sparse_core_all_gathers`) is currently not supported
