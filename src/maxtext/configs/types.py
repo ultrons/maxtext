@@ -1834,6 +1834,14 @@ class DatasetGeneral(BaseModel):
       0.0,
       description="The batch size per device for evaluation. Defaults to per_device_batch_size.",
   )
+  eval_sample_repeat: int = Field(
+      1,
+      description="Eval runs each real eval sample this many times (k). The eval step tiles the first "
+      "global_batch_size_to_eval_on rows (the real samples) k times, so the model sees num_devices * "
+      "eval_per_device_batch_size rows, and divides the summed loss and token weights by k. "
+      "eval_per_device_batch_size refers to the repeated batch; global_batch_size_to_eval_on (the loader's real rows "
+      "and the mllog eval_samples) is that batch divided by k. 1 = off.",
+  )
   max_corpus_chars: int = Field(10_000_000, description="Maximum number of characters to use from the corpus.")
   train_data_columns: list[str] = Field(["text"], description="Column(s) to use from the training data.")
   train_image_column: str | list[str] = Field("image", description="Column name(s) for images in the training data.")
@@ -4256,6 +4264,24 @@ class MaxTextConfig(
         self.num_target_devices,
         1,
     )
+    # eval_sample_repeat=k: the eval step feeds the model micro_batch_size_to_eval_on rows made of the first
+    # micro_batch_size_to_eval_on // k rows tiled k times. The loader (real-row selection), the eval iterator's example
+    # count and the mllog eval_samples read global_batch_size_to_eval_on, so it holds the real sample count.
+    if self.eval_sample_repeat < 1:
+      raise ValueError(f"eval_sample_repeat must be >= 1 (got {self.eval_sample_repeat}).")
+    if self.eval_sample_repeat > 1:
+      k = self.eval_sample_repeat
+      if self.micro_batch_size_to_eval_on % k != 0:
+        raise ValueError(
+            f"eval_sample_repeat={k} must divide the eval batch num_devices * eval_per_device_batch_size = "
+            f"{self.num_target_devices} * {self.eval_per_device_batch_size} = {self.micro_batch_size_to_eval_on}."
+        )
+      if self.use_multimodal:
+        raise ValueError("eval_sample_repeat > 1 is not supported with use_multimodal=True.")
+      if self.enable_diloco:
+        raise ValueError("eval_sample_repeat > 1 is not supported with enable_diloco=True.")
+      self.global_batch_size_to_eval_on = self.micro_batch_size_to_eval_on // k
+      assert self.global_batch_size_to_eval_on * k == self.micro_batch_size_to_eval_on
 
     # Calculate ramp-up batch size parameters if enabled.
     if self.enable_rampup_batch_size:

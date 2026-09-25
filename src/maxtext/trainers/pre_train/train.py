@@ -109,6 +109,26 @@ def get_first_step(model, state):
 # -----------------------------------------------------------------------------
 
 
+def repeat_eval_samples(config, data, k, mesh=None):
+  """eval_sample_repeat: tile the real eval rows k times along the batch dimension.
+
+  The first global_batch_size_to_eval_on rows of the loaded eval batch are the real samples (the loader places them
+  there, and types.py sets global_batch_size_to_eval_on = micro_batch_size_to_eval_on // k). Row i of the result is
+  real row i % n_real. Tiling (rather than repeating each row in place) keeps n_real distinct samples in every
+  contiguous block of n_real rows, so a data/expert shard of the batch sees distinct samples and the per-expert token
+  mix stays close to the k=1 batch. The result is constrained to the eval input sharding.
+  """
+  n_real = config.global_batch_size_to_eval_on
+  logical_axes = tuple(getattr(config, "input_data_sharding_logical_axes", ()) or ())
+  out = {}
+  for key, v in data.items():
+    v = jnp.tile(v[:n_real], (k,) + (1,) * (v.ndim - 1))
+    if mesh is not None and len(logical_axes) == 2:
+      v = sharding.maybe_shard_with_logical(v, logical_axes + (None,) * (v.ndim - 2), mesh, config.shard_mode)
+    out[key] = v
+  return out
+
+
 def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_train=True):
   """loss_fn for both train and eval.
 
@@ -148,6 +168,9 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   else:
     for k, v in data.items():
       data[k] = v[: config.micro_batch_size_to_eval_on, :]
+  eval_sample_repeat = 1 if is_train else getattr(config, "eval_sample_repeat", 1)
+  if eval_sample_repeat > 1:
+    data = repeat_eval_samples(config, data, eval_sample_repeat, getattr(model, "mesh", None))
   # Only forward the kwarg when router replay is actually in use, so models
   # and adapters whose __call__ predates the feature keep working.
   forced_routing_kwargs = (
@@ -263,6 +286,14 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     total_weights = jnp.sum(targets_loss_mask)
   else:
     total_weights = jnp.sum(data["targets_segmentation"] != 0)
+  if eval_sample_repeat > 1:
+    # Every real sample appears exactly eval_sample_repeat (k) times, so the token count is exactly k times the k=1
+    # count (integer division is exact) and xent_sum / z-loss sum are k times the k=1 sums up to f32 reduction order
+    # (division by a power-of-two k is exact). Dividing here keeps loss, total_loss and total_weights at their k=1
+    # values, so each real sample is weighted once.
+    total_weights = total_weights // eval_sample_repeat
+    xent_sum = xent_sum / eval_sample_repeat
+    total_z_loss = total_z_loss / eval_sample_repeat
   # If gradient accumulation is enabled, we don't need to divide xent_sum
   # by total_weights and then multiply the computed gradient by total_weights,
   # since it's equivalent to computing the gradient from xent_sum.
@@ -803,6 +834,7 @@ def training_loop_iteration(
       and step >= eval_start_step
       and (step - eval_start_step) % eval_interval == 0
   )
+  eval_metrics = None
   if ran_eval:
     assert eval_data_iterator
     # Explicitly reset the eval iterator and counters before starting the eval loop
@@ -845,7 +877,9 @@ def training_loop_iteration(
       if 0 < eval_steps <= eval_step_count:
         break
 
-  prof.maybe_deactivate_profiler(step, state)
+  # Eval metrics are fetched lazily (metric_logger defers the float()), so without the eval output in the blocking
+  # object a profile window that ends on an eval step could stop the trace while the eval program is still running.
+  prof.maybe_deactivate_profiler(step, state if eval_metrics is None else (state, eval_metrics))
 
   if step == start_step:
     max_utils.print_mem_stats("After params initialized")
