@@ -193,11 +193,12 @@ _sort_activations_custom.defvjp(_sort_activations_custom_fwd, _sort_activations_
 
 def quantize_rows_fp8(x: jax.Array, qtype) -> tuple[jax.Array, jax.Array]:
   """Per-row fp8 quantization: one f32 absmax scale per row (last axis), returns (qvalue, scale[..., 1])."""
-  xf = x.astype(jnp.float32)
   qmax = float(jnp.finfo(qtype).max)
-  absmax = jnp.max(jnp.abs(xf), axis=-1, keepdims=True)
+  # abs/max are exact in the input dtype; taking them before the f32 cast keeps XLA from materializing an f32
+  # copy of x between the reduction and the quantizing convert.
+  absmax = jnp.max(jnp.abs(x), axis=-1, keepdims=True).astype(jnp.float32)
   scale = jnp.where(absmax > 0, absmax / qmax, jnp.ones_like(absmax))
-  return jnp.clip(xf / scale, -qmax, qmax).astype(qtype), scale
+  return jnp.clip(x.astype(jnp.float32) / scale, -qmax, qmax).astype(qtype), scale
 
 
 def dequantize_rows_fp8(qvalue: jax.Array, scale: jax.Array, dtype) -> jax.Array:
