@@ -1466,6 +1466,12 @@ class DeepSeekMoE(BaseModel):
       " the layer loop (one all-reduce each). Same sums and the same any-device-overflow semantics.",
   )
   log_moe_bias_norms: bool = Field(False, description="Whether to log the norms of MoE router biases.")
+  log_step_diagnostics: bool = Field(
+      False,
+      description="Append to every training step's log line: pre-clip and post-clip global grad norm, param norm,"
+      " max |grad|, the routed-bias checksum (sum over MoE layers of sum(bias)), the number of nonzero routed-bias"
+      " update entries and the MoE overflow flag.",
+  )
   mlp_bias: bool = Field(
       False,
       description="Whether to add a learnable bias for MLP matmul, "

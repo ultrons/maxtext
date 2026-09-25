@@ -33,6 +33,7 @@ import jax.numpy as jnp
 from maxtext.layers import nnx_scan
 import numpy as np
 from maxtext.common import train_state_nnx
+from maxtext.common import metric_logger
 from maxtext.common.metric_logger import record_activation_metrics
 from maxtext.optimizers import optimizers
 from maxtext.trainers.pre_train import train as pre_train
@@ -1320,6 +1321,92 @@ class TestWarmupProgramsInInit(unittest.TestCase):
     order, python_vars = self._clock_order(with_warmup=False)
     self.assertEqual(order, ["init_print", "init_stop", "run_start", "block_start"])
     self.assertIsNone(python_vars["last_step_completion"])
+
+
+class TestStepDiagnosticsNNX(unittest.TestCase):
+  """log_step_diagnostics: the diagnostic scalars are produced, finite and correct, and appear on the step line."""
+
+  _DIAG_KEYS = (
+      "learning/raw_grad_norm",
+      "learning/grad_norm",
+      "learning/param_norm",
+      "diag/max_abs_grad",
+      "diag/moe_bias_checksum",
+      "diag/moe_bias_update_nonzero",
+      "diag/moe_overflow",
+  )
+
+  def _run(self, log_step_diagnostics, model_cls="bias"):
+    """One train_step on the routed-bias + MTP stub ("bias") or the overflow stub; returns (cfg, metrics)."""
+    cfg = _Cfg(gradient_clipping_threshold=1e-3, retry_when_tokens_dropped=True)
+    cfg.log_step_diagnostics = log_step_diagnostics
+    if model_cls == "bias":
+      cfg.routed_bias, cfg.routed_bias_update_rate, cfg.mtp_num_layers = True, 0.001, 2
+      model = _TinyDecoderMoEBiasWithMTP(cfg.vocab_size, hidden=4, rngs=nnx.Rngs(0), num_mtp_layers=2)
+    else:
+      model = _TinyDecoderMoEOverflow(cfg.vocab_size, hidden=4, rngs=nnx.Rngs(0), has_overflow=True)
+    optimizer = nnx.Optimizer(model, optax.sgd(0.01), wrt=nnx.Param)
+    state_graphdef, state_pure = nnx.split(train_state_nnx.TrainStateNNX(model, optimizer))
+    data = _make_data(batch=cfg.micro_batch_size_to_train_on, vocab=cfg.vocab_size)
+    _, metrics = pre_train.train_step(
+        state_graphdef, cfg, state_mesh_shardings=None, params_shardings=None, state=state_pure, data=data
+    )
+    return cfg, metrics
+
+  def test_diagnostics_finite_and_correct(self):
+    _, metrics = self._run(True)
+    scal = {k: float(v) for k, v in metrics["scalar"].items()}
+    for k in self._DIAG_KEYS:
+      self.assertIn(k, scal)
+      self.assertTrue(np.isfinite(scal[k]), k)
+    # Biases start at 0 and get +1 (decoder 2x3), +2 and +3 (two MTP layers of 3): checksum 6 + 6 + 9, 12 nonzero.
+    self.assertAlmostEqual(scal["diag/moe_bias_checksum"], 21.0, places=5)
+    self.assertEqual(scal["diag/moe_bias_update_nonzero"], 12.0)
+    self.assertEqual(scal["diag/moe_overflow"], 0.0)
+    self.assertGreater(scal["diag/max_abs_grad"], 0.0)
+    # Clipping at 1e-3 makes the post-clip norm the threshold, below the pre-clip norm.
+    self.assertLess(scal["learning/grad_norm"], scal["learning/raw_grad_norm"])
+    self.assertLessEqual(scal["diag/max_abs_grad"], scal["learning/raw_grad_norm"] + 1e-6)
+
+  def test_overflow_value(self):
+    _, metrics = self._run(True, model_cls="overflow")
+    self.assertEqual(float(metrics["scalar"]["diag/moe_overflow"]), 1.0)
+    self.assertEqual(float(metrics["scalar"]["diag/moe_bias_update_nonzero"]), 0.0)
+
+  def test_off_adds_nothing(self):
+    _, metrics = self._run(False)
+    self.assertFalse([k for k in metrics["scalar"] if k.startswith("diag/")])
+
+  def test_step_log_line(self):
+    cfg, metrics = self._run(True)
+    logger = metric_logger.MetricLogger.__new__(metric_logger.MetricLogger)  # skip __init__
+    logger.config = pytypes.SimpleNamespace(
+        rampup_end_step=0,
+        hide_profiler_step_metric=False,
+        elastic_enabled=False,
+        num_experts=1,
+        mtp_num_layers=cfg.mtp_num_layers,
+        use_indexer=False,
+        log_step_diagnostics=True,
+    )
+    scalars = {k: float(v) for k, v in metrics["scalar"].items()}
+    perf = ("perf/step_time_seconds", "perf/per_device_tflops_per_sec", "perf/per_device_tokens_per_sec")
+    scalars.update({k: 1.0 for k in perf})
+    with mock.patch.object(metric_logger.max_logging, "log") as log:
+      logger.log_metrics({"scalar": scalars}, step=3, metric_type="train")
+    line = log.call_args[0][0]
+    self.assertIn("completed step: 3", line)
+    self.assertIn("diag: raw_grad_norm=", line)
+    diag = line.split("diag: ")[1].split(",")[0].split()
+    self.assertEqual([d.split("=")[0] for d in diag], [n for n, _ in metric_logger.STEP_DIAGNOSTICS_KEYS])
+    for d in diag:
+      self.assertTrue(np.isfinite(float(d.split("=")[1])), d)
+    self.assertIn("moe_bias_checksum=2.100000000e+01", line)
+    # Flag off: no diag part.
+    logger.config.log_step_diagnostics = False
+    with mock.patch.object(metric_logger.max_logging, "log") as log:
+      logger.log_metrics({"scalar": scalars}, step=3, metric_type="train")
+    self.assertNotIn("diag:", log.call_args[0][0])
 
 
 if __name__ == "__main__":

@@ -428,6 +428,33 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   return loss, aux
 
 
+def step_diagnostics(raw_grads, has_moe_overflow, bias_values, bias_updates):
+  """log_step_diagnostics scalars that are not already in the step metrics.
+
+  Returns max |raw gradient| over all parameters (pre-clip), the routed-bias checksum (sum over MoE layers of the sum
+  of the updated router bias, float32), the number of nonzero routed-bias update entries of this step and the MoE
+  overflow flag, each as a float32 scalar. The gradient and parameter L2 norms are logged from the existing
+  learning/raw_grad_norm, learning/grad_norm and learning/param_norm.
+  """
+  leaves = [
+      g for g in jax.tree_util.tree_leaves(raw_grads) if hasattr(g, "dtype") and jnp.issubdtype(g.dtype, jnp.inexact)
+  ]
+  max_abs = jnp.max(jnp.stack([jnp.max(jnp.abs(g)).astype(jnp.float32) for g in leaves])) if leaves else jnp.float32(0)
+  checksum = jnp.float32(0)
+  for b in bias_values:
+    checksum = checksum + jnp.sum(jnp.asarray(b, jnp.float32))
+  nonzero = jnp.float32(0)
+  for u in bias_updates:
+    nonzero = nonzero + jnp.sum(jnp.asarray(u) != 0).astype(jnp.float32)
+  overflow = jnp.asarray(False if has_moe_overflow is None else has_moe_overflow).astype(jnp.float32)
+  return {
+      "diag/max_abs_grad": max_abs,
+      "diag/moe_bias_checksum": checksum,
+      "diag/moe_bias_update_nonzero": nonzero,
+      "diag/moe_overflow": overflow,
+  }
+
+
 def _find_gate_bias(module: nnx.Module | None) -> nnx.Variable | None:
   """Finds the router gate bias parameter in a module graph."""
   if module is None:
@@ -566,6 +593,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   mtp_loss = aux.get("mtp_loss", 0.0)
   new_opt_state = None
   bias_metrics = {}
+  # log_step_diagnostics: the updated router biases and this step's bias updates (see step_diagnostics).
+  diag_bias_values, diag_bias_updates = [], []
 
   if config.gradient_clipping_threshold > 0:
     grads = maxtext_utils.apply_gradient_clipping(raw_grads, None, config.gradient_clipping_threshold)
@@ -620,6 +649,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
             if getattr(config, "log_moe_bias_norms", False):
               bias_metrics[f"learning/moe_bias_before_norm_{name_prefix}"] = jnp.linalg.norm(node.bias.value)
             node.bias.value = node.bias.value + jnp.array(update_val)
+            diag_bias_values.append(node.bias.value)
+            diag_bias_updates.append(update_val)
             if getattr(config, "log_moe_bias_norms", False):
               bias_metrics[f"learning/moe_bias_update_norm_{name_prefix}"] = jnp.linalg.norm(jnp.array(update_val))
     else:
@@ -628,7 +659,10 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       decoder_layer = getattr(new_state.model.decoder, "moe_layers", new_state.model.decoder)
       decoder_bias = _find_gate_bias(decoder_layer)
       if decoder_bias is not None:
-        decoder_bias.value = decoder_bias.value + _routed_bias_update(moe_bias_updates[0], config)
+        decoder_update = _routed_bias_update(moe_bias_updates[0], config)
+        decoder_bias.value = decoder_bias.value + decoder_update
+        diag_bias_values.append(decoder_bias.value)
+        diag_bias_updates.append(decoder_update)
 
       # 2. Update auxiliary MTP MoE layers (if enabled).
       # Unlike the main decoder, each MTP layer is an individual un-scanned layer
@@ -638,7 +672,10 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
           mtp_layer = getattr(new_state.model.mtp_block, f"mtp_layer_{i + 1}", None)
           mtp_bias = _find_gate_bias(mtp_layer)
           if mtp_bias is not None:
-            mtp_bias.value = mtp_bias.value + _routed_bias_update(update, config)
+            mtp_update = _routed_bias_update(update, config)
+            mtp_bias.value = mtp_bias.value + mtp_update
+            diag_bias_values.append(mtp_bias.value)
+            diag_bias_updates.append(mtp_update)
 
   lm_loss = xent_sum / (total_weights + EPS)
   scalar_metrics = {
@@ -672,6 +709,13 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
     model_params = nnx.state(new_state.model, nnx.Param)
     scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(model_params)
+
+  if getattr(config, "log_step_diagnostics", False):
+    scalar_metrics.update(step_diagnostics(raw_grads, has_moe_overflow, diag_bias_values, diag_bias_updates))
+    if "learning/raw_grad_norm" not in scalar_metrics:  # optimizer_memory_host_offload skips the norms above
+      scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
+      scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
+      scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(nnx.state(new_state.model, nnx.Param))
 
   # Surface skip-step rejections as a TB metric. The skip-step optimizer stores
   # is_skipped in its opt_state; read it back off the optimizer just updated in place.
