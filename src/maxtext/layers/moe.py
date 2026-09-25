@@ -798,6 +798,11 @@ class RoutedMoE(nnx.Module):
     override = getattr(self, "ragged_buffer_factor_override", None)
     return override if (override is not None and override > 0) else self.config.ragged_buffer_factor
 
+  def _gate_matmul_precision(self) -> str:
+    """Precision of the gate projection: gate_matmul_precision, or matmul_precision when it is "default"."""
+    gate_precision = getattr(self.config, "gate_matmul_precision", "default")
+    return self.config.matmul_precision if gate_precision == "default" else gate_precision
+
   def required_ragged_buffer_factor(self, group_sizes, bsz_times_seq_len, num_ep, expert_shard_id):
     """log_required_ragged_buffer_factor probe: the smallest ragged_buffer_factor that would not have dropped tokens.
 
@@ -940,7 +945,7 @@ class RoutedMoE(nnx.Module):
         # so we don't apply it here to avoid redundant computation.
         # See https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/layers/common/fused_moe_gmm.py#L58.
         score_func="" if self.config.attention in ("vllm_rpa", "vllm_batched_rpa") else self.config.routed_score_func,
-        matmul_precision=self.config.matmul_precision,
+        matmul_precision=self._gate_matmul_precision(),
         shard_mode=config.shard_mode,
         rngs=self.rngs,
     )

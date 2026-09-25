@@ -228,6 +228,9 @@ float32_weight_sum: true
 # compute dtype only (the kernel is still stored in weight_dtype): casts the gate inputs and kernel, emits fp32 logits, and applies to the routed bias add and score function.
 # see quantize_router_proj for whether the gate projection matmul is quantized; enabling both is rejected.
 float32_gate_logits: false
+# gate_matmul_precision - precision of the MoE gate projection dot only (default/high/highest; forward and transposes).
+# "default" = use matmul_precision (unchanged behavior). With float32_gate_logits, "highest" keeps f32 operands on TPU.
+gate_matmul_precision: "default"
 # multi-token prediction configs
 # the number of auxiliary prediction layers to use for mtp.
 # set to 0 to disable the feature.

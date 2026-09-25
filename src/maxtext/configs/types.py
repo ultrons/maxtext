@@ -1312,6 +1312,16 @@ class MoEGeneral(BaseModel):
           " projection discards the fp32 operand precision."
       ),
   )
+  gate_matmul_precision: Literal["default", "high", "highest"] = Field(
+      "default",
+      description=(
+          "Precision of the MoE gate (router) projection dot only (`GateLogit`), forward and both transposes."
+          " 'default' keeps the previous behavior (the gate uses `matmul_precision`). With"
+          " `float32_gate_logits=True`, 'highest' keeps the f32 operands on TPU: under DEFAULT precision XLA folds"
+          " the f32 casts and runs the gate as a single bf16 MXU pass with an f32 result. Every other dot keeps"
+          " `matmul_precision`."
+      ),
+  )
   prefuse_moe_weights: bool = Field(
       False,
       description="Whether to pre-fuse MoE weights (w0 and w1) during initialization. "

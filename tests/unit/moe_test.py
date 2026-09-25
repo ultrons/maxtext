@@ -813,6 +813,146 @@ def test_sparse_matmul_repairs_batch_specs_only_without_expert_parallelism(exper
   assert captured["out_specs"][0] == P(batch_partition, None, None)
 
 
+def _dot_general_precisions(jaxpr):
+  """Precision of every dot_general in a (closed) jaxpr, sub-jaxprs included."""
+  found = []
+  for eqn in jaxpr.eqns:
+    if eqn.primitive.name == "dot_general":
+      found.append(eqn.params["precision"])
+    for value in eqn.params.values():
+      for sub in value if isinstance(value, (tuple, list)) else (value,):
+        if hasattr(sub, "eqns"):
+          found.extend(_dot_general_precisions(sub))
+        elif hasattr(sub, "jaxpr") and hasattr(sub.jaxpr, "eqns"):
+          found.extend(_dot_general_precisions(sub.jaxpr))
+  return found
+
+
+class GatePrecisionTest(unittest.TestCase):
+  """gate_matmul_precision: the precision of the MoE gate projection dot only (forward and both transposes)."""
+
+  def _model(self, **overrides):
+    """A small RoutedMoE with float32 gate logits; overrides go to pyconfig."""
+    cfg = pyconfig.initialize(
+        [None, get_test_config_path()],
+        run_name="gate_precision_test",
+        enable_checkpointing=False,
+        dtype="bfloat16",
+        max_target_length=8,
+        per_device_batch_size=1,
+        num_experts=16,
+        num_experts_per_tok=2,
+        base_emb_dim=512,
+        base_moe_mlp_dim=256,
+        base_mlp_dim=256,
+        float32_gate_logits=True,
+        **overrides,
+    )
+    devices_array = maxtext_utils.create_device_mesh(cfg)
+    model = moe.RoutedMoE(
+        config=cfg,
+        num_experts=cfg.num_experts,
+        num_experts_per_tok=cfg.num_experts_per_tok,
+        mesh=Mesh(devices_array, cfg.mesh_axes),
+        kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
+        kernel_axes=("embed", "mlp"),
+        dtype=cfg.dtype,
+        rngs=nnx.Rngs(params=0),
+    )
+    return cfg, model
+
+  def _inputs(self):
+    return jax.random.normal(jax.random.PRNGKey(7), (2, 8, 512), jnp.float32)
+
+  def _gate_fn(self, gate):
+    graphdef, state = nnx.split(gate)
+
+    def fn(state, x):
+      return nnx.merge(graphdef, state)(x)[0]
+
+    return fn, state
+
+  def test_config_default_and_validation(self):
+    cfg, _ = self._model()
+    self.assertEqual(cfg.gate_matmul_precision, "default")
+    for value in ("high", "highest"):
+      cfg, _ = self._model(gate_matmul_precision=value)
+      self.assertEqual(cfg.gate_matmul_precision, value)
+    for value in ("bfloat16", "float32", "fastest"):
+      with self.assertRaises(Exception):
+        self._model(gate_matmul_precision=value)
+
+  def test_gate_precision_resolution(self):
+    _, model = self._model()
+    self.assertEqual(jax.lax.Precision(model.gate.matmul_precision), jax.lax.Precision.DEFAULT)
+    # "default" inherits the global matmul_precision, as the gate did before the flag existed.
+    _, model = self._model(matmul_precision="highest")
+    self.assertEqual(jax.lax.Precision(model.gate.matmul_precision), jax.lax.Precision.HIGHEST)
+    _, model = self._model(gate_matmul_precision="highest")
+    self.assertEqual(jax.lax.Precision(model.gate.matmul_precision), jax.lax.Precision.HIGHEST)
+    self.assertEqual(model.config.matmul_precision, "default")
+
+  def test_highest_matches_f32_dot(self):
+    _, model = self._model(gate_matmul_precision="highest")
+    x = self._inputs()
+    kernel = np.asarray(model.gate.kernel[...], np.float64)
+    self.assertEqual(model.gate.kernel[...].dtype, jnp.float32)
+    ref = np.asarray(x, np.float64) @ kernel
+    out = np.asarray(model.gate(x)[0], np.float64)
+    self.assertEqual(model.gate(x)[0].dtype, jnp.float32)
+    rel = np.linalg.norm(out - ref) / np.linalg.norm(ref)
+    max_logging.log(f"gate highest vs f64 dot: rel={rel:.3e}")
+    self.assertLess(rel, 1e-6)
+    # The same input exposes a bf16 pass: a dot of bf16-rounded operands (what DEFAULT precision does on TPU,
+    # where XLA folds the f32 casts) is off by more than 1e-3. XLA:CPU computes f32 dots in f32 at every
+    # precision, so the DEFAULT code path cannot show this error on CPU; the HLO precision_config is the TPU check.
+    x_bf16 = np.asarray(jnp.asarray(x, jnp.bfloat16), np.float64)
+    k_bf16 = np.asarray(jnp.asarray(model.gate.kernel[...], jnp.bfloat16), np.float64)
+    rel_bf16 = np.linalg.norm(x_bf16 @ k_bf16 - ref) / np.linalg.norm(ref)
+    max_logging.log(f"bf16-operand dot vs f64 dot: rel={rel_bf16:.3e}")
+    self.assertGreater(rel_bf16, 1e-3)
+
+  def test_forward_and_transposes_carry_precision(self):
+    for flag, expected in (("default", jax.lax.Precision.DEFAULT), ("highest", jax.lax.Precision.HIGHEST)):
+      _, model = self._model(gate_matmul_precision=flag)
+      fn, state = self._gate_fn(model.gate)
+      x = self._inputs()
+      cot = jax.random.normal(jax.random.PRNGKey(3), (2, 8, 16), jnp.float32)
+      loss = functools.partial(lambda s, xx, f, c: jnp.sum(f(s, xx) * c), f=fn, c=cot)
+      jaxpr = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(state, x)
+      precisions = _dot_general_precisions(jaxpr.jaxpr)
+      # forward, dX and dW (the router weight gradient)
+      self.assertEqual(len(precisions), 3, precisions)
+      for p in precisions:
+        self.assertEqual(p, (expected, expected), (flag, precisions))
+
+  def test_default_flag_bit_identical_to_matmul_precision(self):
+    cfg, model = self._model()
+    # The gate as RoutedMoE built it before the flag existed: matmul_precision=config.matmul_precision.
+    old_gate = moe.GateLogit(
+        in_features_shape=model.moe_expert_input_dim,
+        out_features_shape=model.num_experts,
+        mesh=model.mesh,
+        model_name=cfg.model_name,
+        dtype=jnp.float32,
+        weight_dtype=model.gate.kernel[...].dtype,
+        quant=model.quant,
+        kernel_init=model.kernel_init,
+        kernel_axes=model.kernel_axes,
+        use_bias=cfg.routed_bias,
+        score_func=cfg.routed_score_func,
+        matmul_precision=cfg.matmul_precision,
+        shard_mode=cfg.shard_mode,
+        rngs=nnx.Rngs(params=0),
+    )
+    old_gate.kernel[...] = model.gate.kernel[...]
+    x = self._inputs()
+    np.testing.assert_array_equal(np.asarray(model.gate(x)[0]), np.asarray(old_gate(x)[0]))
+    fn_new, state_new = self._gate_fn(model.gate)
+    fn_old, state_old = self._gate_fn(old_gate)
+    self.assertEqual(str(jax.make_jaxpr(fn_new)(state_new, x)), str(jax.make_jaxpr(fn_old)(state_old, x)))
+
+
 class RoutedMoeTest(parameterized.TestCase):
   """Routed Mixture of Experts test."""
 
