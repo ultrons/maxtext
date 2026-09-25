@@ -405,9 +405,10 @@ def _find_gate_bias(module: nnx.Module | None) -> nnx.Variable | None:
 def _routed_bias_update(signal, config):
   """Returns the routed-bias update to add for one optimizer step.
 
-  Without gradient accumulation the MoE layers already emit the update. With
-  it they emit per-expert token counts, which the accumulation loop sums over
-  microbatches, so the update is computed here once from the global-batch counts.
+  By default, without gradient accumulation, the MoE layers already emit the
+  update. With accumulation (or routed_bias_global_counts) they emit per-expert
+  token counts, summed over token chunks and accumulation microbatches, so the
+  update is computed here once from the global-batch counts.
   """
   signal = jnp.array(signal)
   if moe.routed_bias_emits_expert_counts(config):

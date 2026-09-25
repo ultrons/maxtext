@@ -101,7 +101,7 @@ class RouteOutput:
   # Auxiliary loss for token distribution among experts.
   lb_loss: Optional[jax.Array]
   # Dynamic bias updates for loss-free load balancing, used only for Deepseek models.
-  # Under gradient accumulation this holds per-expert token counts instead
+  # Under gradient accumulation or routed_bias_global_counts this holds per-expert token counts instead
   # (see routed_bias_emits_expert_counts).
   bias_updates: Optional[jax.Array]
   # Shape [local experts], tracks number of local tokens routed to every local expert.
@@ -358,10 +358,12 @@ def routed_bias_emits_expert_counts(config) -> bool:
   With gradient accumulation the expert bias must follow the token counts of
   the whole global batch, so each microbatch emits its per-expert counts, the
   accumulation loop sums them and train_step converts the sum into one update
-  per optimizer step (expert_counts_to_bias_updates). Without accumulation the
-  layer emits the update itself, as before.
+  per optimizer step (expert_counts_to_bias_updates). routed_bias_global_counts
+  does the same without accumulation, so that the chunked ring-of-experts path
+  sums counts over its token chunks rather than averaging per-chunk updates.
+  Otherwise the layer emits the update itself, as before.
   """
-  return config.gradient_accumulation_steps > 1
+  return config.gradient_accumulation_steps > 1 or bool(getattr(config, "routed_bias_global_counts", False))
 
 
 def calculate_routed_bias_signal(top_k_indices, num_experts, config, axis_names=None):
@@ -369,6 +371,20 @@ def calculate_routed_bias_signal(top_k_indices, num_experts, config, axis_names=
   if routed_bias_emits_expert_counts(config):
     return calculate_expert_counts(top_k_indices, num_experts, axis_names=axis_names)
   return calculate_load_balance_updates(top_k_indices, num_experts, config.routed_bias_update_rate, axis_names=axis_names)
+
+
+def combine_chunk_bias_signals(chunk_signals, config):
+  """Combines the per-chunk routed-bias signals of the chunked ring-of-experts path.
+
+  Expert counts (see routed_bias_emits_expert_counts) add up across chunks, so
+  the bias follows the whole batch. Per-chunk bias updates are averaged, which
+  is the default behaviour without gradient accumulation.
+  """
+  if chunk_signals[0] is None:
+    return None
+  if routed_bias_emits_expert_counts(config):
+    return sum(chunk_signals)
+  return sum(chunk_signals) / len(chunk_signals)
 
 
 def _batch_axis_names(pspec) -> tuple[str, ...] | None:
@@ -2940,7 +2956,8 @@ class RoutedMoE(nnx.Module):
         # reduce-scatter with chunk c's GMM compute. Token routing is per-token, so
         # the main (lm) output is identical to n_chunks=1; only the aggregate
         # load-balance loss / bias updates are averaged across chunks (expert
-        # counts, emitted under gradient accumulation, are summed instead).
+        # counts, emitted under gradient accumulation or routed_bias_global_counts,
+        # are summed instead).
         seq_len = x.shape[1]
         chunk = seq_len // n_chunks
         outs, lb_losses, bias_updates_list, has_overflows, required_rbfs = [], [], [], [], []
@@ -2978,13 +2995,7 @@ class RoutedMoE(nnx.Module):
           required_rbfs.append(req_c)
         output = jnp.concatenate(outs, axis=1)
         lb_loss = None if lb_losses[0] is None else sum(lb_losses) / n_chunks
-        if bias_updates_list[0] is None:
-          bias_updates = None
-        elif routed_bias_emits_expert_counts(self.config):
-          # Expert counts add up across chunks, so the bias follows the whole batch.
-          bias_updates = sum(bias_updates_list)
-        else:
-          bias_updates = sum(bias_updates_list) / n_chunks
+        bias_updates = combine_chunk_bias_signals(bias_updates_list, self.config)
         has_overflow = jnp.any(jnp.stack(has_overflows))
         # Each chunk has its own buffer, so the step needs the largest per-chunk factor.
         required_rbf = None if required_rbfs[0] is None else jnp.max(jnp.stack(required_rbfs))

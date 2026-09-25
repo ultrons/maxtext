@@ -60,6 +60,7 @@ class _Cfg:
   retry_when_tokens_dropped: bool = False
   routed_bias: bool = False
   routed_bias_update_rate: float = 0.0
+  routed_bias_global_counts: bool = False
   mtp_num_layers: int = 0
   mtp_eval_target_module: int = 0
   use_qk_clip: bool = False
@@ -628,17 +629,31 @@ class _CountingRouter(nnx.Module):
   int32 expert counts at GA>1, as in RoutedMoE.
   """
 
-  def __init__(self, bias_shape, offsets, ga_steps: int):
+  def __init__(self, bias_shape, offsets, ga_steps: int, n_chunks: int = 1, global_counts: bool = False):
     self.gate = GateLogit(bias_shape)
     self.offsets = tuple(offsets)
     self.ga_steps = ga_steps
+    self.n_chunks = n_chunks
+    self.global_counts = global_counts
+
+  def _signal(self, indices, cfg):
+    """Per-layer signal; with n_chunks > 1 it splits the sequence like the chunked ring-of-experts path."""
+    if self.n_chunks == 1:
+      return moe.calculate_routed_bias_signal(indices, _GA_NUM_EXPERTS, cfg)
+    chunk = indices.shape[1] // self.n_chunks
+    chunk_signals = [
+        moe.calculate_routed_bias_signal(indices[:, c * chunk : (c + 1) * chunk], _GA_NUM_EXPERTS, cfg)
+        for c in range(self.n_chunks)
+    ]
+    return moe.combine_chunk_bias_signals(chunk_signals, cfg)
 
   def __call__(self, tokens):
-    cfg = pytypes.SimpleNamespace(gradient_accumulation_steps=self.ga_steps, routed_bias_update_rate=_GA_RATE)
-    signals = [
-        moe.calculate_routed_bias_signal((tokens + off)[..., None] % _GA_NUM_EXPERTS, _GA_NUM_EXPERTS, cfg)
-        for off in self.offsets
-    ]
+    cfg = pytypes.SimpleNamespace(
+        gradient_accumulation_steps=self.ga_steps,
+        routed_bias_update_rate=_GA_RATE,
+        routed_bias_global_counts=self.global_counts,
+    )
+    signals = [self._signal((tokens + off)[..., None] % _GA_NUM_EXPERTS, cfg) for off in self.offsets]
     signal = jnp.stack(signals) if len(self.gate.bias.shape) == 2 else signals[0]
     self.sow(nnx.Intermediate, "moe_bias_updates", signal)
 
@@ -646,10 +661,13 @@ class _CountingRouter(nnx.Module):
 class _TinyDecoderRoutedCounts(_TinyDecoder):
   """`_TinyDecoder` whose scanned decoder (2 layers) and one MTP layer route tokens by id."""
 
-  def __init__(self, vocab_size: int, hidden: int, rngs: nnx.Rngs, ga_steps: int):
+  def __init__(
+      self, vocab_size: int, hidden: int, rngs: nnx.Rngs, ga_steps: int, n_chunks: int = 1, global_counts: bool = False
+  ):
     super().__init__(vocab_size, hidden, rngs=rngs)
-    self.decoder = _CountingRouter((2, _GA_NUM_EXPERTS), offsets=(0, 1), ga_steps=ga_steps)
-    self.mtp_block = nnx.Dict({"mtp_layer_1": _CountingRouter((_GA_NUM_EXPERTS,), offsets=(2,), ga_steps=ga_steps)})
+    kw = {"ga_steps": ga_steps, "n_chunks": n_chunks, "global_counts": global_counts}
+    self.decoder = _CountingRouter((2, _GA_NUM_EXPERTS), offsets=(0, 1), **kw)
+    self.mtp_block = nnx.Dict({"mtp_layer_1": _CountingRouter((_GA_NUM_EXPERTS,), offsets=(2,), **kw)})
 
   def __call__(self, decoder_input_tokens, decoder_positions, **kwargs):
     out = super().__call__(decoder_input_tokens, decoder_positions, **kwargs)
@@ -714,51 +732,90 @@ def _expected_bias(tokens, offset):
   return _GA_RATE * np.sign(counts.sum() / _GA_NUM_EXPERTS - counts)
 
 
+def _train_step_router_biases(ga_steps, tokens, n_chunks=1, global_counts=False):
+  """Runs one train_step and returns the (decoder, MTP) router biases after it."""
+  batch = tokens.shape[0]
+  cfg = _Cfg(
+      routed_bias=True,
+      routed_bias_update_rate=_GA_RATE,
+      routed_bias_global_counts=global_counts,
+      gradient_accumulation_steps=ga_steps,
+      micro_batch_size_to_train_on=batch // ga_steps,
+  )
+  model = _TinyDecoderRoutedCounts(
+      cfg.vocab_size, hidden=4, rngs=nnx.Rngs(0), ga_steps=ga_steps, n_chunks=n_chunks, global_counts=global_counts
+  )
+  shardings = _params_shardings(model)
+  ts = train_state_nnx.TrainStateNNX(model, nnx.Optimizer(model, optax.sgd(0.01), wrt=nnx.Param))
+  state_graphdef, state_pure = nnx.split(ts)
+  data = _make_data(batch=batch, seq=tokens.shape[1], vocab=cfg.vocab_size)
+  data["inputs"] = tokens
+  new_state, _ = pre_train.train_step(
+      state_graphdef, cfg, state_mesh_shardings=None, params_shardings=shardings, state=state_pure, data=data
+  )
+  return (
+      np.asarray(new_state.model.decoder.gate.bias.value),
+      np.asarray(new_state.model.mtp_block.mtp_layer_1.gate.bias.value),
+  )
+
+
 class TestGradientAccumulationRoutedBias(unittest.TestCase):
   """Under GA the routed-bias update follows the expert counts of the whole global batch."""
 
-  def _train_step_biases(self, ga_steps, tokens):
-    """Runs one train_step and returns the (decoder, MTP) router biases after it."""
-    batch = tokens.shape[0]
-    cfg = _Cfg(
-        routed_bias=True,
-        routed_bias_update_rate=_GA_RATE,
-        gradient_accumulation_steps=ga_steps,
-        micro_batch_size_to_train_on=batch // ga_steps,
-    )
-    model = _TinyDecoderRoutedCounts(cfg.vocab_size, hidden=4, rngs=nnx.Rngs(0), ga_steps=ga_steps)
-    shardings = _params_shardings(model)
-    ts = train_state_nnx.TrainStateNNX(model, nnx.Optimizer(model, optax.sgd(0.01), wrt=nnx.Param))
-    state_graphdef, state_pure = nnx.split(ts)
-    data = _make_data(batch=batch, seq=tokens.shape[1], vocab=cfg.vocab_size)
-    data["inputs"] = tokens
-    new_state, _ = pre_train.train_step(
-        state_graphdef, cfg, state_mesh_shardings=None, params_shardings=shardings, state=state_pure, data=data
-    )
-    return (
-        np.asarray(new_state.model.decoder.gate.bias.value),
-        np.asarray(new_state.model.mtp_block.mtp_layer_1.gate.bias.value),
-    )
-
   def test_ga1_bias_update_unchanged(self):
     tokens = _routed_tokens()
-    decoder_bias, mtp_bias = self._train_step_biases(1, tokens)
+    decoder_bias, mtp_bias = _train_step_router_biases(1, tokens)
     ref = [moe.calculate_load_balance_updates((tokens + off)[..., None] % 4, 4, _GA_RATE) for off in (0, 1, 2)]
     np.testing.assert_array_equal(decoder_bias, np.asarray(jnp.stack(ref[:2])))
     np.testing.assert_array_equal(mtp_bias, np.asarray(ref[2]))
 
   def test_ga2_bias_update_matches_global_batch(self):
     tokens = _routed_tokens()
-    decoder_bias, mtp_bias = self._train_step_biases(2, tokens)
+    decoder_bias, mtp_bias = _train_step_router_biases(2, tokens)
     np.testing.assert_allclose(decoder_bias, np.stack([_expected_bias(tokens, 0), _expected_bias(tokens, 1)]))
     np.testing.assert_allclose(mtp_bias, _expected_bias(tokens, 2))
     # Same global batch without GA gives the same update.
-    ga1_decoder_bias, ga1_mtp_bias = self._train_step_biases(1, tokens)
+    ga1_decoder_bias, ga1_mtp_bias = _train_step_router_biases(1, tokens)
     np.testing.assert_allclose(decoder_bias, ga1_decoder_bias)
     np.testing.assert_allclose(mtp_bias, ga1_mtp_bias)
     # The sum of per-microbatch votes (the old GA behaviour) differs for this batch.
     votes = sum(moe.calculate_load_balance_updates(tokens[rows, :, None] % 4, 4, _GA_RATE) for rows in ([0, 2], [1, 3]))
     self.assertFalse(np.allclose(np.asarray(votes), decoder_bias[0]))
+
+
+class TestRoutedBiasGlobalCountsChunks(unittest.TestCase):
+  """routed_bias_global_counts: with 2 token chunks the update follows the whole batch rather than the chunk average."""
+
+  def _chunk_average(self, tokens, offset):
+    idx = (tokens + offset)[..., None] % _GA_NUM_EXPERTS
+    halves = [idx[:, :2], idx[:, 2:]]
+    return np.asarray(sum(moe.calculate_load_balance_updates(h, _GA_NUM_EXPERTS, _GA_RATE) for h in halves) / 2)
+
+  def test_flag_off_keeps_chunk_average(self):
+    tokens = _routed_tokens()
+    decoder_bias, mtp_bias = _train_step_router_biases(1, tokens, n_chunks=2, global_counts=False)
+    np.testing.assert_array_equal(
+        decoder_bias, np.stack([self._chunk_average(tokens, 0), self._chunk_average(tokens, 1)])
+    )
+    np.testing.assert_array_equal(mtp_bias, self._chunk_average(tokens, 2))
+    # The chunk votes differ on this batch: opposite votes cancel to 0, and a chunk tied at its mean gives +-rate/2.
+    self.assertTrue(np.any(np.isclose(np.abs(decoder_bias), _GA_RATE / 2)))
+
+  def test_flag_on_matches_single_batch(self):
+    tokens = _routed_tokens()
+    decoder_bias, mtp_bias = _train_step_router_biases(1, tokens, n_chunks=2, global_counts=True)
+    np.testing.assert_allclose(decoder_bias, np.stack([_expected_bias(tokens, 0), _expected_bias(tokens, 1)]))
+    np.testing.assert_allclose(mtp_bias, _expected_bias(tokens, 2))
+    unchunked_decoder_bias, unchunked_mtp_bias = _train_step_router_biases(1, tokens, n_chunks=1, global_counts=False)
+    np.testing.assert_array_equal(decoder_bias, unchunked_decoder_bias)
+    np.testing.assert_array_equal(mtp_bias, unchunked_mtp_bias)
+
+  def test_ga2_with_chunks_matches_single_batch(self):
+    """Under GA the counts are summed over chunks and microbatches whatever the flag."""
+    tokens = _routed_tokens()
+    decoder_bias, mtp_bias = _train_step_router_biases(2, tokens, n_chunks=2, global_counts=False)
+    np.testing.assert_allclose(decoder_bias, np.stack([_expected_bias(tokens, 0), _expected_bias(tokens, 1)]))
+    np.testing.assert_allclose(mtp_bias, _expected_bias(tokens, 2))
 
 
 class TestGradientAccumulationAuxLosses(unittest.TestCase):
