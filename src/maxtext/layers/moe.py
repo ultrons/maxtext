@@ -1216,7 +1216,7 @@ class RoutedMoE(nnx.Module):
   def _ep_all_gather_fn(self):
     """Tiled all-gather over the EP axis, pinned to a SparseCore when moe_pin_sparse_core_all_gathers."""
     axis_name = self._expert_parallelism_name
-    if self.config.moe_pin_sparse_core_all_gathers:
+    if self.config.moe_pin_sparse_core_all_gathers or self.config.moe_pin_sparse_core_ep_all_gathers:
 
       @functools.partial(
           compute_on,
@@ -3329,7 +3329,8 @@ class RoutedMoE(nnx.Module):
           logical_axes=gate_logits_logical_axes,
       )
 
-    if self.config.moe_pin_sparse_core_all_gathers:
+    if self.config.moe_pin_sparse_core_all_gathers or self.config.moe_pin_sparse_core_fsdp_all_gathers:
+      fwd_only = self.config.moe_pin_sparse_core_fsdp_all_gathers_fwd_only
 
       def _fsdp_all_gather(w, pspec):
         if w is None or pspec is None:
@@ -3344,7 +3345,24 @@ class RoutedMoE(nnx.Module):
         def _reshard_fn(x):
           return self._maybe_shard_with_pspec(x, pspec)
 
-        return _reshard_fn(w)
+        if not fwd_only:
+          return _reshard_fn(w)
+
+        # Forward: the pinned SparseCore all-gather. Backward: the transpose of the unpinned reshard (a sharding
+        # constraint on the cotangent), so the weight-gradient reduce-scatter and its cross-slice all-reduce are
+        # not wrapped in a SparseCore compute_on region.
+        @jax.custom_vjp
+        def _pinned_fwd_reshard(x):
+          return _reshard_fn(x)
+
+        def _pinned_fwd_reshard_fwd(x):
+          return _reshard_fn(x), None
+
+        def _pinned_fwd_reshard_bwd(_, g):
+          return (self._maybe_shard_with_pspec(g, pspec),)
+
+        _pinned_fwd_reshard.defvjp(_pinned_fwd_reshard_fwd, _pinned_fwd_reshard_bwd)
+        return _pinned_fwd_reshard(w)
 
     else:
 
