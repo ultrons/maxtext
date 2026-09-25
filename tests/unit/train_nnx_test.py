@@ -36,6 +36,9 @@ from maxtext.common import train_state_nnx
 from maxtext.common.metric_logger import record_activation_metrics
 from maxtext.optimizers import optimizers
 from maxtext.trainers.pre_train import train as pre_train
+from maxtext.layers import moe
+from maxtext.layers.multi_token_prediction import mtp_losses
+from maxtext.utils import gradient_accumulation
 import optax
 
 
@@ -58,6 +61,7 @@ class _Cfg:
   retry_when_tokens_dropped: bool = False
   routed_bias: bool = False
   routed_bias_update_rate: float = 0.0
+  routed_bias_global_counts: bool = False
   mtp_num_layers: int = 0
   mtp_eval_target_module: int = 0
   use_qk_clip: bool = False
@@ -613,6 +617,264 @@ class TestRoutedBiasReadNNX(unittest.TestCase):
     data = _make_data(batch=cfg.micro_batch_size_to_train_on, vocab=cfg.vocab_size)
     _, aux = pre_train.loss_fn(model, cfg, data, None, None, is_train=True)
     self.assertIsNone(aux["moe_bias_updates"])
+
+
+_GA_NUM_EXPERTS = 4
+_GA_RATE = 0.01
+
+
+class _CountingRouter(nnx.Module):
+  """Router stub: routes each token to expert (token + offset) % E and sows the MoE bias signal.
+
+  The signal comes from moe.calculate_routed_bias_signal, so it is the bias update at GA=1 and
+  int32 expert counts at GA>1, as in RoutedMoE.
+  """
+
+  def __init__(self, bias_shape, offsets, ga_steps: int, n_chunks: int = 1, global_counts: bool = False):
+    self.gate = GateLogit(bias_shape)
+    self.offsets = tuple(offsets)
+    self.ga_steps = ga_steps
+    self.n_chunks = n_chunks
+    self.global_counts = global_counts
+
+  def _signal(self, indices, cfg):
+    """Per-layer signal; with n_chunks > 1 it splits the sequence like the chunked ring-of-experts path."""
+    if self.n_chunks == 1:
+      return moe.calculate_routed_bias_signal(indices, _GA_NUM_EXPERTS, cfg)
+    chunk = indices.shape[1] // self.n_chunks
+    chunk_signals = [
+        moe.calculate_routed_bias_signal(indices[:, c * chunk : (c + 1) * chunk], _GA_NUM_EXPERTS, cfg)
+        for c in range(self.n_chunks)
+    ]
+    return moe.combine_chunk_bias_signals(chunk_signals, cfg)
+
+  def __call__(self, tokens):
+    cfg = pytypes.SimpleNamespace(
+        gradient_accumulation_steps=self.ga_steps,
+        routed_bias_update_rate=_GA_RATE,
+        routed_bias_global_counts=self.global_counts,
+    )
+    signals = [self._signal((tokens + off)[..., None] % _GA_NUM_EXPERTS, cfg) for off in self.offsets]
+    signal = jnp.stack(signals) if len(self.gate.bias.shape) == 2 else signals[0]
+    self.sow(nnx.Intermediate, "moe_bias_updates", signal)
+
+
+class _TinyDecoderRoutedCounts(_TinyDecoder):
+  """`_TinyDecoder` whose scanned decoder (2 layers) and one MTP layer route tokens by id."""
+
+  def __init__(
+      self, vocab_size: int, hidden: int, rngs: nnx.Rngs, ga_steps: int, n_chunks: int = 1, global_counts: bool = False
+  ):
+    super().__init__(vocab_size, hidden, rngs=rngs)
+    kw = {"ga_steps": ga_steps, "n_chunks": n_chunks, "global_counts": global_counts}
+    self.decoder = _CountingRouter((2, _GA_NUM_EXPERTS), offsets=(0, 1), **kw)
+    self.mtp_block = nnx.Dict({"mtp_layer_1": _CountingRouter((_GA_NUM_EXPERTS,), offsets=(2,), **kw)})
+
+  def __call__(self, decoder_input_tokens, decoder_positions, **kwargs):
+    out = super().__call__(decoder_input_tokens, decoder_positions, **kwargs)
+    self.decoder(decoder_input_tokens)
+    self.mtp_block["mtp_layer_1"](decoder_input_tokens)
+    return out
+
+
+class _AuxLossMTPBlock(nnx.Module):
+  """Sows MTP loss components (token-summed loss and token count) the way MultiTokenPredictionBlock does."""
+
+  def __init__(self, hidden: int, rngs: nnx.Rngs):
+    self.v = nnx.Param(jax.random.normal(rngs.params(), (hidden,)))
+
+  def __call__(self, h):
+    per_token = jnp.tanh(h @ self.v[...]) ** 2
+    self.losses = mtp_losses(jnp.stack([jnp.sum(per_token)]))
+    self.weights = mtp_losses(jnp.stack([jnp.array(per_token.size, jnp.float32)]))
+
+
+class _TinyDecoderAuxLosses(_TinyDecoder):
+  """`_TinyDecoder` that also produces MoE load-balance, indexer and MTP losses.
+
+  Each auxiliary loss is a per-token mean, so for equal-sized microbatches the
+  mean over microbatches equals the global-batch value and the GA gradient can
+  be compared exactly against the non-GA gradient.
+  """
+
+  def __init__(self, vocab_size: int, hidden: int, rngs: nnx.Rngs):
+    super().__init__(vocab_size, hidden, rngs=rngs)
+    self.lb_w = nnx.Param(jax.random.normal(rngs.params(), (hidden,)))
+    self.indexer_w = nnx.Param(jax.random.normal(rngs.params(), (hidden,)))
+    self.mtp_block = _AuxLossMTPBlock(hidden, rngs)
+
+  def __call__(self, decoder_input_tokens, decoder_positions, **kwargs):
+    out = super().__call__(decoder_input_tokens, decoder_positions, **kwargs)
+    h = self.embed(decoder_input_tokens)
+    self.sow(nnx.Intermediate, "moe_lb_loss", jnp.atleast_1d(jnp.mean(jax.nn.sigmoid(h @ self.lb_w[...]))))
+    self.sow(indexer_losses, "indexer_loss", jnp.mean(jnp.sin(h @ self.indexer_w[...]) ** 2))
+    self.mtp_block(h)
+    return out
+
+
+def _params_shardings(model):
+  """Replicated NamedSharding tree on the model's mesh, shaped like nnx.split(model, nnx.Param, ...)[1]."""
+  _, params, _ = nnx.split(model, nnx.Param, ...)
+  ns = jax.sharding.NamedSharding(model.mesh, jax.sharding.PartitionSpec())
+  return jax.tree.map(lambda _: ns, params)
+
+
+def _routed_tokens():
+  """Global batch of 4 sequences; GA=2 takes rows (0, 2) and (1, 3) as its microbatches.
+
+  Decoder layer 0 (offset 0) sees counts [5, 1, 1, 1] in microbatch 0 and [0, 3, 3, 2] in
+  microbatch 1, so the per-microbatch votes disagree with the global vote on [5, 4, 4, 3].
+  """
+  return jnp.array([[0, 0, 0, 0], [1, 1, 2, 2], [0, 1, 2, 3], [1, 2, 3, 3]], dtype=jnp.int32)
+
+
+def _expected_bias(tokens, offset):
+  counts = np.bincount((np.asarray(tokens).ravel() + offset) % _GA_NUM_EXPERTS, minlength=_GA_NUM_EXPERTS)
+  return _GA_RATE * np.sign(counts.sum() / _GA_NUM_EXPERTS - counts)
+
+
+def _train_step_router_biases(ga_steps, tokens, n_chunks=1, global_counts=False):
+  """Runs one train_step and returns the (decoder, MTP) router biases after it."""
+  batch = tokens.shape[0]
+  cfg = _Cfg(
+      routed_bias=True,
+      routed_bias_update_rate=_GA_RATE,
+      routed_bias_global_counts=global_counts,
+      gradient_accumulation_steps=ga_steps,
+      micro_batch_size_to_train_on=batch // ga_steps,
+  )
+  model = _TinyDecoderRoutedCounts(
+      cfg.vocab_size, hidden=4, rngs=nnx.Rngs(0), ga_steps=ga_steps, n_chunks=n_chunks, global_counts=global_counts
+  )
+  shardings = _params_shardings(model)
+  ts = train_state_nnx.TrainStateNNX(model, nnx.Optimizer(model, optax.sgd(0.01), wrt=nnx.Param))
+  state_graphdef, state_pure = nnx.split(ts)
+  data = _make_data(batch=batch, seq=tokens.shape[1], vocab=cfg.vocab_size)
+  data["inputs"] = tokens
+  new_state, _ = pre_train.train_step(
+      state_graphdef, cfg, state_mesh_shardings=None, params_shardings=shardings, state=state_pure, data=data
+  )
+  return (
+      np.asarray(new_state.model.decoder.gate.bias.value),
+      np.asarray(new_state.model.mtp_block.mtp_layer_1.gate.bias.value),
+  )
+
+
+class TestGradientAccumulationRoutedBias(unittest.TestCase):
+  """Under GA the routed-bias update follows the expert counts of the whole global batch."""
+
+  def test_ga1_bias_update_unchanged(self):
+    tokens = _routed_tokens()
+    decoder_bias, mtp_bias = _train_step_router_biases(1, tokens)
+    ref = [moe.calculate_load_balance_updates((tokens + off)[..., None] % 4, 4, _GA_RATE) for off in (0, 1, 2)]
+    np.testing.assert_array_equal(decoder_bias, np.asarray(jnp.stack(ref[:2])))
+    np.testing.assert_array_equal(mtp_bias, np.asarray(ref[2]))
+
+  def test_ga2_bias_update_matches_global_batch(self):
+    tokens = _routed_tokens()
+    decoder_bias, mtp_bias = _train_step_router_biases(2, tokens)
+    np.testing.assert_allclose(decoder_bias, np.stack([_expected_bias(tokens, 0), _expected_bias(tokens, 1)]))
+    np.testing.assert_allclose(mtp_bias, _expected_bias(tokens, 2))
+    # Same global batch without GA gives the same update.
+    ga1_decoder_bias, ga1_mtp_bias = _train_step_router_biases(1, tokens)
+    np.testing.assert_allclose(decoder_bias, ga1_decoder_bias)
+    np.testing.assert_allclose(mtp_bias, ga1_mtp_bias)
+    # The sum of per-microbatch votes (the old GA behaviour) differs for this batch.
+    votes = sum(moe.calculate_load_balance_updates(tokens[rows, :, None] % 4, 4, _GA_RATE) for rows in ([0, 2], [1, 3]))
+    self.assertFalse(np.allclose(np.asarray(votes), decoder_bias[0]))
+
+
+class TestRoutedBiasGlobalCountsChunks(unittest.TestCase):
+  """routed_bias_global_counts: with 2 token chunks the update follows the whole batch rather than the chunk average."""
+
+  def _chunk_average(self, tokens, offset):
+    idx = (tokens + offset)[..., None] % _GA_NUM_EXPERTS
+    halves = [idx[:, :2], idx[:, 2:]]
+    return np.asarray(sum(moe.calculate_load_balance_updates(h, _GA_NUM_EXPERTS, _GA_RATE) for h in halves) / 2)
+
+  def test_flag_off_keeps_chunk_average(self):
+    tokens = _routed_tokens()
+    decoder_bias, mtp_bias = _train_step_router_biases(1, tokens, n_chunks=2, global_counts=False)
+    np.testing.assert_array_equal(
+        decoder_bias, np.stack([self._chunk_average(tokens, 0), self._chunk_average(tokens, 1)])
+    )
+    np.testing.assert_array_equal(mtp_bias, self._chunk_average(tokens, 2))
+    # The chunk votes differ on this batch: opposite votes cancel to 0, and a chunk tied at its mean gives +-rate/2.
+    self.assertTrue(np.any(np.isclose(np.abs(decoder_bias), _GA_RATE / 2)))
+
+  def test_flag_on_matches_single_batch(self):
+    tokens = _routed_tokens()
+    decoder_bias, mtp_bias = _train_step_router_biases(1, tokens, n_chunks=2, global_counts=True)
+    np.testing.assert_allclose(decoder_bias, np.stack([_expected_bias(tokens, 0), _expected_bias(tokens, 1)]))
+    np.testing.assert_allclose(mtp_bias, _expected_bias(tokens, 2))
+    unchunked_decoder_bias, unchunked_mtp_bias = _train_step_router_biases(1, tokens, n_chunks=1, global_counts=False)
+    np.testing.assert_array_equal(decoder_bias, unchunked_decoder_bias)
+    np.testing.assert_array_equal(mtp_bias, unchunked_mtp_bias)
+
+  def test_ga2_with_chunks_matches_single_batch(self):
+    """Under GA the counts are summed over chunks and microbatches whatever the flag."""
+    tokens = _routed_tokens()
+    decoder_bias, mtp_bias = _train_step_router_biases(2, tokens, n_chunks=2, global_counts=False)
+    np.testing.assert_allclose(decoder_bias, np.stack([_expected_bias(tokens, 0), _expected_bias(tokens, 1)]))
+    np.testing.assert_allclose(mtp_bias, _expected_bias(tokens, 2))
+
+
+class TestGradientAccumulationAuxLosses(unittest.TestCase):
+  """Under GA the MTP, indexer and load-balance gradients match the non-GA gradient of the global batch."""
+
+  def _cfg(self, ga_steps, batch):
+    """Config with MTP, indexer and load-balance losses on; GA microbatches of batch // ga_steps."""
+    cfg = _Cfg(
+        gradient_accumulation_steps=ga_steps,
+        micro_batch_size_to_train_on=batch // ga_steps,
+        num_experts=4,
+        mtp_num_layers=1,
+        use_indexer=True,
+        indexer_sparse_training=True,
+        indexer_loss_scaling_factor=1.0,
+    )
+    cfg.mtp_loss_scaling_factor = 0.5  # not a _Cfg field; read by calculate_mtp_loss
+    return cfg
+
+  def _data(self, batch=4, seq=4):
+    data = _make_data(batch=batch, seq=seq)
+    data["inputs"] = jax.random.randint(jax.random.PRNGKey(1), (batch, seq), 0, 8)
+    data["targets"] = jax.random.randint(jax.random.PRNGKey(2), (batch, seq), 0, 8)
+    return data
+
+  def _grads_as_dict(self, grads):
+    return {jax.tree_util.keystr(p): np.asarray(v) for p, v in jax.tree_util.tree_leaves_with_path(grads)}
+
+  def test_ga1_loss_unchanged(self):
+    data = self._data()
+    model = _TinyDecoderAuxLosses(8, hidden=4, rngs=nnx.Rngs(0))
+    loss, aux = pre_train.loss_fn(model, self._cfg(1, 4), data, None, None, is_train=True)
+    expected = aux["xent_sum"] / (aux["total_weights"] + 1e-8) + aux["mtp_loss"] + aux["indexer_loss"]
+    expected = expected + aux["moe_lb_loss"]
+    np.testing.assert_allclose(float(loss), float(expected), rtol=1e-6)
+
+  def test_ga2_aux_gradients_match_global_batch(self):
+    data = self._data()
+    ga_model = _TinyDecoderAuxLosses(8, hidden=4, rngs=nnx.Rngs(0))
+    _, aux, ga_grads = gradient_accumulation.gradient_accumulation_loss_and_grad(
+        pre_train.loss_fn, self._cfg(2, 4), ga_model, None, _params_shardings(ga_model), dict(data), None
+    )
+    self.assertGreater(float(aux["mtp_loss"]), 0.0)
+    self.assertGreater(float(aux["indexer_loss"]), 0.0)
+    self.assertGreater(float(aux["moe_lb_loss"]), 0.0)
+
+    ref_model = _TinyDecoderAuxLosses(8, hidden=4, rngs=nnx.Rngs(0))
+    grad_fn = nnx.value_and_grad(pre_train.loss_fn, argnums=0, has_aux=True)
+    _, ref_grads = grad_fn(ref_model, self._cfg(1, 4), dict(data), None, None, is_train=True)
+
+    got, want = self._grads_as_dict(ga_grads), self._grads_as_dict(ref_grads)
+    self.assertEqual(set(got), set(want))
+    for key in want:
+      np.testing.assert_allclose(got[key], want[key], rtol=1e-5, atol=1e-7, err_msg=key)
+    # The aux-only parameters get a gradient of ordinary size (not ~1/tokens).
+    for key in want:
+      if "lb_w" in key or "indexer_w" in key or "mtp_block" in key:
+        self.assertGreater(np.abs(want[key]).max(), 1e-3, key)
 
 
 class TestRecordActivationMetricsParity(unittest.TestCase):

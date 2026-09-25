@@ -1425,6 +1425,12 @@ class DeepSeekMoE(BaseModel):
   routed_score_func: str = Field("", description="Scoring function for routing (e.g., 'softmax', 'sigmoid').")
   routed_bias: bool = Field(False, description="Whether to add a bias term for routing.")
   routed_bias_update_rate: float = Field(0.0, description="Update rate applied to the router bias term.")
+  routed_bias_global_counts: bool = Field(
+      False,
+      description="Compute the routed-bias update once per optimizer step from per-expert token counts summed over"
+      " MoE token chunks (num_moe_token_chunks) and gradient accumulation microbatches, instead of averaging the"
+      " per-chunk updates. Gradient accumulation > 1 always uses summed counts.",
+  )
   log_moe_bias_norms: bool = Field(False, description="Whether to log the norms of MoE router biases.")
   mlp_bias: bool = Field(
       False,

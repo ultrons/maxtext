@@ -126,7 +126,9 @@ class RouteOutput:
   weights: jax.Array
   # Auxiliary loss for token distribution among experts.
   lb_loss: Optional[jax.Array]
-  # Dynamic bias updates for loss-free load balancing, used only for Deepseek models
+  # Dynamic bias updates for loss-free load balancing, used only for Deepseek models.
+  # Under gradient accumulation or routed_bias_global_counts this holds per-expert token counts instead
+  # (see routed_bias_emits_expert_counts).
   bias_updates: Optional[jax.Array]
   # Shape [local experts], tracks number of local tokens routed to every local expert.
   local_group_sizes: Optional[jax.Array] = None
@@ -443,6 +445,48 @@ def _top_2_in_group_sum(scores_grouped: jax.Array) -> jax.Array:
   return max_1.astype(jnp.float32) + max_2.astype(jnp.float32)
 
 
+def calculate_expert_counts(top_k_indices, num_experts, axis_names=None):
+  """Counts the tokens routed to each expert.
+
+  Args:
+      top_k_indices: Shape (batch, sequence, top_k).
+      num_experts: Total number of experts.
+      axis_names: Optional mesh axis names to reduce expert counts across.
+        When provided, expert token counts are collectively reduced (psum)
+        across these axes.
+
+  Returns:
+      expert_counts: int32 token count per expert. Shape (num_experts,).
+  """
+  flat_indices = top_k_indices.ravel()
+  # one_hot rather than bincount: bincount clips out-of-range values, so the -1
+  # padding that forced routing uses would all be counted as expert 0.
+  expert_counts = jnp.sum(jax.nn.one_hot(flat_indices, num_experts, dtype=jnp.int32), axis=0)
+  if axis_names:
+    expert_counts = jax.lax.psum(expert_counts, axis_names)
+  return expert_counts
+
+
+def expert_counts_to_bias_updates(expert_counts, rate):
+  """Converts per-expert token counts into the loss-free load-balancing bias update.
+
+  Args:
+      expert_counts: Token count per expert, experts on the last axis. Shape
+        (..., num_experts), e.g. (num_experts,) for one layer or
+        (num_layers, num_experts) for a scanned stack of layers.
+      rate: The update rate.
+
+  Returns:
+      update: rate * sign(mean_count - count), same shape as expert_counts.
+  """
+  num_experts = expert_counts.shape[-1]
+  total_tokens = jnp.sum(expert_counts, axis=-1, keepdims=True)
+  average_load = total_tokens / num_experts
+  direction = jnp.sign(average_load - expert_counts)
+  output = direction * rate
+  return output
+
+
 def calculate_load_balance_updates(top_k_indices, num_experts, rate, axis_names=None):
   """Computes a bias adjustment update based on expert load.
 
@@ -461,17 +505,43 @@ def calculate_load_balance_updates(top_k_indices, num_experts, rate, axis_names=
   Returns:
       update: The value to add to the expert bias. Shape (num_experts,).
   """
-  flat_indices = top_k_indices.ravel()
-  # one_hot rather than bincount: bincount clips out-of-range values, so the -1
-  # padding that forced routing uses would all be counted as expert 0.
-  expert_counts = jnp.sum(jax.nn.one_hot(flat_indices, num_experts, dtype=jnp.int32), axis=0)
-  if axis_names:
-    expert_counts = jax.lax.psum(expert_counts, axis_names)
-  total_tokens = jnp.sum(expert_counts)
-  average_load = total_tokens / num_experts
-  direction = jnp.sign(average_load - expert_counts)
-  output = direction * rate
-  return output
+  expert_counts = calculate_expert_counts(top_k_indices, num_experts, axis_names=axis_names)
+  return expert_counts_to_bias_updates(expert_counts, rate)
+
+
+def routed_bias_emits_expert_counts(config) -> bool:
+  """Whether MoE layers emit raw expert counts rather than the bias update.
+
+  With gradient accumulation the expert bias must follow the token counts of
+  the whole global batch, so each microbatch emits its per-expert counts, the
+  accumulation loop sums them and train_step converts the sum into one update
+  per optimizer step (expert_counts_to_bias_updates). routed_bias_global_counts
+  does the same without accumulation, so that the chunked ring-of-experts path
+  sums counts over its token chunks rather than averaging per-chunk updates.
+  Otherwise the layer emits the update itself, as before.
+  """
+  return config.gradient_accumulation_steps > 1 or bool(getattr(config, "routed_bias_global_counts", False))
+
+
+def calculate_routed_bias_signal(top_k_indices, num_experts, config, axis_names=None):
+  """Returns expert counts under gradient accumulation, else the bias update."""
+  if routed_bias_emits_expert_counts(config):
+    return calculate_expert_counts(top_k_indices, num_experts, axis_names=axis_names)
+  return calculate_load_balance_updates(top_k_indices, num_experts, config.routed_bias_update_rate, axis_names=axis_names)
+
+
+def combine_chunk_bias_signals(chunk_signals, config):
+  """Combines the per-chunk routed-bias signals of the chunked ring-of-experts path.
+
+  Expert counts (see routed_bias_emits_expert_counts) add up across chunks, so
+  the bias follows the whole batch. Per-chunk bias updates are averaged, which
+  is the default behaviour without gradient accumulation.
+  """
+  if chunk_signals[0] is None:
+    return None
+  if routed_bias_emits_expert_counts(config):
+    return sum(chunk_signals)
+  return sum(chunk_signals) / len(chunk_signals)
 
 
 def _batch_axis_names(pspec) -> tuple[str, ...] | None:
@@ -1391,10 +1461,10 @@ class RoutedMoE(nnx.Module):
       lb_loss = self.load_balance_loss(selected_experts, softmax_probs)
 
     if self.should_update_load_balance():
-      bias_updates = calculate_load_balance_updates(
+      bias_updates = calculate_routed_bias_signal(
           selected_experts,
           self.config.num_experts,
-          self.config.routed_bias_update_rate,
+          self.config,
           axis_names=mesh_axis_names,
       )
     else:
@@ -3097,7 +3167,9 @@ class RoutedMoE(nnx.Module):
         # free to overlap chunk (c+1)'s EP all-gather and chunk (c-1)'s
         # reduce-scatter with chunk c's GMM compute. Token routing is per-token, so
         # the main (lm) output is identical to n_chunks=1; only the aggregate
-        # load-balance loss / bias updates are averaged across chunks.
+        # load-balance loss / bias updates are averaged across chunks (expert
+        # counts, emitted under gradient accumulation or routed_bias_global_counts,
+        # are summed instead).
         seq_len = x.shape[1]
         chunk = seq_len // n_chunks
         outs, lb_losses, bias_updates_list, has_overflows, required_rbfs = [], [], [], [], []
@@ -3136,7 +3208,7 @@ class RoutedMoE(nnx.Module):
           required_rbfs.append(req_c)
         output = jnp.concatenate(outs, axis=1)
         lb_loss = None if lb_losses[0] is None else sum(lb_losses) / n_chunks
-        bias_updates = None if bias_updates_list[0] is None else sum(bias_updates_list) / n_chunks
+        bias_updates = combine_chunk_bias_signals(bias_updates_list, self.config)
         has_overflow = jnp.any(jnp.stack(has_overflows))
         # Each chunk has its own buffer, so the step needs the largest per-chunk factor.
         required_rbf = None if required_rbfs[0] is None else jnp.max(jnp.stack(required_rbfs))
@@ -3603,10 +3675,10 @@ class RoutedMoE(nnx.Module):
     if self.should_update_load_balance():
       # Under plain JIT (dense_matmul), GSPMD automatically inserts the all-reduce
       # across partitioned batch/sequence axes on global arrays, so axis_names=None.
-      bias_updates = calculate_load_balance_updates(
+      bias_updates = calculate_routed_bias_signal(
           top_k_indices,
           self.config.num_experts,
-          self.config.routed_bias_update_rate,
+          self.config,
           axis_names=None,
       )
     else:

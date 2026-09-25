@@ -493,6 +493,86 @@ class DeepSeekRoutingTest(unittest.TestCase):
 
     assert_moe_close(actual_updates, expected_updates, jnp.float32)
 
+  def test_bias_update_split_matches_single_formula(self):
+    """calculate_load_balance_updates is bit-identical to the one-shot formula it replaced."""
+    num_experts, rate = 8, 0.001
+    top_k_indices = jax.random.randint(jax.random.PRNGKey(3), (4, 16, 2), 0, num_experts)
+    flat = top_k_indices.ravel()
+    counts = jnp.sum(jax.nn.one_hot(flat, num_experts, dtype=jnp.int32), axis=0)
+    reference = jnp.sign(jnp.sum(counts) / num_experts - counts) * rate
+    actual = moe.calculate_load_balance_updates(top_k_indices, num_experts, rate)
+    self.assertEqual(actual.shape, (num_experts,))
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(reference))
+
+  def test_routed_bias_signal_depends_on_gradient_accumulation(self):
+    """GA=1 emits the bias update itself; GA>1 emits int32 expert counts."""
+    num_experts, rate = 4, 0.01
+    top_k_indices = jnp.array([[[0, 1], [3, 0], [3, 1], [1, 0]], [[0, 3], [2, 0], [1, 2], [2, 3]]])
+    ga1 = SimpleNamespace(gradient_accumulation_steps=1, routed_bias_update_rate=rate)
+    ga2 = SimpleNamespace(gradient_accumulation_steps=2, routed_bias_update_rate=rate)
+    np.testing.assert_array_equal(
+        np.asarray(moe.calculate_routed_bias_signal(top_k_indices, num_experts, ga1)),
+        np.asarray(moe.calculate_load_balance_updates(top_k_indices, num_experts, rate)),
+    )
+    counts = moe.calculate_routed_bias_signal(top_k_indices, num_experts, ga2)
+    self.assertEqual(counts.dtype, jnp.int32)
+    np.testing.assert_array_equal(np.asarray(counts), np.array([5, 4, 3, 4]))
+
+  def test_bias_update_from_summed_counts_matches_global_batch(self):
+    """Summing per-microbatch counts, then taking the sign, equals the global-batch update."""
+    num_experts, rate = 4, 0.01
+    # Microbatch votes disagree with the global vote: mb0 counts [5, 1, 1, 1],
+    # mb1 counts [0, 3, 3, 2]; global counts [5, 4, 4, 3].
+    mb0 = jnp.array([[[0], [0], [0], [0]], [[0], [1], [2], [3]]])
+    mb1 = jnp.array([[[1], [1], [2], [2]], [[1], [2], [3], [3]]])
+    global_update = moe.calculate_load_balance_updates(jnp.concatenate([mb0, mb1]), num_experts, rate)
+    summed_counts = moe.calculate_expert_counts(mb0, num_experts) + moe.calculate_expert_counts(mb1, num_experts)
+    np.testing.assert_array_equal(
+        np.asarray(moe.expert_counts_to_bias_updates(summed_counts, rate)), np.asarray(global_update)
+    )
+    np.testing.assert_allclose(np.asarray(global_update), np.array([-0.01, 0.0, 0.0, 0.01]))
+    # The per-microbatch vote that GA used to sum is a different update.
+    vote_sum = moe.calculate_load_balance_updates(mb0, num_experts, rate) + moe.calculate_load_balance_updates(
+        mb1, num_experts, rate
+    )
+    self.assertFalse(np.allclose(np.asarray(vote_sum), np.asarray(global_update)))
+
+  def test_bias_update_from_stacked_counts_is_per_layer(self):
+    """For scanned (num_layers, num_experts) counts the mean is taken per layer."""
+    rate = 0.01
+    counts = jnp.array([[5, 1, 1, 1], [0, 30, 30, 20]], dtype=jnp.int32)
+    stacked = moe.expert_counts_to_bias_updates(counts, rate)
+    for layer in range(counts.shape[0]):
+      np.testing.assert_array_equal(
+          np.asarray(stacked[layer]), np.asarray(moe.expert_counts_to_bias_updates(counts[layer], rate))
+      )
+
+  def test_chunk_bias_signals_default_averages_chunk_updates(self):
+    """Flag off at GA=1: the chunked path averages the per-chunk updates, as before."""
+    num_experts, rate = 4, 0.01
+    cfg = SimpleNamespace(gradient_accumulation_steps=1, routed_bias_update_rate=rate, routed_bias_global_counts=False)
+    top_k_indices = jnp.array([[0, 0, 0, 0], [1, 1, 2, 2], [0, 1, 2, 3], [1, 2, 3, 3]])[..., None]
+    chunks = [top_k_indices[:, :2], top_k_indices[:, 2:]]
+    signals = [moe.calculate_routed_bias_signal(c, num_experts, cfg) for c in chunks]
+    combined = moe.combine_chunk_bias_signals(signals, cfg)
+    reference = (signals[0] + signals[1]) / 2
+    np.testing.assert_array_equal(np.asarray(combined), np.asarray(reference))
+    np.testing.assert_allclose(np.asarray(combined), np.array([-0.005, 0.0, 0.0, 0.0]))
+
+  def test_chunk_bias_signals_global_counts_matches_single_batch(self):
+    """Flag on: summed chunk counts give the update of the unchunked batch although the chunk votes disagree."""
+    num_experts, rate = 4, 0.01
+    cfg = SimpleNamespace(gradient_accumulation_steps=1, routed_bias_update_rate=rate, routed_bias_global_counts=True)
+    top_k_indices = jnp.array([[0, 0, 0, 0], [1, 1, 2, 2], [0, 1, 2, 3], [1, 2, 3, 3]])[..., None]
+    chunks = [top_k_indices[:, :2], top_k_indices[:, 2:]]
+    # Chunk votes: [-1, -1, 1, 1] and [0, 1, -1, -1] (times rate); the whole batch gives [-1, 0, 0, 1].
+    signals = [moe.calculate_routed_bias_signal(c, num_experts, cfg) for c in chunks]
+    self.assertEqual(signals[0].dtype, jnp.int32)
+    combined = moe.combine_chunk_bias_signals(signals, cfg)
+    single_batch = moe.calculate_load_balance_updates(top_k_indices, num_experts, rate)
+    np.testing.assert_array_equal(np.asarray(moe.expert_counts_to_bias_updates(combined, rate)), np.asarray(single_batch))
+    np.testing.assert_allclose(np.asarray(single_batch), np.array([-0.01, 0.0, 0.0, 0.01]))
+
   def test_batch_axis_names(self):
     # pylint: disable=protected-access
     self.assertIsNone(moe._batch_axis_names(None))
