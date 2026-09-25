@@ -71,6 +71,32 @@ WI_1 = "wi_1"
 WO = "wo"
 
 
+def _order_after(x, dep):
+  """Returns x with a data dependency on `dep` (forward only).
+
+  The forward pass adds `0 * dep[0]` to x, so every consumer of the result is scheduled after dep
+  exists. An optimization_barrier does not survive to the TPU schedule here (no barrier and no control
+  dependency remain in the optimized HLO), while XLA does not fold a floating-point multiply by zero,
+  so the dependency does. Apply it to a small operand: it adds one elementwise pass over x. The
+  backward pass returns the cotangent of x unchanged and a zero cotangent for dep.
+  """
+  if not jnp.issubdtype(x.dtype, jnp.floating):
+    raise ValueError(f"_order_after needs a floating-point x, got {x.dtype}")
+
+  @jax.custom_vjp
+  def _tie(v, d):
+    return v + (jnp.reshape(d, (-1,))[0] * 0).astype(v.dtype)
+
+  def _fwd(v, d):
+    return _tie(v, d), None
+
+  def _bwd(_, g):
+    return g, jnp.zeros(dep.shape, dep.dtype)
+
+  _tie.defvjp(_fwd, _bwd)
+  return _tie(x, dep)
+
+
 @struct.dataclass
 class RouteMetadata:
   """EP communication state needed to undo the forward all-to-all after expert computation."""
@@ -2866,6 +2892,7 @@ class RoutedMoE(nnx.Module):
         rngs,
         forced_routed_experts=None,
         force_dropless=False,
+        combine_after=None,
     ):
       batch_size, sequence_length, embed_dim = x.shape
       if self.config.num_moe_emb_chunks > 0:
@@ -2923,11 +2950,16 @@ class RoutedMoE(nnx.Module):
       intermediate_output = adc.checkpoint_name(adc.checkpoint_name(intermediate_output, "mlpwo"), "moe_mlpwo")
 
       if self.config.use_ring_of_experts:
+        unpermute_weights = routing.weights
+        if combine_after is not None:
+          # moe_combine_per_chunk: this chunk's unpermute waits on the previous chunk's combine reduce-scatter
+          # (a data dependency on the small routing-weight operand of the unpermute).
+          unpermute_weights = adc.checkpoint_name(_order_after(unpermute_weights, combine_after), "moe_combine_order")
         # Unsort and deduplicate the outputs locally.
         output = self.unpermute(
             intermediate_output,
             routing.sorted_selected_experts,
-            routing.weights,
+            unpermute_weights,
             batch_size=batch_size,
             sequence_length=sequence_length,
             use_custom_sort_vjp=self.config.use_custom_sort_vjp,
@@ -3093,6 +3125,7 @@ class RoutedMoE(nnx.Module):
               rngs,
               None if forced_routed_experts is None else forced_routed_experts[:, sl, :],
               force_dropless=force_dropless,
+              combine_after=outs[-1] if (self.config.moe_combine_per_chunk and outs) else None,
           )
           if barrier_enabled:
             _prev = out_c
