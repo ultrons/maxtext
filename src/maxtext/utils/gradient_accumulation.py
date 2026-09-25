@@ -187,6 +187,10 @@ def gradient_accumulation_loss_and_grad(
       raw_grads,
   )
   scanned_aux = aux
+  # Sum every aux leaf over microbatches. Under gradient accumulation the MoE
+  # layers emit int32 per-expert token counts in "moe_bias_updates" and
+  # "mtp_moe_bias_updates" (moe.routed_bias_emits_expert_counts), so this sum
+  # gives the global-batch counts that train_step turns into one bias update.
   aux = jax.tree.map(lambda x: jnp.sum(x, axis=0), aux)  # pytype: disable=module-attr
   if "te_moe_capacity_overflow" in scanned_aux:
     aux["te_moe_capacity_overflow"] = jnp.any(scanned_aux["te_moe_capacity_overflow"], axis=0)

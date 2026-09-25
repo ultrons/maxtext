@@ -56,6 +56,7 @@ from maxtext.utils import elastic_utils
 # pylint: disable=too-many-positional-arguments
 from maxtext.layers.multi_token_prediction import calculate_mtp_acceptance_rate, calculate_mtp_loss, mtp_acceptance, mtp_losses
 from maxtext.layers.attention_mla import indexer_losses
+from maxtext.layers import moe
 from maxtext.common import checkpointing, profiler
 from maxtext.common.goodput import (
     GoodputEvent,
@@ -271,7 +272,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   # Zero1+GA to reduce communication overhead.
   # EPS was used to avoid division by zero, but it's not needed when gradient
   # accumulation is enabled since there's no division.
-  if config.gradient_accumulation_steps > 1 and not config.use_tunix_gradient_accumulation:
+  manual_gradient_accumulation = config.gradient_accumulation_steps > 1 and not config.use_tunix_gradient_accumulation
+  if manual_gradient_accumulation:
     loss = xent_sum
   else:
     # When using Tunix gradient accumulation, we revert to standard normalization.
@@ -283,11 +285,24 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   # We keep z-loss normalized by total_weights.
   total_z_loss = total_z_loss / (total_weights + EPS)
 
+  # The auxiliary losses below (MTP, indexer, MoE load balance) are already
+  # normalized means. Under manual gradient accumulation the objective is the
+  # unnormalized xent_sum and the accumulated gradient is divided by the token
+  # count of the whole global batch, so each auxiliary term is scaled by this
+  # microbatch's token count to keep its gradient weight at 1/GA per microbatch
+  # (exactly so when microbatches carry equal token counts). The aux values
+  # themselves are returned unscaled for logging, and eval_step's loss is left
+  # as before.
+  def _add_aux_loss(total, aux_loss):
+    if manual_gradient_accumulation and is_train:
+      return total + aux_loss * jnp.asarray(total_weights, jnp.float32)
+    return total + aux_loss
+
   # Calculate and Add MTP Loss
   mtp_loss = 0.0
   if config.mtp_num_layers > 0 and is_train:
     mtp_loss = calculate_mtp_loss(intermediate_outputs, config)
-    loss += mtp_loss
+    loss = _add_aux_loss(loss, mtp_loss)
 
   # Calculate and add auxiliary Indexer loss
   indexer_loss = 0.0
@@ -296,7 +311,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     indexer_losses_list = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "indexer_loss")
     if indexer_losses_list:
       indexer_loss = jnp.mean(jnp.concatenate([jnp.atleast_1d(x) for x in indexer_losses_list]))
-      loss += indexer_loss  # Injects loss into scalar objective to drive backward gradients for indexer weights.
+      # Injects loss into scalar objective to drive backward gradients for indexer weights.
+      loss = _add_aux_loss(loss, indexer_loss)
     else:
       max_logging.debug("No Indexer loss found. Defaulting to 0.0.")
 
@@ -306,7 +322,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     moe_lb_losses = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "moe_lb_loss")
     if moe_lb_losses:
       moe_lb_loss = jnp.mean(jnp.concatenate(moe_lb_losses))
-      loss += moe_lb_loss
+      loss = _add_aux_loss(loss, moe_lb_loss)
     else:
       max_logging.debug("\nNo MoE load balance loss found. Defaulting to 0.0.")
 
@@ -384,6 +400,19 @@ def _find_gate_bias(module: nnx.Module | None) -> nnx.Variable | None:
     if type(node).__name__ == "GateLogit" and hasattr(node, "bias") and node.bias is not None:
       return node.bias
   return None
+
+
+def _routed_bias_update(signal, config):
+  """Returns the routed-bias update to add for one optimizer step.
+
+  Without gradient accumulation the MoE layers already emit the update. With
+  it they emit per-expert token counts, which the accumulation loop sums over
+  microbatches, so the update is computed here once from the global-batch counts.
+  """
+  signal = jnp.array(signal)
+  if moe.routed_bias_emits_expert_counts(config):
+    return moe.expert_counts_to_bias_updates(signal, config.routed_bias_update_rate)
+  return signal
 
 
 def train_step(model, config, state_mesh_shardings, params_shardings, state, data, dropout_rng=None):
@@ -549,7 +578,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
           continue
         for _, node in nnx.iter_graph(target):
           if type(node).__name__ == "GateLogit" and hasattr(node, "bias") and node.bias is not None:
-            update_val = update[0] if isinstance(update, (tuple, list)) else update
+            update_val = _routed_bias_update(update[0] if isinstance(update, (tuple, list)) else update, config)
             name_prefix = "-".join(map(str, prefix))
             if getattr(config, "log_moe_bias_norms", False):
               bias_metrics[f"learning/moe_bias_before_norm_{name_prefix}"] = jnp.linalg.norm(node.bias.value)
@@ -562,7 +591,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       decoder_layer = getattr(new_state.model.decoder, "moe_layers", new_state.model.decoder)
       decoder_bias = _find_gate_bias(decoder_layer)
       if decoder_bias is not None:
-        decoder_bias.value = decoder_bias.value + jnp.array(moe_bias_updates[0])
+        decoder_bias.value = decoder_bias.value + _routed_bias_update(moe_bias_updates[0], config)
 
       # 2. Update auxiliary MTP MoE layers (if enabled).
       # Unlike the main decoder, each MTP layer is an individual un-scanned layer
@@ -572,7 +601,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
           mtp_layer = getattr(new_state.model.mtp_block, f"mtp_layer_{i + 1}", None)
           mtp_bias = _find_gate_bias(mtp_layer)
           if mtp_bias is not None:
-            mtp_bias.value = mtp_bias.value + jnp.array(update)
+            mtp_bias.value = mtp_bias.value + _routed_bias_update(update, config)
 
   lm_loss = xent_sum / (total_weights + EPS)
   scalar_metrics = {
