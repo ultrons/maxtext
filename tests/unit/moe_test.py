@@ -2366,6 +2366,147 @@ class QuantizedMoeTest(parameterized.TestCase):
     compare_tree(tree_ref, tree_tgt, relative_norm_diff_threshold=0.22)
 
 
+class Fp8CommsTest(parameterized.TestCase):
+  """fp8 payloads on the ring-of-experts EP collectives (CPU; any device count)."""
+
+  def _ep_mesh(self):
+    return Mesh(np.array(jax.devices()), ("expert",))
+
+  def test_token_all_gather_quantization_matches_gmm_v2_inkernel_quantization(self):
+    """moe_quantize_token_all_gather sends the exact fp8 bits gmm_v2 would quantize in-kernel.
+
+    Reference is the in-kernel static-scale path of pallas_mosaic_tpu_v2_gmm_kernel.py
+    (`clip(block_lhs * (1 / lhs_scale), -dtype_max, dtype_max).astype(lhs_q_dtype)` in f32) with the
+    lhs_scale that ops._fwd_prepare_lhs_scale hands the kernel.
+    """
+    from maxtext.kernels.megablox import ops as mblx_ops  # pylint: disable=import-outside-toplevel
+    import qwix.pallas as qpl  # pylint: disable=import-outside-toplevel
+
+    calib = "fixed,-224,224"
+    rule = SimpleNamespace(act_calibration_method=calib, act_qtype=jnp.float8_e4m3fn)
+    x = jax.random.normal(jax.random.PRNGKey(0), (512, 256), jnp.float32) * 150.0
+    edge = jnp.array([0.0, -0.0, 224.0, -224.0, 223.9, 300.0, -1e4, 1e-8, 5e-3, 0.4375, 0.46875], jnp.float32)
+    x = x.at[0, : edge.shape[0]].set(edge).astype(jnp.bfloat16)
+
+    sent = qpl.quantize(x, qtype=jnp.float8_e4m3fn, channelwise_axes=(), calibration_method=calib)
+    lhs_scale = mblx_ops._fwd_prepare_lhs_scale(rule).astype(jnp.float32)  # pylint: disable=protected-access
+    dtype_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    inkernel = jnp.clip(x * (1.0 / lhs_scale), -dtype_max, dtype_max).astype(jnp.float8_e4m3fn)
+
+    np.testing.assert_array_equal(np.asarray(sent.qvalue).view(np.uint8), np.asarray(inkernel).view(np.uint8))
+    self.assertEqual(float(sent.scale.reshape(())), float(lhs_scale.reshape(())))
+
+  def test_quantize_then_all_gather_equals_all_gather_then_quantize(self):
+    """A per-tensor static scale commutes with the EP all-gather and the expert sort."""
+    import qwix.pallas as qpl  # pylint: disable=import-outside-toplevel
+
+    mesh = self._ep_mesh()
+    n = mesh.shape["expert"]
+    calib = "fixed,-224,224"
+    x = (jax.random.normal(jax.random.PRNGKey(1), (n * 8, 128), jnp.float32) * 100.0).astype(jnp.bfloat16)
+    perm = jax.random.permutation(jax.random.PRNGKey(2), n * 8)
+
+    def q(z):
+      return qpl.quantize(z, qtype=jnp.float8_e4m3fn, channelwise_axes=(), calibration_method=calib).qvalue
+
+    def gather_after_quantize(z):
+      return jax.lax.all_gather(q(z), "expert", tiled=True)[perm]
+
+    def quantize_after_gather(z):
+      return q(jax.lax.all_gather(z, "expert", tiled=True)[perm])
+
+    outs = [
+        jax.jit(jax.shard_map(f, mesh=mesh, in_specs=P("expert"), out_specs=P("expert"), check_vma=False))(x)
+        for f in (gather_after_quantize, quantize_after_gather)
+    ]
+    np.testing.assert_array_equal(np.asarray(outs[0]).view(np.uint8), np.asarray(outs[1]).view(np.uint8))
+
+  def test_quantize_rows_fp8_zero_rows_and_bound(self):
+    x = jax.random.normal(jax.random.PRNGKey(3), (6, 4, 64), jnp.float32).astype(jnp.bfloat16)
+    x = x.at[1, 2].set(0.0)
+    for qtype, rel_bound in ((jnp.float8_e4m3fn, 2.0**-4), (jnp.float8_e5m2, 2.0**-3)):
+      qvalue, scale = moe.quantize_rows_fp8(x, qtype)
+      self.assertEqual(qvalue.dtype, qtype)
+      self.assertEqual(scale.shape, (6, 4, 1))
+      y = moe.dequantize_rows_fp8(qvalue, scale, jnp.float32)
+      np.testing.assert_array_equal(np.asarray(y[1, 2]), np.zeros((64,), np.float32))
+      xf = x.astype(jnp.float32)
+      err = jnp.abs(y - xf)
+      # Round-to-nearest in fp8 of a normal value: relative error <= 2^-(mantissa bits + 1).
+      normal = jnp.abs(xf) >= scale * float(jnp.finfo(qtype).smallest_normal)
+      self.assertTrue(bool(jnp.all(jnp.where(normal, err <= rel_bound * jnp.abs(xf) + 1e-30, True))))
+
+  @parameterized.named_parameters(("e4m3", "float8_e4m3fn"), ("e5m2", "float8_e5m2"))
+  def test_ep_combine_reduce_scatter_fp8_bwd(self, qtype_name):
+    """Forward is bitwise the bf16 reduce-scatter; backward all-gathers the per-row fp8 cotangent."""
+    mesh = self._ep_mesh()
+    n = mesh.shape["expert"]
+    qtype = jnp.dtype(qtype_name)
+    x = jax.random.normal(jax.random.PRNGKey(4), (n * n * 2, 8, 64), jnp.float32).astype(jnp.bfloat16)
+    cot = jax.random.normal(jax.random.PRNGKey(5), (n * 2, 8, 64), jnp.float32).astype(jnp.bfloat16)
+
+    def make(bwd_qtype):
+      def body(z):
+        return moe.ep_combine_reduce_scatter(z, "expert", bwd_qtype=bwd_qtype)
+
+      f = jax.shard_map(body, mesh=mesh, in_specs=P("expert"), out_specs=P("expert"), check_vma=False)
+      return jax.jit(lambda z: jax.vjp(f, z))
+
+    out_ref, vjp_ref = make(None)(x)
+    out_q, vjp_q = make(qtype)(x)
+    np.testing.assert_array_equal(np.asarray(out_ref, np.float32), np.asarray(out_q, np.float32))
+
+    (g_ref,) = vjp_ref(cot)
+    (g_q,) = vjp_q(cot)
+    # Reference backward: every shard receives the full cotangent (all-gather of the scattered shards).
+    np.testing.assert_array_equal(np.asarray(g_ref, np.float32), np.tile(np.asarray(cot, np.float32), (n, 1, 1)))
+    # fp8 backward: every shard receives the per-row quantize/dequantize of the cotangent, exactly.
+    qvalue, scale = moe.quantize_rows_fp8(cot, qtype)
+    expected = moe.dequantize_rows_fp8(qvalue, scale, cot.dtype)
+    np.testing.assert_array_equal(np.asarray(g_q, np.float32), np.tile(np.asarray(expected, np.float32), (n, 1, 1)))
+
+  @parameterized.named_parameters(("bf16_bwd", None), ("fp8_bwd", "float8_e4m3fn"))
+  def test_ep_combine_fp8_all_to_all_forward(self, bwd_qtype_name):
+    """moe_fp8_combine: forward = f32 sum of the per-row fp8 round trip of each shard's contribution."""
+    mesh = self._ep_mesh()
+    n = mesh.shape["expert"]
+    bwd_qtype = None if bwd_qtype_name is None else jnp.dtype(bwd_qtype_name)
+    x = jax.random.normal(jax.random.PRNGKey(6), (n * n * 2, 8, 64), jnp.float32).astype(jnp.bfloat16)
+    cot = jax.random.normal(jax.random.PRNGKey(7), (n * 2, 8, 64), jnp.float32).astype(jnp.bfloat16)
+
+    def make(fwd_qtype, bq):
+      def body(z):
+        return moe.ep_combine_reduce_scatter(z, "expert", bwd_qtype=bq, fwd_qtype=fwd_qtype)
+
+      f = jax.shard_map(body, mesh=mesh, in_specs=P("expert"), out_specs=P("expert"), check_vma=False)
+      return jax.jit(lambda z: jax.vjp(f, z))
+
+    out_ref, vjp_ref = make(None, None)(x)
+    out_q, vjp_q = make(jnp.float8_e4m3fn, bwd_qtype)(x)
+
+    # Expected: source shard i's rows for destination j, per-row fp8 round trip, summed over i in f32.
+    qvalue, scale = moe.quantize_rows_fp8(x, jnp.float8_e4m3fn)
+    dq = (qvalue.astype(jnp.float32) * scale).reshape((n, n * 2) + x.shape[1:])
+    expected = jnp.concatenate([jnp.sum(dq[:, j * 2 : (j + 1) * 2], axis=0) for j in range(n)]).astype(jnp.bfloat16)
+    np.testing.assert_allclose(np.asarray(out_q, np.float32), np.asarray(expected, np.float32), rtol=2**-7, atol=1e-6)
+    # And it is an fp8-sized perturbation of the bf16 reduce-scatter.
+    ref = np.asarray(out_ref, np.float32)
+    rel = np.linalg.norm(np.asarray(out_q, np.float32) - ref) / np.linalg.norm(ref)
+    self.assertLess(rel, 2**-4)
+    if n > 1:
+      self.assertGreater(rel, 0.0)
+
+    (g_ref,) = vjp_ref(cot)
+    (g_q,) = vjp_q(cot)
+    if bwd_qtype is None:
+      # Straight-through backward: exactly the reduce-scatter's transpose.
+      np.testing.assert_array_equal(np.asarray(g_q, np.float32), np.asarray(g_ref, np.float32))
+    else:
+      qv, sc = moe.quantize_rows_fp8(cot, bwd_qtype)
+      exp_g = moe.dequantize_rows_fp8(qv, sc, cot.dtype)
+      np.testing.assert_array_equal(np.asarray(g_q, np.float32), np.tile(np.asarray(exp_g, np.float32), (n, 1, 1)))
+
+
 class GetEinsumTest(parameterized.TestCase):
   """Tests for the quantized einsums RoutedMoE.get_einsum hands to dense_matmul."""
 

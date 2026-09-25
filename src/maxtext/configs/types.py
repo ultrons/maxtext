@@ -1206,6 +1206,32 @@ class MoEGeneral(BaseModel):
       1,
       description="SparseCore ID to pin MoE EP all-gathers to when moe_pin_sparse_core_all_gathers is True.",
   )
+  moe_fp8_bwd_dispatch: bool = Field(
+      False,
+      description=(
+          "Ring of experts: send the backward of the combine reduce-scatter (the all-gather of the MoE output"
+          " cotangent to every expert shard) as an fp8 payload with a per-row f32 scale, dequantized to the"
+          " cotangent dtype after the gather. Halves that all-gather's bytes; the forward is unchanged. A precision"
+          " change of the expert and router gradients (not bitwise), see repro/mlperf/FP8_COMMS.md."
+      ),
+  )
+  moe_fp8_bwd_dispatch_qtype: str = Field(
+      "float8_e4m3fn",
+      description="fp8 dtype of the moe_fp8_bwd_dispatch payload (float8_e4m3fn or float8_e5m2).",
+  )
+  moe_fp8_combine: bool = Field(
+      False,
+      description=(
+          "Ring of experts: replace the forward combine reduce-scatter by an fp8 (e4m3, per-row f32 scale)"
+          " all-to-all over the EP axis followed by a local f32 sum. Changes the forward activations; the"
+          " backward stays the all-gather of the cotangent (fp8 if moe_fp8_bwd_dispatch). See"
+          " repro/mlperf/FP8_COMMS.md."
+      ),
+  )
+  moe_fp8_combine_pin_sparse_core: bool = Field(
+      False,
+      description="Pin the moe_fp8_combine all-to-all to the EP SparseCore (compute_on) instead of leaving it to XLA.",
+  )
   use_random_routing: bool = Field(False, description="Whether to use random routing for debugging.")
   interleave_moe_layer_step: int = Field(1, description="Frequency of MoE layers, e.g., 2 means every 2nd layer is MoE.")
   moe_fsdp_use_two_stage_all_gather: bool = Field(
@@ -3892,6 +3918,18 @@ class MaxTextConfig(
             f"Got use_gmm_v2={self.use_gmm_v2}, use_ring_of_experts={self.use_ring_of_experts}."
         )
 
+  def validate_moe_fp8_bwd_dispatch(self):
+    """Validates moe_fp8_bwd_dispatch and moe_fp8_combine settings."""
+    if self.moe_fp8_bwd_dispatch:
+      if not self.use_ring_of_experts:
+        raise ValueError("moe_fp8_bwd_dispatch=True requires use_ring_of_experts=True.")
+      if self.moe_fp8_bwd_dispatch_qtype not in ("float8_e4m3fn", "float8_e5m2"):
+        raise ValueError(
+            "moe_fp8_bwd_dispatch_qtype must be float8_e4m3fn or float8_e5m2, got" f" {self.moe_fp8_bwd_dispatch_qtype}."
+        )
+    if self.moe_fp8_combine and not self.use_ring_of_experts:
+      raise ValueError("moe_fp8_combine=True requires use_ring_of_experts=True.")
+
   def validate_moe_quantize_token_all_gather(self):
     """Validates that moe_quantize_token_all_gather is used with supported settings."""
     if self.moe_quantize_token_all_gather:
@@ -4856,6 +4894,7 @@ class MaxTextConfig(
       self.validate_retry_when_tokens_dropped()
     self.validate_num_moe_emb_chunks()
     self.validate_moe_quantize_token_all_gather()
+    self.validate_moe_fp8_bwd_dispatch()
     self.validate_mllog()
     self.validate_retry_dropless_first_steps_and_eval_buffer()
 
