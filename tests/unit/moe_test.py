@@ -3364,5 +3364,35 @@ class RequiredRaggedBufferFactorTest(unittest.TestCase):
     self.assertLess(moe.RoutedMoE.get_ragged_buffer_size(8, 2, 4, 2, 1.49), 12)
 
 
+class OrderAfterTest(unittest.TestCase):
+  """`moe_combine_per_chunk` helper: identity with a forward-only data dependency on the previous chunk's output."""
+
+  def test_value_and_gradient_are_identity(self):
+    x = jnp.arange(12.0).reshape(3, 4)
+    dep = jnp.ones((2, 5))
+
+    def f(x, dep):
+      return jnp.sum(moe._order_after(x, dep) ** 2)  # pylint: disable=protected-access
+
+    np.testing.assert_array_equal(moe._order_after(x, dep), x)  # pylint: disable=protected-access
+    gx, gdep = jax.grad(f, argnums=(0, 1))(x, dep)
+    np.testing.assert_array_equal(gx, 2 * x)
+    np.testing.assert_array_equal(gdep, jnp.zeros_like(dep))
+
+  def test_dependency_is_forward_only(self):
+    x = jnp.ones((3, 4))
+    dep = jnp.ones((2, 5))
+    fwd = jax.make_jaxpr(moe._order_after)(x, dep)  # pylint: disable=protected-access
+    _, vjp = jax.vjp(moe._order_after, x, dep)  # pylint: disable=protected-access
+    bwd = jax.make_jaxpr(vjp)(x)
+    # The forward output reads dep; the backward cotangent of x does not.
+    self.assertIn("mul", str(fwd))
+    self.assertNotIn("mul", str(bwd))
+
+  def test_rejects_integer_operand(self):
+    with self.assertRaises(ValueError):
+      moe._order_after(jnp.ones((3,), jnp.int32), jnp.ones((2,)))  # pylint: disable=protected-access
+
+
 if __name__ == "__main__":
   absltest.main()

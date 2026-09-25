@@ -1061,6 +1061,18 @@ class MoEGeneral(BaseModel):
           " effect."
       ),
   )
+  moe_combine_per_chunk: bool = Field(
+      False,
+      description=(
+          "Chunked ring-of-experts MoE: make chunk c's unpermute (the local unsort + weighted sum before the"
+          " combine reduce-scatter) wait on chunk c-1's combine reduce-scatter result, through a forward-only"
+          " data dependency on the unpermute's routing weights (the weights are saved for the backward pass,"
+          " via the remat name 'moe_combine_order', so the recompute does not redo the reduce-scatter)."
+          " This orders the SparseCore work as unpermute0, RS0, unpermute1, RS1 instead of letting chunk 0's"
+          " reduce-scatter queue behind chunk 1's unpermute. Math unchanged. Needs num_moe_token_chunks>1 and"
+          " use_ring_of_experts=True to have any effect."
+      ),
+  )
 
   moe_expert_input_dim: int = Field(
       -1,
@@ -4328,6 +4340,10 @@ class MaxTextConfig(
       ]
       self.tensors_on_device = [t for t in tensors if getattr(self, t) == "device"]
       self.tensors_to_offload = [t for t in tensors if getattr(self, t) == "offload"]
+      if getattr(self, "moe_combine_per_chunk", False):
+        # The ordered unpermute weights are saved so the backward recompute does not redo the combine
+        # reduce-scatter and unpermute that the ordering dependency reads.
+        self.tensors_on_device.append("moe_combine_order")
 
     if self.pipeline_parallel_layers == -1:
       if self.decoder_block == DecoderBlockType.DEEPSEEK:
@@ -5730,6 +5746,10 @@ class RLConfig(
       ]
       self.tensors_on_device = [t for t in tensors if getattr(self, t) == "device"]
       self.tensors_to_offload = [t for t in tensors if getattr(self, t) == "offload"]
+      if getattr(self, "moe_combine_per_chunk", False):
+        # The ordered unpermute weights are saved so the backward recompute does not redo the combine
+        # reduce-scatter and unpermute that the ordering dependency reads.
+        self.tensors_on_device.append("moe_combine_order")
 
     def get_parallelism_map(prefix: str) -> dict[str, int]:
       return {
