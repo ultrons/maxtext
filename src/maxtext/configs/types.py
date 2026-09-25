@@ -1038,6 +1038,17 @@ class MoEGeneral(BaseModel):
           "max all-reduce per MoE layer and token chunk, and a device-to-host fetch per step."
       ),
   )
+  warmup_programs_in_init: bool = Field(
+      False,
+      description=(
+          "After the setup precompiles and before init_stop/run_start are logged, execute each precompiled train "
+          "program (normal, first-phase, dropless) and eval program (eval, eval dropless) once through its jit on a "
+          "synthetic batch (PRNG token ids, never the dataset), discard the outputs so parameters, optimizer state "
+          "and routed biases are unchanged, block on completion and run a cross-host barrier. Moves the first "
+          "execution (and the hosts' arrival skew) out of the scored window. Skipped when the programs are not "
+          "precompiled (compiled_trainstep_file or AutoPGLE)."
+      ),
+  )
   num_moe_token_chunks: PositiveInt = Field(
       1,
       description=(
