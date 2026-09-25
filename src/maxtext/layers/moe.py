@@ -1216,7 +1216,7 @@ class RoutedMoE(nnx.Module):
   def _ep_all_gather_fn(self):
     """Tiled all-gather over the EP axis, pinned to a SparseCore when moe_pin_sparse_core_all_gathers."""
     axis_name = self._expert_parallelism_name
-    if self.config.moe_pin_sparse_core_all_gathers or self.config.moe_pin_sparse_core_ep_all_gathers:
+    if self.config.moe_pin_sparse_core_all_gathers or getattr(self.config, "moe_pin_sparse_core_ep_all_gathers", False):
 
       @functools.partial(
           compute_on,
@@ -3329,8 +3329,8 @@ class RoutedMoE(nnx.Module):
           logical_axes=gate_logits_logical_axes,
       )
 
-    if self.config.moe_pin_sparse_core_all_gathers or self.config.moe_pin_sparse_core_fsdp_all_gathers:
-      fwd_only = self.config.moe_pin_sparse_core_fsdp_all_gathers_fwd_only
+    if self.config.moe_pin_sparse_core_all_gathers or getattr(self.config, "moe_pin_sparse_core_fsdp_all_gathers", False):
+      fwd_only = getattr(self.config, "moe_pin_sparse_core_fsdp_all_gathers_fwd_only", False)
 
       def _fsdp_all_gather(w, pspec):
         if w is None or pspec is None:
