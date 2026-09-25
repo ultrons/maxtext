@@ -191,6 +191,56 @@ def _sort_activations_custom_bwd(residuals: jax.Array, grads: jax.Array) -> tupl
 _sort_activations_custom.defvjp(_sort_activations_custom_fwd, _sort_activations_custom_bwd)
 
 
+def quantize_rows_fp8(x: jax.Array, qtype) -> tuple[jax.Array, jax.Array]:
+  """Per-row fp8 quantization: one f32 absmax scale per row (last axis), returns (qvalue, scale[..., 1])."""
+  xf = x.astype(jnp.float32)
+  qmax = float(jnp.finfo(qtype).max)
+  absmax = jnp.max(jnp.abs(xf), axis=-1, keepdims=True)
+  scale = jnp.where(absmax > 0, absmax / qmax, jnp.ones_like(absmax))
+  return jnp.clip(xf / scale, -qmax, qmax).astype(qtype), scale
+
+
+def dequantize_rows_fp8(qvalue: jax.Array, scale: jax.Array, dtype) -> jax.Array:
+  """Inverse of quantize_rows_fp8."""
+  return (qvalue.astype(jnp.float32) * scale).astype(dtype)
+
+
+def ep_combine_reduce_scatter(x: jax.Array, axis_name, all_gather_fn=None, bwd_qtype=None) -> jax.Array:
+  """Ring-of-experts combine: sums the per-shard partial outputs over the EP axis and scatters them.
+
+  With `bwd_qtype` set, the forward (bf16 reduce-scatter) is unchanged, but the backward -- the
+  all-gather of the output cotangent to every expert shard -- carries an fp8 payload with a per-row
+  f32 scale gathered alongside, and is dequantized back to the cotangent dtype after the gather.
+  This is a precision change of the gradient (the expert GMM backward re-quantizes it to its own
+  bwd_qtype after the router-weight multiply), not a bitwise-identical transform.
+  """
+
+  def _rs(z):
+    return jax.lax.psum_scatter(z, axis_name, scatter_dimension=0, tiled=True)
+
+  if bwd_qtype is None:
+    return _rs(x)
+
+  def _ag(z):
+    if all_gather_fn is not None:
+      return all_gather_fn(z)
+    return jax.lax.all_gather(z, axis_name=axis_name, tiled=True)
+
+  @jax.custom_vjp
+  def _combine(z):
+    return _rs(z)
+
+  def _combine_fwd(z):
+    return _rs(z), None
+
+  def _combine_bwd(_, g):
+    qvalue, scale = quantize_rows_fp8(g, bwd_qtype)
+    return (dequantize_rows_fp8(_ag(qvalue), _ag(scale), g.dtype),)
+
+  _combine.defvjp(_combine_fwd, _combine_bwd)
+  return _combine(x)
+
+
 def get_batchsplit_init_kernel_axes():
   return (
       ("expert_only", "embed_moe", None),
@@ -945,6 +995,27 @@ class RoutedMoE(nnx.Module):
     spec = [None if name is None else self._logical_to_mesh_axes((name,))[0] for name in logical_axis]
     pspec = remove_expert_from_partition_spec(jax.sharding.PartitionSpec(*spec), dims_to_peel=(1,))
     return self._maybe_shard_with_pspec(inputs, pspec)
+
+  def _ep_all_gather_fn(self):
+    """Tiled all-gather over the EP axis, pinned to a SparseCore when moe_pin_sparse_core_all_gathers."""
+    axis_name = self._expert_parallelism_name
+    if self.config.moe_pin_sparse_core_all_gathers:
+
+      @functools.partial(
+          compute_on,
+          compute_type="tpu_sparsecore",
+          out_memory_spaces=jax.memory.Space.Device,
+          compiler_options={"sparse_core_config": {"core_ids": [self.config.moe_ep_all_gather_sparse_core_id]}},
+      )
+      def _ep_all_gather(z):
+        return jax.lax.all_gather(z, axis_name=axis_name, tiled=True)
+
+    else:
+
+      def _ep_all_gather(z):
+        return jax.lax.all_gather(z, axis_name=axis_name, tiled=True)
+
+    return _ep_all_gather
 
   def get_expert_parallelism_size(self):
     # When expert parallelism has more than one physical axes, take product of their shapes
@@ -2122,21 +2193,7 @@ class RoutedMoE(nnx.Module):
         forced_routed_experts=None,
         force_dropless=False,
     ):
-      if self.config.moe_pin_sparse_core_all_gathers:
-
-        @functools.partial(
-            compute_on,
-            compute_type="tpu_sparsecore",
-            out_memory_spaces=jax.memory.Space.Device,
-            compiler_options={"sparse_core_config": {"core_ids": [self.config.moe_ep_all_gather_sparse_core_id]}},
-        )
-        def _ep_all_gather(z):
-          return jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True)
-
-      else:
-
-        def _ep_all_gather(z):
-          return jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True)
+      _ep_all_gather = self._ep_all_gather_fn()
 
       # Duplicate token inputs across all expert shards.
       if self.config.moe_quantize_token_all_gather:
@@ -2767,11 +2824,11 @@ class RoutedMoE(nnx.Module):
                 self.moe_expert_input_dim // self.get_tensor_parallelism_size(),
             ),
         )
-        output = jax.lax.psum_scatter(
+        output = ep_combine_reduce_scatter(
             output,
             self._expert_parallelism_name,
-            scatter_dimension=0,
-            tiled=True,
+            all_gather_fn=self._ep_all_gather_fn(),
+            bwd_qtype=jnp.dtype(self.config.moe_fp8_bwd_dispatch_qtype) if self.config.moe_fp8_bwd_dispatch else None,
         )
         return output, routing.lb_loss, routing.bias_updates, routing.has_overflow, routing.required_rbf
 
