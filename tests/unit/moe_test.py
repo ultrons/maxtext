@@ -566,7 +566,7 @@ def test_sparse_matmul_repairs_batch_specs_only_without_expert_parallelism(exper
     del function, mesh, check_vma
     captured["in_specs"] = in_specs
     captured["out_specs"] = out_specs
-    return lambda x, *_args: (x, None, None, jnp.bool_(False))
+    return lambda x, *_args: (x, None, None, jnp.bool_(False), None)
 
   with mock.patch.object(jax, "shard_map", side_effect=fake_shard_map):
     output, _, _ = moe.RoutedMoE.sparse_matmul(
@@ -3340,6 +3340,28 @@ class RoutedMoEFp8Test(unittest.TestCase):
     self.assertEqual(model.weight_quant.block_size, [64, 32])
     expected_wi_shape = (cfg.num_experts, 128 // 64, (cfg.base_moe_mlp_dim * 2) // 32)
     self.assertEqual(model.wi_scale.shape, expected_wi_shape)
+
+
+class RequiredRaggedBufferFactorTest(unittest.TestCase):
+  """RoutedMoE.required_ragged_buffer_factor: the factor at which the fullest shard's buffer is exactly full."""
+
+  def _required(self, group_sizes, bsz_times_seq_len, num_ep, expert_shard_id):
+    fake = SimpleNamespace(config=SimpleNamespace(num_experts=len(group_sizes)), num_experts_per_tok=2, mesh=None)
+    return float(
+        moe.RoutedMoE.required_ragged_buffer_factor(
+            fake, jnp.array(group_sizes, dtype=jnp.int32), bsz_times_seq_len, num_ep, expert_shard_id
+        )
+    )
+
+  def test_matches_buffer_size_boundary(self):
+    # 8 tokens, top-2, EP=2: balanced_size = (8 // 2) * 2 = 8 rows per shard. Shard 1 owns experts 2, 3 with
+    # 6 + 6 = 12 tokens, so it needs factor 12 / 8 = 1.5; shard 0 (1 + 1 = 2 tokens) needs 0.25.
+    group_sizes = [1, 1, 6, 6]
+    self.assertAlmostEqual(self._required(group_sizes, 8, 2, 1), 1.5)
+    self.assertAlmostEqual(self._required(group_sizes, 8, 2, 0), 0.25)
+    # The required factor is the smallest that keeps get_ragged_buffer_size >= the shard's token count.
+    self.assertEqual(moe.RoutedMoE.get_ragged_buffer_size(8, 2, 4, 2, 1.5), 12)
+    self.assertLess(moe.RoutedMoE.get_ragged_buffer_size(8, 2, 4, 2, 1.49), 12)
 
 
 if __name__ == "__main__":

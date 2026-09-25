@@ -367,6 +367,12 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     if moe_overflow_flags:
       has_moe_overflow = jnp.any(jnp.stack([jnp.any(x) for x in moe_overflow_flags]))
   aux["has_moe_overflow"] = has_moe_overflow
+  if getattr(config, "log_required_ragged_buffer_factor", False):
+    # Probe: per-MoE-layer minimum ragged_buffer_factor that would have avoided drops (RoutedMoE sows it next to
+    # moe_has_overflow). Leaf order of collect_intermediates_by_suffix; scanned layers contribute one entry each.
+    required_rbf_values = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "moe_required_rbf")
+    if required_rbf_values:
+      aux["moe_required_rbf"] = jnp.concatenate([x.astype(jnp.float32) for x in required_rbf_values])
   return loss, aux
 
 
@@ -616,6 +622,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     metrics["has_moe_overflow"] = (  # pyrefly: ignore[bad-assignment]
         has_moe_overflow if has_moe_overflow is not None else jnp.bool_(False)  # pyrefly: ignore[bad-assignment]
     )
+  if getattr(config, "log_required_ragged_buffer_factor", False) and "moe_required_rbf" in aux:
+    # Top-level (not "scalar"): a per-layer vector, read by training_loop_iteration for the REQUIRED_RBF line.
+    metrics["moe_required_rbf"] = aux["moe_required_rbf"]  # pyrefly: ignore[bad-assignment]
   if getattr(config, "record_internal_nn_metrics", False):
     record_activation_metrics(metrics, intermediate_outputs, config)
 
@@ -660,6 +669,17 @@ def eval_step(model, config, state, data, dropout_rng=None):
   return metrics
 
 
+def _maybe_log_required_rbf(config, step, metrics, program):
+  """log_required_ragged_buffer_factor probe: one REQUIRED_RBF line per train program run (fetches the vector)."""
+  if not getattr(config, "log_required_ragged_buffer_factor", False) or "moe_required_rbf" not in metrics:
+    return
+  per_layer = np.asarray(jax.device_get(metrics["moe_required_rbf"]), dtype=np.float32).ravel()
+  if per_layer.size == 0:
+    return
+  per_layer_str = ",".join(f"{v:.4f}" for v in per_layer)
+  max_logging.log(f"REQUIRED_RBF step={step} max={per_layer.max():.4f} per_layer=[{per_layer_str}] program={program}")
+
+
 def training_loop_iteration(
     jax_device_state: dict[str, Any],
     python_vars: dict[str, Any],
@@ -672,6 +692,7 @@ def training_loop_iteration(
   mesh = jax_device_state["mesh"]
   p_train_step = jax_device_state["p_train_step"]
   p_train_step_dropless = jax_device_state.get("p_train_step_dropless", None)
+  p_train_step_first_phase = jax_device_state.get("p_train_step_first_phase", None)
   p_eval_step = jax_device_state["p_eval_step"]
   p_eval_step_dropless = jax_device_state.get("p_eval_step_dropless", None)
 
@@ -719,17 +740,25 @@ def training_loop_iteration(
       step_rng_args = ()
     with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
       with jax.set_mesh(mesh), logical_axis_rules(logical_axis_rules_for_train):
-        if (
-            config.retry_dropless_first_steps > 0
-            and step - start_step < config.retry_dropless_first_steps
-            and p_train_step_dropless is not None
-        ):
+        in_first_phase = config.retry_dropless_first_steps > 0 and step - start_step < config.retry_dropless_first_steps
+        if in_first_phase and p_train_step_dropless is not None and p_train_step_first_phase is None:
           # First-phase schedule: the steps right after (re)start overflow the ragged buffer most often,
           # so run them directly with the dropless program instead of attempt + discard + replay.
           max_logging.log(f"Step {step}: dropless first-phase program")
           state, metrics = p_train_step_dropless(state, example_batch, *step_rng_args)
+          _maybe_log_required_rbf(config, step, metrics, "dropless")
         elif config.retry_when_tokens_dropped and p_train_step_dropless is not None:
-          candidate_state, metrics = p_train_step(state, example_batch, *step_rng_args)
+          # With first_phase_ragged_buffer_factor > 0, first-phase steps attempt the first-phase program (larger
+          # finite ragged buffer) instead of the normal one; an overflow still replays with the dropless program.
+          if in_first_phase and p_train_step_first_phase is not None:
+            max_logging.log(
+                f"Step {step}: first-phase program (ragged_buffer_factor={config.first_phase_ragged_buffer_factor})"
+            )
+            p_attempt, attempt_name = p_train_step_first_phase, "first_phase"
+          else:
+            p_attempt, attempt_name = p_train_step, "normal"
+          candidate_state, metrics = p_attempt(state, example_batch, *step_rng_args)
+          _maybe_log_required_rbf(config, step, metrics, attempt_name)
           if bool(metrics.get("has_moe_overflow")):
             max_logging.log(
                 f"Step {step}: MoE ragged buffer overflow detected! "
@@ -744,10 +773,12 @@ def training_loop_iteration(
             del candidate_state
             gc.collect()
             state, metrics = p_train_step_dropless(state, example_batch, *step_rng_args)
+            _maybe_log_required_rbf(config, step, metrics, "dropless")
           else:
             state = candidate_state
         else:
           state, metrics = p_train_step(state, example_batch, *step_rng_args)
+          _maybe_log_required_rbf(config, step, metrics, "normal")
 
   step_time_delta = datetime.datetime.now() - last_step_completion
   last_step_completion = datetime.datetime.now()
@@ -862,6 +893,27 @@ def build_eval_graphdef(config, jit_model, state):
   return jit_model_eval
 
 
+def build_first_phase_graphdef(config, jit_model, state):
+  """Graphdef of the first-phase train program: the normal graphdef with RoutedMoE ragged_buffer_factor_override =
+  config.first_phase_ragged_buffer_factor. None when first_phase_ragged_buffer_factor is 0 (off)."""
+  if getattr(config, "first_phase_ragged_buffer_factor", 0.0) <= 0:
+    return None
+  reconstructed = nnx.merge(jit_model, state)
+  n_moe = 0
+  for _, module in nnx.iter_graph(reconstructed):
+    if type(module).__name__ == "RoutedMoE":
+      module.ragged_buffer_factor_override = float(config.first_phase_ragged_buffer_factor)
+      n_moe += 1
+  max_logging.log(
+      f"first-phase graphdef: ragged_buffer_factor_override={config.first_phase_ragged_buffer_factor} "
+      f"on {n_moe} RoutedMoE"
+  )
+  jit_model_first_phase, _ = nnx.split(reconstructed)
+  del reconstructed, _
+  gc.collect()
+  return jit_model_first_phase
+
+
 def aot_compile_step(p_step, lower_args, compiler_options, prefix):
   """Lowers and compiles p_step ahead of time (warms the executable cache) and prints its memory stats."""
   compiled = p_step.lower(*lower_args).compile(compiler_options=compiler_options)
@@ -894,6 +946,7 @@ def train_loop(config, recorder, state=None):
 
   jit_model_dropless = None
   jit_model_eval = None
+  jit_model_first_phase = None
 
   if config.enable_diloco:
     # state is the DiLoCoTrainState; `model` is already the TrainStateNNX graphdef the inner step needs.
@@ -902,6 +955,7 @@ def train_loop(config, recorder, state=None):
     jit_model, state = nnx.split(state)
     if config.retry_when_tokens_dropped:
       jit_model_dropless = build_dropless_graphdef(config, jit_model, state)
+      jit_model_first_phase = build_first_phase_graphdef(config, jit_model, state)
     jit_model_eval = build_eval_graphdef(config, jit_model, state)
 
   if config.enable_diloco:
@@ -948,6 +1002,18 @@ def train_loop(config, recorder, state=None):
         params_shardings=params_shardings,
     )
 
+  p_train_step_first_phase = None
+  if jit_model_first_phase is not None:
+    p_train_step_first_phase, _ = train_utils.jit_train_and_eval_step(
+        config,
+        jit_model_first_phase,
+        mesh,
+        state,
+        state_mesh_shardings,
+        train_step,
+        params_shardings=params_shardings,
+    )
+
   # Do not enter the legacy `mesh` context manager here: the training loop calls
   # p_train_step without it, and the mismatch in jit's tracing-cache key would
   # cause train_step to be traced and compiled a second time on the first step.
@@ -976,6 +1042,8 @@ def train_loop(config, recorder, state=None):
       if p_train_step_dropless is not None:
         # Precompile the dropless retry program here so no compile happens inside the timed loop.
         aot_compile_step(p_train_step_dropless, lower_args, compiler_options, prefix="train_dropless")
+      if p_train_step_first_phase is not None:
+        aot_compile_step(p_train_step_first_phase, lower_args, compiler_options, prefix="train_first_phase")
 
   # Ahead-of-time compile the evaluation step alongside the training step to
   # warm up the XLA executable cache and avoid JIT compilation pause on the
@@ -1016,6 +1084,7 @@ def train_loop(config, recorder, state=None):
       "state_mesh_shardings": state_mesh_shardings,
       "p_train_step": p_train_step,
       "p_train_step_dropless": p_train_step_dropless,
+      "p_train_step_first_phase": p_train_step_first_phase,
       "p_eval_step": p_eval_step,
       "p_eval_step_dropless": p_eval_step_dropless,
       "model": model,
