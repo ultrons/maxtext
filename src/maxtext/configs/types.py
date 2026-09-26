@@ -1274,6 +1274,12 @@ class MoEGeneral(BaseModel):
       False,
       description="Keep embed_moe sharded so we can manually QAG it over FSDP.",
   )
+  shard_mlp_moe_on_fsdp: bool = Field(
+      False,
+      description="With shard_embed_moe_on_fsdp, shard the routed expert weights over FSDP on their mlp axis "
+      "(wi [E, D, F] and wo [E, F, D] on F) instead of the embed axis, so that the manual fp8 all-gather writes "
+      "whole native-tiling rows and the gmm_v2 kernels read the gathered [E, F, D] buffer without a copy.",
+  )
   use_2d_fsdp_sharding: bool = Field(
       False,
       description="Use `fsdp` and `fsdp_transpose` axes for 2D FSDP sharding.",
@@ -4030,6 +4036,20 @@ class MaxTextConfig(
     # Explicitly setting encoding removes the need for the pylint disable comment
     with open(custom_mesh_path, "r", encoding="utf-8") as f:
       return yaml.safe_load(f) or {}
+
+  @model_validator(mode="after")
+  def validate_shard_mlp_moe_on_fsdp(self) -> "MaxTextConfig":
+    """Raise ValueError if shard_mlp_moe_on_fsdp is used outside the manual-QAG gmm_v2 path it is built for."""
+    if self.shard_mlp_moe_on_fsdp:
+      if not self.shard_embed_moe_on_fsdp:
+        raise ValueError("shard_mlp_moe_on_fsdp requires shard_embed_moe_on_fsdp=True (the manual fp8 QAG path).")
+      if not (self.use_tokamax_gmm and self.use_gmm_v2):
+        raise ValueError("shard_mlp_moe_on_fsdp requires use_tokamax_gmm=True and use_gmm_v2=True.")
+      if self.prefuse_moe_weights or self.num_moe_emb_chunks > 0 or self.use_batch_split_schedule:
+        raise ValueError(
+            "shard_mlp_moe_on_fsdp does not support prefuse_moe_weights, num_moe_emb_chunks or use_batch_split_schedule."
+        )
+    return self
 
   @model_validator(mode="after")
   def validate_shard_embed_moe_on_fsdp(self) -> "MaxTextConfig":

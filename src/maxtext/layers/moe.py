@@ -584,6 +584,13 @@ def finalize_deferred_intermediates(intermediate_outputs, config):
   return jax.tree_util.tree_map_with_path(_fix, intermediate_outputs)
 
 
+def _mesh_axes_of(pspec_entry) -> tuple:
+  """Mesh axis names of one PartitionSpec entry (None, a name, or a tuple of names)."""
+  if pspec_entry is None:
+    return ()
+  return (pspec_entry,) if isinstance(pspec_entry, str) else tuple(pspec_entry)
+
+
 def _batch_axis_names(pspec) -> tuple[str, ...] | None:
   """Returns the mesh axes the (batch, sequence) dims are partitioned over."""
   if not pspec:
@@ -902,6 +909,12 @@ class RoutedMoE(nnx.Module):
       self.wo_kernel_axes = ("embed_moe", "mlp_moe", None)
     elif self.config.use_batch_split_schedule:
       self.wi_kernel_axes, self.wo_kernel_axes = get_batchsplit_init_kernel_axes()
+    elif self.config.shard_mlp_moe_on_fsdp:
+      # FSDP (the embed_moe mesh axes) on the mlp dim of both weights: wi [E, D, F] and
+      # wo [E, F, D] are sharded on F, and the axes that shard F otherwise (mlp_moe) move
+      # to D. See shard_mlp_moe_on_fsdp in base.yml and sparse_matmul.
+      self.wi_kernel_axes = ("exp", "mlp_moe", "embed_moe")
+      self.wo_kernel_axes = ("exp", "embed_moe", "mlp_moe")
     else:
       self.wi_kernel_axes = ("exp", "embed_moe", "mlp_moe")
       self.wo_kernel_axes = ("exp", "mlp_moe", "embed_moe")
@@ -2167,6 +2180,8 @@ class RoutedMoE(nnx.Module):
         weight_gather_axes,
         group_offset,
         partial_sum=None,
+        transpose_rhs=False,
+        gathered_weight_in_native_tiling=False,
     ):
       def extract_vma(tensor):
         # Extract underlying array from QArray to inspect sharding annotation string.
@@ -2227,6 +2242,8 @@ class RoutedMoE(nnx.Module):
       # Use custom vjp: tokamax gmm v1 (quantized), tokamax gmm v2 (quantized, unquantized), older forked megablox
       use_custom_vjp_gmm = self.config.use_tokamax_gmm or self.config.megablox
 
+      if transpose_rhs and not use_custom_vjp_gmm:
+        raise NotImplementedError("A [g, n, k] (transpose_rhs) expert weight needs the megablox / tokamax gmm.")
       if is_tokamax_v1_unquantized:
         # tokamax v1 (unquantized)
         output = tokamax.ragged_dot(
@@ -2259,6 +2276,8 @@ class RoutedMoE(nnx.Module):
             use_gmm_v2_heuristic_tiling=self.config.use_gmm_v2_heuristic_tiling,
             partial_sum=partial_sum,
             interpret=megablox_interpret,
+            transpose_rhs=transpose_rhs,
+            gathered_weight_in_native_tiling=gathered_weight_in_native_tiling,
         )
       else:
         # jax.lax.ragged_dot
@@ -2352,6 +2371,14 @@ class RoutedMoE(nnx.Module):
         w0_pspec = self._logical_to_mesh_axes((None, "mlp_no_fsdp", None))
         w1_pspec = self._logical_to_mesh_axes((None, "mlp_no_fsdp", None))
         wo_pspec = self._logical_to_mesh_axes((None, "mlp_no_fsdp", None))
+      elif self.config.shard_embed_moe_on_fsdp and explicitly_weight_ag() and self.config.shard_mlp_moe_on_fsdp:
+        # Keep the FSDP (embed_moe) mesh axes sharded, on the mlp dim, so we can manually QAG
+        # them: each shard is F / fsdp whole rows of the gathered [E, F, D] buffer.
+        if any(self.mesh.shape.get(ax, 1) > 1 for ax in _mesh_axes_of(self._logical_to_mesh_axes(("mlp_no_fsdp",))[0])):
+          raise NotImplementedError("shard_mlp_moe_on_fsdp does not support tensor parallelism on the expert weights.")
+        w0_pspec = self._logical_to_mesh_axes(("exp", None, "embed_moe"))
+        w1_pspec = self._logical_to_mesh_axes(("exp", None, "embed_moe"))
+        wo_pspec = self._logical_to_mesh_axes(("exp", "embed_moe", None))
       elif self.config.shard_embed_moe_on_fsdp and explicitly_weight_ag():
         # Keep embed_moe sharded so we can manually QAG it over FSDP
         w0_pspec = self._logical_to_mesh_axes(("exp", "embed_moe", "mlp_no_fsdp"))
@@ -2382,6 +2409,10 @@ class RoutedMoE(nnx.Module):
 
     is_batch_sharded_by_expert = is_batch_sharded_by_ep(inputs)
     weight_gather = explicitly_weight_ag()
+    # shard_mlp_moe_on_fsdp: the QAG runs on the mlp dim. The wi weights go to the gmm as
+    # [E, F, D] (transpose_rhs), so for all three weights the gather is along axis 1 of the
+    # gmm's rhs, the row axis of the gathered buffer that the forward and dlhs kernels read.
+    mlp_fsdp_qag = weight_gather and self.config.shard_embed_moe_on_fsdp and self.config.shard_mlp_moe_on_fsdp
     (
         batch_logical_axis,
         input_partition_pspec,
@@ -2704,11 +2735,15 @@ class RoutedMoE(nnx.Module):
         if self.config.shard_exp_on_fsdp:
           # wi [Experts, In, Hidden] -> Gather Exp(0)
           wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[0], 0))
+        elif mlp_fsdp_qag:
+          # wi goes to the gmm as [Experts, Hidden, In] -> Gather Hidden(1); In is not sharded.
+          wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[2], 1))
         else:
           # Gather In(1) where embed_moe is sharded.
           wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[1], 1))
-        # Gather Hidden(2)
-        wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[2], 2))
+        if not mlp_fsdp_qag:
+          # Gather Hidden(2)
+          wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[2], 2))
       wi_tile_size = (
           fwd_tile("wi_tile_fwd_batch_seq"),  # m (LHS batch)
           fwd_tile("wi_tile_fwd_embed_dim"),  # k  (contracting)
@@ -2729,6 +2764,8 @@ class RoutedMoE(nnx.Module):
         if self.config.shard_exp_on_fsdp:
           # wo [Experts, Hidden, Out] -> Gather Exp(0)
           wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[0], 0))
+        elif mlp_fsdp_qag:
+          pass  # Out is not sharded; Hidden(1) is gathered below.
         else:
           # Gather Out(2) where embed_moe is sharded.
           wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[2], 2))
@@ -2776,12 +2813,16 @@ class RoutedMoE(nnx.Module):
         layer_w0 = adc.checkpoint_name(adc.checkpoint_name(layer_w0, "mlpwi_0"), "moe_mlpwi_0")
         layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
       else:
+        # shard_mlp_moe_on_fsdp: pass the local wi shards as [E, F / fsdp, D] (transpose_rhs) so that
+        # the QAG in the gmm concatenates whole rows; see mlp_fsdp_qag.
+        wi_layout_kwargs = {"transpose_rhs": True, "gathered_weight_in_native_tiling": True} if mlp_fsdp_qag else {}
         layer_w0 = gmm_fn(
             x,
-            w0,
+            w0.swapaxes(1, 2) if mlp_fsdp_qag else w0,
             tiling=wi_tile_size,
             weight_gather_axes=wi_gather_axes,
             partial_sum=partial_accum0,
+            **wi_layout_kwargs,
         )
         if self.config.mlp_bias and w0_bias is not None:
           layer_w0 = layer_w0 + w0_bias
@@ -2791,10 +2832,11 @@ class RoutedMoE(nnx.Module):
 
         layer_w1 = gmm_fn(
             x,
-            w1,
+            w1.swapaxes(1, 2) if mlp_fsdp_qag else w1,
             tiling=wi_tile_size,
             weight_gather_axes=wi_gather_axes,
             partial_sum=partial_accum1,
+            **wi_layout_kwargs,
         )
         if self.config.mlp_bias and w1_bias is not None:
           layer_w1 = layer_w1 + w1_bias
@@ -3061,6 +3103,7 @@ class RoutedMoE(nnx.Module):
           wo,
           tiling=wo_tile_size,
           weight_gather_axes=wo_gather_axes,
+          **({"gathered_weight_in_native_tiling": True} if mlp_fsdp_qag else {}),
       )
       if self.get_tensor_parallelism_size() > 1:
         intermediate_output = jax.lax.psum_scatter(
