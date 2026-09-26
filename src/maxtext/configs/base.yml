@@ -348,6 +348,17 @@ shard_exp_on_fsdp: false
 # Keep embed_moe sharded so we can manually QAG it over FSDP.
 # Requires quantization to be specified and weight_quantization_calibration_method to be fixed (static scaling mode).
 shard_embed_moe_on_fsdp: false
+# With shard_embed_moe_on_fsdp (manual fp8 QAG), shard the routed expert weights over FSDP on their mlp
+# (moe_mlp_dim) axis instead of the embed axis: wi [E, D, F] and wo [E, F, D] are both sharded on F.
+# Each FSDP shard is then F / fsdp rows of the gathered weight (2048 / 64 = 32 at FSDP64), so the
+# all-gather writes whole native (32, 128) fp8 tiles, and the gmm_v2 kernels read the gathered buffer
+# in its [E, F, D] orientation without a copy when the megablox DLHS_USE_TRANSPOSED_RHS_KERNEL switch is
+# on (wi forward and wo dlhs with the in-kernel transposed rhs, wi dlhs and wo forward plain). Requires
+# use_tokamax_gmm and use_gmm_v2; does not support prefuse_moe_weights, num_moe_emb_chunks,
+# use_batch_split_schedule or tensor parallelism on the expert weights. The fp8 values and the fixed
+# per-tensor scales are unchanged; only the axis the parameters (and their optimizer state) are sharded
+# on changes, and checkpoint restore reshards the stored arrays onto the new sharding.
+shard_mlp_moe_on_fsdp: false
 # use fsdp and fsdp_transpose axes for sharding the moe weights
 use_2d_fsdp_sharding: false
 

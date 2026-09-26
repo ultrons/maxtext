@@ -1171,6 +1171,100 @@ def _cpu_interpret_gmm_v2(internals):
       cache_clear()
 
 
+@contextlib.contextmanager
+def cpu_interpret_megablox_v2():
+  """Runs the gmm_v2 and tgmm_v2 Pallas kernels under the Pallas TPU interpreter on a non-TPU backend.
+
+  Both kernels read and write refs through `ref.reshape(...)` views (row-splitting views of the HBM operands,
+  the 3-D to 2-D views of pipelined blocks, the zero-fill buffer of the tgmm). The interpreter in this jax only
+  folds NDIndexer transforms, so this context wraps the interpreter's `get`, `store` and `swap` callbacks: a
+  transform chain containing a ReshapeTransform is split into the NDIndexer prefix (handed to the interpreter)
+  and the remainder, which is applied in numpy through a flat index map of the prefix region, so every read and
+  write lands on exactly the elements of the view. DMAs go through the same callbacks. It also registers the
+  TPU7x hardware info for the "cpu" device kind and runs every pallas_call interpreted with zero-initialized
+  memory. Everything is restored on exit. Used by the MoE-level tests (moe_test.py) that run the full gmm path.
+  """
+  # pylint: disable=import-outside-toplevel,protected-access
+  from jax._src import tpu_info
+  from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc
+  from jax._src.pallas.mosaic.interpret import utils as interpret_utils
+  from jax._src.state import types as state_types
+
+  def split(transforms):
+    for i, t in enumerate(transforms):
+      if isinstance(t, state_types.ReshapeTransform):
+        return tuple(transforms[:i]), tuple(transforms[i:])
+    return tuple(transforms), ()
+
+  def view_index(region_shape, post):
+    idx = np.arange(int(np.prod(region_shape)), dtype=np.int64).reshape(region_shape)
+    for t in post:
+      if isinstance(t, state_types.ReshapeTransform):
+        idx = idx.reshape(tuple(int(d) for d in t.shape))
+      else:
+        idx = idx[tuple(interpret_utils._transform_slice_or_index(i) for i in t.indices)]
+    return idx
+
+  orig_get, orig_store, orig_swap = ipc.get, ipc.store, ipc.swap
+  raw_get, raw_store, raw_swap = orig_get.__wrapped__, orig_store.__wrapped__, orig_swap.__wrapped__
+
+  def get(token, device_id, local_core_id, memory_space, buffer_id, transforms, *args, **kwargs):
+    transforms = jax.tree.map(int, transforms)
+    pre, post = split(transforms)
+    if not post:
+      return raw_get(token, device_id, local_core_id, memory_space, buffer_id, transforms, *args, **kwargs)
+    token, region = raw_get(token, device_id, local_core_id, memory_space, buffer_id, pre, *args, **kwargs)
+    return token, np.asarray(region).reshape(-1)[view_index(region.shape, post)]
+
+  def store(token, device_id, local_core_id, memory_space, buffer_id, transforms, val, *args, **kwargs):
+    transforms = jax.tree.map(int, transforms)
+    pre, post = split(transforms)
+    if not post:
+      return raw_store(token, device_id, local_core_id, memory_space, buffer_id, transforms, val, *args, **kwargs)
+    get_kwargs = {k: v for k, v in kwargs.items() if k in ("source_info", "clock", "src_device_id", "src_local_core_id")}
+    _, region = raw_get(token, device_id, local_core_id, memory_space, buffer_id, pre, **get_kwargs)
+    region = np.array(region)
+    flat = region.reshape(-1)
+    flat[view_index(region.shape, post)] = np.asarray(val)
+    return raw_store(token, device_id, local_core_id, memory_space, buffer_id, pre, region, *args, **kwargs)
+
+  def swap(token, device_id, local_core_id, memory_space, buffer_id, transforms, val, mask, **kwargs):
+    transforms = jax.tree.map(int, transforms)
+    pre, post = split(transforms)
+    if not post:
+      return raw_swap(token, device_id, local_core_id, memory_space, buffer_id, transforms, val, mask, **kwargs)
+    _, region = raw_get(token, device_id, local_core_id, memory_space, buffer_id, pre, **kwargs)
+    region = np.array(region)
+    idx = view_index(region.shape, post)
+    flat = region.reshape(-1)
+    old = flat[idx].copy()
+    val = np.asarray(val)
+    flat[idx] = val if mask is None else np.where(np.asarray(mask), val, old)
+    token, _ = raw_swap(token, device_id, local_core_id, memory_space, buffer_id, pre, region, None, **kwargs)
+    return token, old
+
+  orig_pallas_call = pl.pallas_call
+
+  def pallas_call(*args, **kwargs):
+    kwargs["interpret"] = pltpu.InterpretParams(uninitialized_memory="zero")
+    return orig_pallas_call(*args, **kwargs)
+
+  had_cpu_entry = "cpu" in tpu_info.registry
+  tpu_info.registry["cpu"] = lambda: tpu_info._get_tpu_info_impl(tpu_info.ChipVersion.TPU_7X, 1)
+  ipc.get, ipc.store, ipc.swap = ipc.fail_on_exception(get), ipc.fail_on_exception(store), ipc.fail_on_exception(swap)
+  pl.pallas_call = pallas_call
+  try:
+    yield
+  finally:
+    pl.pallas_call = orig_pallas_call
+    ipc.get, ipc.store, ipc.swap = orig_get, orig_store, orig_swap
+    if not had_cpu_entry:
+      del tpu_info.registry["cpu"]
+    cache_clear = getattr(tpu_info.get_tpu_info, "cache_clear", None)
+    if cache_clear is not None:
+      cache_clear()
+
+
 def _reference_gmm_transposed(lhs, rhs_gnk, group_sizes, group_offset, rhs_scale=None, lhs_scale=None, lhs_qtype=None):
   """f32 reference of lhs[m, k] @ rhs_gnk[g, n, k].T per group; groups outside the local range give zeros."""
   m = lhs.shape[0]
@@ -1268,6 +1362,22 @@ class GmmTransposeRhsTest(parameterized.TestCase):
           (256, 2048, 3584),
           False,
       ),
+      # wi forward with shard_mlp_moe_on_fsdp: the gathered weight is [g, n=F, k=D] and the forward kernel reads it
+      # with transpose_rhs at the production forward tiles (tk = 7168, tn = 1024), bf16 activations quantized in
+      # VMEM, fewer experts.
+      (
+          "fp8_wi_fwd_production_tiles",
+          256,
+          7168,
+          2048,
+          4,
+          _TRHS_GROUP_SIZES,
+          1,
+          jnp.bfloat16,
+          jnp.float8_e4m3fn,
+          (256, 7168, 1024),
+          True,
+      ),
   )
   def test_matches_swapaxes_path(
       self, m, k, n, num_local_groups, group_sizes, group_offset, lhs_dtype, rhs_dtype, tiles, quantize_lhs
@@ -1312,7 +1422,10 @@ class GmmTransposeRhsTest(parameterized.TestCase):
     reference = _reference_gmm_transposed(
         lhs, rhs_gnk, group_sizes, int(group_offset[0]), rhs_scale, lhs_scale, lhs_qtype
     )
-    chex.assert_trees_all_close(actual.astype(jnp.float32), jnp.asarray(reference), atol=0.5, rtol=5e-2)
+    # The error of the in-kernel e4m3 lhs quantization against this reference grows like sqrt(k): 0.5 covers k up
+    # to 2048; the k = 7168 forward case needs a wider absolute band (the bit-equality above is the real check).
+    atol = 0.5 if k <= 2048 else 4.0
+    chex.assert_trees_all_close(actual.astype(jnp.float32), jnp.asarray(reference), atol=atol, rtol=5e-2)
 
   def test_dlhs_switch_selects_kernel_and_matches(self):
     """ops._dlhs_run_tokamax_v2 gives the same dlhs with the in-kernel transpose on and off (bit for bit off-TPU)."""
@@ -1339,7 +1452,6 @@ class GmmTransposeRhsTest(parameterized.TestCase):
   def test_retile_helper_is_identity(self):
     """_copy_in_kernel_native_tiling returns its input bit for bit (fp8 and bf16, plain and QArray)."""
     key = jax.random.key(3)
-    group_sizes = jnp.array([5, 0, 7, 4], jnp.int32)
     for dtype in (jnp.float8_e4m3fn, jnp.bfloat16):
       x = jax.random.normal(key, (4, 64, 128), jnp.float32).astype(dtype)
       y = jax.block_until_ready(jax.jit(megablox_ops._copy_in_kernel_native_tiling)(x))  # pylint: disable=protected-access

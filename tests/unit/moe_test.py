@@ -13,6 +13,8 @@
 # limitations under the License.
 """Mixture of Experts (MoE) tests."""
 
+import collections
+import contextlib
 import functools
 from types import SimpleNamespace
 import unittest
@@ -3364,6 +3366,270 @@ class RoutedMoEFp8Test(unittest.TestCase):
     self.assertEqual(model.weight_quant.block_size, [64, 32])
     expected_wi_shape = (cfg.num_experts, 128 // 64, (cfg.base_moe_mlp_dim * 2) // 32)
     self.assertEqual(model.wi_scale.shape, expected_wi_shape)
+
+
+class ShardMlpMoeOnFsdpTest(parameterized.TestCase):
+  """shard_mlp_moe_on_fsdp: FSDP on the mlp axis of the routed expert weights, manual fp8 QAG.
+
+  Runs on 4 devices (CPU: XLA_FLAGS=--xla_force_host_platform_device_count=4). gmm_v2 / tgmm_v2 have no
+  interpret switch, so off TPU they run under the Pallas TPU interpreter shim of
+  pallas_mosaic_tpu_v2_kernel_test (index maps, DMA slicing, masks and accumulation are checked; the
+  block products are computed by XLA:CPU).
+  """
+
+  NUM_DEVICES = 4
+
+  def setUp(self):
+    super().setUp()
+    if jax.device_count() != self.NUM_DEVICES:
+      self.skipTest(f"needs exactly {self.NUM_DEVICES} devices")
+
+  def _kernel_context(self):
+    """Native kernels on TPU; elsewhere the Pallas TPU interpreter with the megablox v2 shim."""
+    if jax.devices()[0].platform == "tpu":
+      return contextlib.nullcontext()
+    # pylint: disable=import-outside-toplevel
+    from tests.unit import pallas_mosaic_tpu_v2_kernel_test as kt
+
+    try:
+      kt._interpret_internals()  # pylint: disable=protected-access
+    except (ImportError, AttributeError) as e:
+      self.skipTest(f"Pallas TPU interpreter shim does not fit this jax version: {e!r}")
+    return kt.cpu_interpret_megablox_v2()
+
+  def _cfg(self, ici_expert_parallelism, shard_mlp_moe_on_fsdp):
+    return pyconfig.initialize(
+        [None, get_test_config_path()],
+        run_name="shard_mlp_moe_on_fsdp_test",
+        enable_checkpointing=False,
+        model_name="mixtral-8x7b",
+        override_model_config=True,
+        base_emb_dim=256,
+        base_mlp_dim=512,
+        base_moe_mlp_dim=512,
+        custom_mesh_and_rule="ep-as-dp",
+        weight_dtype="float32",
+        dtype="bfloat16",
+        per_device_batch_size=1,
+        max_target_length=64,
+        float32_gate_logits=True,
+        quantize_router_proj=False,
+        ici_expert_parallelism=ici_expert_parallelism,
+        ici_fsdp_parallelism=self.NUM_DEVICES // ici_expert_parallelism,
+        # EP>1 as in the production recipe (ring of experts); the ragged all-to-all path has no XLA:CPU lowering.
+        use_ring_of_experts=ici_expert_parallelism > 1,
+        sparse_matmul=True,
+        megablox=True,
+        use_tokamax_gmm=True,
+        use_gmm_v2=True,
+        shard_embed_moe_on_fsdp=True,
+        shard_mlp_moe_on_fsdp=shard_mlp_moe_on_fsdp,
+        quantization="fp8_full",
+        use_qwix_quantization=True,
+        weight_quantization_calibration_method="fixed,-224,224",
+        act_quantization_calibration_method="fixed,-224,224",
+        bwd_quantization_calibration_method="absmax",
+        wi_tile_fwd_batch_seq=128,
+        wi_tile_fwd_embed_dim=256,
+        wi_tile_fwd_mlp_dim=256,
+        wi_tile_dlhs_batch_seq=128,
+        wi_tile_dlhs_mlp_dim=256,
+        wi_tile_dlhs_embed_dim=256,
+        wi_tile_drhs_batch_seq=128,
+        wi_tile_drhs_embed_dim=256,
+        wi_tile_drhs_mlp_dim=256,
+        wo_tile_fwd_batch_seq=128,
+        wo_tile_fwd_mlp_dim=256,
+        wo_tile_fwd_embed_dim=256,
+        wo_tile_dlhs_batch_seq=128,
+        wo_tile_dlhs_embed_dim=256,
+        wo_tile_dlhs_mlp_dim=256,
+        wo_tile_drhs_batch_seq=128,
+        wo_tile_drhs_mlp_dim=256,
+        wo_tile_drhs_embed_dim=256,
+    )
+
+  def _model(self, cfg, mesh):
+    """RoutedMoE with the fp8_full qwix rule (e4m3 weights and activations, e5m2 gradients)."""
+    model = moe.get_routed_moe(
+        name="MoeBlock",
+        config=cfg,
+        num_experts=cfg.num_experts,
+        num_experts_per_tok=cfg.num_experts_per_tok,
+        mesh=mesh,
+        kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
+        kernel_axes=("embed", "mlp"),
+        intermediate_dim=cfg.mlp_dim,
+        dtype=cfg.dtype,
+    )
+    rule = qwix.QtRule(
+        module_path=".*",
+        weight_qtype=jnp.float8_e4m3fn,
+        act_qtype=jnp.float8_e4m3fn,
+        bwd_qtype=jnp.float8_e5m2,
+        weight_calibration_method=cfg.weight_quantization_calibration_method,
+        act_calibration_method=cfg.act_quantization_calibration_method,
+        bwd_calibration_method=cfg.bwd_quantization_calibration_method,
+        op_names=("gmm", "ragged_dot"),
+    )
+    return qwix.quantize_model(model, qwix.QtProvider([rule]))
+
+  def _run(self, cfg, params=None, record=None, kernel_record=None):
+    """Loss, output and gradients of mean(out**2) + lb_loss.
+
+    `record` collects the ops.gmm calls; `kernel_record` the gmm_v2 kernel calls (rhs shape, transpose_rhs) and
+    the native-tiling copies (`retile`) traced for the jitted forward/backward.
+    """
+    from maxtext.kernels.megablox import ops as mblx_ops  # pylint: disable=import-outside-toplevel
+
+    mesh = Mesh(maxtext_utils.create_device_mesh(cfg), cfg.mesh_axes)
+    model = self._model(cfg, mesh)
+    rng_model, rng_x = jax.random.split(jax.random.PRNGKey(2345))
+    x = jax.random.normal(rng_x, (cfg.global_batch_size_to_train_on, cfg.max_target_length, cfg.base_emb_dim), cfg.dtype)
+
+    def loss_fn(params, x):
+      out, lb_loss, _ = model.apply({"params": params}, x)
+      loss = jnp.mean(out.astype(jnp.float32) ** 2)
+      if lb_loss is not None:
+        loss = loss + lb_loss.astype(jnp.float32)
+      return loss, out
+
+    orig_gmm = moe.mblx.gmm
+
+    def recording_gmm(*args, **kwargs):
+      if record is not None:
+        rhs = kwargs["rhs"]
+        record.append(
+            {
+                "rhs_shape": tuple((rhs.qvalue if hasattr(rhs, "qvalue") else rhs).shape),
+                "transpose_rhs": kwargs.get("transpose_rhs", False),
+                "weight_gather_axes": list(kwargs.get("weight_gather_axes") or []),
+                "native": kwargs.get("gathered_weight_in_native_tiling", False),
+            }
+        )
+      return orig_gmm(*args, **kwargs)
+
+    orig_kernel = mblx_ops.gmm_v2.gmm_v2
+    orig_retile = mblx_ops._copy_in_kernel_native_tiling  # pylint: disable=protected-access
+
+    def recording_kernel(*args, **kwargs):
+      if kernel_record is not None:
+        kernel_record.append(("gmm_v2", tuple(kwargs["rhs"].shape), kwargs.get("transpose_rhs", False)))
+      return orig_kernel(*args, **kwargs)
+
+    def recording_retile(x):
+      if kernel_record is not None:
+        kernel_record.append(("retile", tuple(x.shape), None))
+      return orig_retile(x)
+
+    with (
+        jax.set_mesh(mesh),
+        nn_partitioning.axis_rules(cfg.logical_axis_rules),
+        self._kernel_context(),
+        mock.patch.object(moe.mblx, "gmm", recording_gmm),
+        mock.patch.object(mblx_ops.gmm_v2, "gmm_v2", recording_kernel),
+        mock.patch.object(mblx_ops, "_copy_in_kernel_native_tiling", recording_retile),
+    ):
+      variables = model.init({"params": rng_model, "dropout": rng_model}, x)
+      if params is None:
+        params = variables["params"]
+      for r in (record, kernel_record):
+        if r is not None:
+          r.clear()  # keep only the calls traced for the jitted forward/backward below
+      (loss, out), (grads, x_grad) = jax.jit(jax.value_and_grad(loss_fn, argnums=(0, 1), has_aux=True))(params, x)
+      # The interpreted kernels run as host callbacks: finish them while the shim is installed.
+      loss, out, grads, x_grad = jax.block_until_ready((loss, out, grads, x_grad))
+    return {"loss": loss, "output": out, "x_grad": x_grad, "param_grad": grads}, params, variables
+
+  def test_flag_places_fsdp_on_the_mlp_axis(self):
+    """wi/wo parameters are stored FSDP-sharded on F, and the gmm QAG gathers axis 1 of an [E, F, D] rhs."""
+    cfg = self._cfg(ici_expert_parallelism=1, shard_mlp_moe_on_fsdp=True)
+    record = []
+    _, _, variables = self._run(cfg, record=record)
+    fsdp = self.NUM_DEVICES
+    num_experts, emb, mlp = cfg.num_experts, cfg.base_emb_dim, cfg.moe_mlp_dim
+    logical_specs = nn.get_partition_spec(variables)["params"]
+    shapes = {
+        jax.tree_util.keystr(path): tuple(v.shape)
+        for path, v in jax.tree_util.tree_leaves_with_path(nn.unbox(variables)["params"])
+    }
+    expected = {
+        "wi_0": ((num_experts, emb, mlp), ("exp", "mlp_moe", "embed_moe"), P("expert", "fsdp_transpose", "fsdp")),
+        "wi_1": ((num_experts, emb, mlp), ("exp", "mlp_moe", "embed_moe"), P("expert", "fsdp_transpose", "fsdp")),
+        "wo": ((num_experts, mlp, emb), ("exp", "embed_moe", "mlp_moe"), P("expert", "fsdp", "fsdp_transpose")),
+    }
+    found = {}
+    for path, spec in jax.tree_util.tree_leaves_with_path(logical_specs, is_leaf=lambda v: isinstance(v, P)):
+      name = getattr(path[-1], "key", None)
+      if name in expected:
+        found[name] = (jax.tree_util.keystr(path), spec)
+    self.assertEqual(sorted(found), sorted(expected))
+    for name, (path, spec) in found.items():
+      shape, logical, mesh_spec = expected[name]
+      self.assertEqual(tuple(spec), logical, msg=path)
+      self.assertEqual(nn_partitioning.logical_to_mesh_axes(spec, rules=cfg.logical_axis_rules), mesh_spec, msg=path)
+      self.assertEqual(shapes[path], shape, msg=path)
+    wi_calls = [r for r in record if r["transpose_rhs"]]
+    wo_calls = [r for r in record if not r["transpose_rhs"]]
+    self.assertLen(wi_calls, 2)
+    self.assertLen(wo_calls, 1)
+    for r in wi_calls:
+      self.assertEqual(r["rhs_shape"], (num_experts, mlp // fsdp, emb))
+      self.assertEqual(r["weight_gather_axes"], [("fsdp", 1)])
+      self.assertTrue(r["native"])
+    self.assertEqual(wo_calls[0]["rhs_shape"], (num_experts, mlp // fsdp, emb))
+    self.assertEqual(wo_calls[0]["weight_gather_axes"], [("fsdp", 1)])
+    self.assertTrue(wo_calls[0]["native"])
+
+  def test_flag_off_keeps_fsdp_on_the_embed_axis(self):
+    cfg = self._cfg(ici_expert_parallelism=1, shard_mlp_moe_on_fsdp=False)
+    record = []
+    self._run(cfg, record=record)
+    self.assertLen(record, 3)
+    for r in record:
+      self.assertFalse(r["transpose_rhs"])
+      self.assertFalse(r["native"])
+    self.assertEqual(
+        sorted(tuple(r["weight_gather_axes"]) for r in record), [(("fsdp", 1),), (("fsdp", 1),), (("fsdp", 2),)]
+    )
+
+  @parameterized.named_parameters(
+      {"testcase_name": f"ep{ep}_switch_{'on' if switch else 'off'}", "ep": ep, "switch": switch}
+      for ep in (1, 2)
+      for switch in (False, True)
+  )
+  def test_flag_on_matches_flag_off_bitwise(self, ep, switch):
+    """Loss, output and every gradient are bit-identical with the weights FSDP-sharded on mlp vs embed."""
+    from maxtext.kernels.megablox import ops as mblx_ops  # pylint: disable=import-outside-toplevel
+
+    ref_kernels, tgt_kernels = [], []
+    with mock.patch.object(mblx_ops, "DLHS_USE_TRANSPOSED_RHS_KERNEL", switch):
+      ref, params, _ = self._run(
+          self._cfg(ici_expert_parallelism=ep, shard_mlp_moe_on_fsdp=False), kernel_record=ref_kernels
+      )
+      cfg = self._cfg(ici_expert_parallelism=ep, shard_mlp_moe_on_fsdp=True)
+      tgt, _, _ = self._run(cfg, params=params, kernel_record=tgt_kernels)
+    # Which kernel variant reads which orientation, with the flag on (weights gathered as [E, F, D]):
+    # wi forward transposed-rhs (switch on) or a swapaxes copy + plain (off); wi dlhs plain; wo forward plain;
+    # wo dlhs transposed-rhs (on) or swapaxes + plain (off); and no native-tiling copy (the gather writes whole
+    # 32-row tiles). The drhs goes through tgmm_v2 and is not recorded here.
+    e_local, emb, mlp = cfg.num_experts // ep, cfg.base_emb_dim, cfg.moe_mlp_dim
+    gmm_calls = collections.Counter((shape, trhs) for kind, shape, trhs in tgt_kernels if kind == "gmm_v2")
+    if switch:  # wi fwd + wo dlhs transposed-rhs on [E, F, D]; wi dlhs + wo fwd plain on [E, F, D]
+      expected = {((e_local, mlp, emb), True): 3, ((e_local, mlp, emb), False): 3}
+    else:  # wi fwd + wo dlhs plain on a swapaxes copy [E, D, F]; wi dlhs + wo fwd plain on [E, F, D]
+      expected = {((e_local, emb, mlp), False): 3, ((e_local, mlp, emb), False): 3}
+    self.assertEqual(dict(gmm_calls), expected)
+    self.assertEqual([k for k in tgt_kernels if k[0] == "retile"], [])
+    self.assertLen([k for k in ref_kernels if k[0] == "retile"], 3 if switch else 0)
+    ref_leaves = jax.tree_util.tree_leaves_with_path(ref)
+    tgt_leaves = jax.tree_util.tree_leaves_with_path(tgt)
+    self.assertEqual([p for p, _ in ref_leaves], [p for p, _ in tgt_leaves])
+    for (path, a), (_, b) in zip(ref_leaves, tgt_leaves):
+      a, b = np.asarray(jax.device_get(a)), np.asarray(jax.device_get(b))
+      self.assertEqual(a.shape, b.shape, msg=jax.tree_util.keystr(path))
+      self.assertTrue(np.any(a != 0), msg=f"{jax.tree_util.keystr(path)} is all zero; the comparison would be vacuous")
+      np.testing.assert_array_equal(a, b, err_msg=jax.tree_util.keystr(path))
 
 
 if __name__ == "__main__":

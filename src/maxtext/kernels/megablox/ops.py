@@ -76,8 +76,18 @@ def gmm(
     use_gmm_v2: bool = False,
     use_gmm_v2_heuristic_tiling: bool = False,
     partial_sum: jnp.ndarray | None = None,
+    gathered_weight_in_native_tiling: bool = False,
 ):
-  """Grouped matrix multiplication operation."""
+  """Grouped matrix multiplication operation.
+
+  `gathered_weight_in_native_tiling`: the caller shards the weight so that the
+  QAG of `weight_gather_axes` runs along axis 1 of the rhs as passed, which is the
+  row axis of every kernel that reads it. When in addition each local shard is a
+  whole number of native row tiles (32 rows for fp8, `_gather_writes_native_row_tiles`),
+  the gathered buffer can land in the kernels' native tiling, and with
+  DLHS_USE_TRANSPOSED_RHS_KERNEL on the kernels read it directly instead of through
+  _copy_in_kernel_native_tiling. See `shard_mlp_moe_on_fsdp` in moe.py.
+  """
   if interpret is None:
     # Default to native (TPU) lowering. `jax.devices()[0]` is NOT the compile TARGET:
     # during train_compile the local backend is CPU (JAX_PLATFORMS=cpu) while the mesh
@@ -110,7 +120,7 @@ def gmm(
   gmm_fwd_bwd = lambda *args: _gmm_fwd(*args)[0]  # pylint: disable=C3001
   gmm_fwd_bwd = jax.custom_vjp(
       gmm_fwd_bwd,
-      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16),
+      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18),
   )
   gmm_fwd_bwd.defvjp(_gmm_fwd, functools.partial(_gmm_bwd, lhs.dtype, rhs.dtype))
   return gmm_fwd_bwd(
@@ -132,6 +142,7 @@ def gmm(
       use_gmm_v2,
       use_gmm_v2_heuristic_tiling,
       partial_sum,
+      gathered_weight_in_native_tiling,
   )
 
 
@@ -169,6 +180,7 @@ def _gmm_fwd(
     use_gmm_v2: bool = False,
     use_gmm_v2_heuristic_tiling: bool = False,
     partial_sum: jnp.ndarray | None = None,
+    gathered_weight_in_native_tiling: bool = False,
 ) -> tuple[
     jnp.ndarray,
     tuple[
@@ -200,6 +212,7 @@ def _gmm_fwd(
     )
 
   # Quantization All-Gather (QAG) for weight: only supported for following conditions
+  gathered_in_native_row_tiles = False
   if (
       use_tokamax_backend
       and quantization_rule
@@ -208,10 +221,13 @@ def _gmm_fwd(
       and isinstance(rhs, qpl.QArray)
       and weight_gather_axes
   ):
+    gathered_in_native_row_tiles = gathered_weight_in_native_tiling and _gather_writes_native_row_tiles(
+        rhs.qvalue, weight_gather_axes
+    )
     # pyrefly: ignore[bad-assignment]
     rhs = _fwd_gather_weight(rhs, weight_gather_axes)
 
-  if use_tokamax_backend and use_gmm_v2 and DLHS_USE_TRANSPOSED_RHS_KERNEL:
+  if use_tokamax_backend and use_gmm_v2 and DLHS_USE_TRANSPOSED_RHS_KERNEL and not gathered_in_native_row_tiles:
     # One TensorCore-written copy of the (gathered) weight in the kernels' native
     # tiling, shared by the forward kernel here and, through the residual, by the
     # dlhs kernel; see DLHS_USE_TRANSPOSED_RHS_KERNEL.
@@ -294,6 +310,18 @@ def _fwd_quantize_activation_and_weight(
           calibration_method=quantization_rule.weight_calibration_method,
       )
   return lhs, rhs
+
+
+def _gather_writes_native_row_tiles(local_qvalue: jnp.ndarray, weight_gather_axes: List[Tuple[str, int]]) -> bool:
+  """Whether gathering `local_qvalue` on `weight_gather_axes` concatenates whole native row tiles.
+
+  True when every gather is along axis 1 (the rows of the rhs as passed, which is the
+  row axis both of the forward and the dlhs kernel read) and each local shard holds a
+  multiple of the kernels' native row tile (32 rows for 8-bit, 16 for 16-bit data), so
+  the gathered buffer can be laid out in that tiling without re-tiling any shard.
+  """
+  native_rows = 32 // jnp.dtype(local_qvalue.dtype).itemsize
+  return all(axis_idx == 1 for _, axis_idx in weight_gather_axes) and local_qvalue.shape[1] % native_rows == 0
 
 
 def _fwd_gather_weight(rhs: qpl.QArray, weight_gather_axes: List[Tuple[str, int]]) -> qpl.QArray:
@@ -403,8 +431,11 @@ def _fwd_run_tokamax_v2(
 ) -> jnp.ndarray:
   """Executes the Tokamax GMM V2 backend for forward pass OUT = LHS @ RHS."""
   # if transpose_rhs=False, rhs is [g, k, n], remain unchanged
-  # if transpose_rhs=True, rhs [g, n, k], explicit transpose to [g, k, n]
-  rhs_operand = rhs if not transpose_rhs else rhs.swapaxes(1, 2)
+  # if transpose_rhs=True, rhs [g, n, k]: with DLHS_USE_TRANSPOSED_RHS_KERNEL on the
+  # kernel reads it in place (transpose_rhs=True, NT contraction inside the tile);
+  # otherwise it is explicitly transposed to [g, k, n].
+  kernel_transpose_rhs = transpose_rhs and DLHS_USE_TRANSPOSED_RHS_KERNEL
+  rhs_operand = rhs if (not transpose_rhs or kernel_transpose_rhs) else rhs.swapaxes(1, 2)
   rhs_scale = None
 
   if isinstance(rhs, qpl.QArray):
@@ -444,6 +475,7 @@ def _fwd_run_tokamax_v2(
       group_offset=group_offset,
       lhs_scale=lhs_scale,
       maybe_quantize_lhs=maybe_quantize_lhs,
+      **({"transpose_rhs": True} if kernel_transpose_rhs else {}),
   )
 
   # gmm_v2 only rescales output when it quantizes lhs internally; for pre-quantized QArray
@@ -503,6 +535,7 @@ def _gmm_bwd(
     rhs_vma_axes: tuple,
     use_gmm_v2: bool,
     use_gmm_v2_heuristic_tiling: bool,
+    gathered_weight_in_native_tiling: bool,  # pylint: disable=unused-argument
     residual: tuple[
         jnp.ndarray | qpl.QArray,
         jnp.ndarray | qpl.QArray,
@@ -575,6 +608,11 @@ def _gmm_bwd(
   )
 
   # 4. DRHS Gradient Execution
+  # The tgmm computes drhs as [g, k, n]; with transpose_rhs=True the weight (and the
+  # axes it was gathered on) is [g, n, k], so the reduce-scatter axes 1 and 2 swap.
+  drhs_scatter_axes = weight_gather_axes
+  if transpose_rhs and weight_gather_axes:
+    drhs_scatter_axes = [(axis_name, {1: 2, 2: 1}.get(axis_idx, axis_idx)) for axis_name, axis_idx in weight_gather_axes]
   drhs = _compute_drhs(
       drhs_dout,
       lhs,
@@ -586,7 +624,7 @@ def _gmm_bwd(
       use_tokamax_backend,
       use_gmm_v2,
       use_manual_quantization,
-      weight_gather_axes,
+      drhs_scatter_axes,
       interpret,
       rhs_vma_axes,
       quantization_rule,
@@ -817,6 +855,15 @@ def _dlhs_scale_grad_by_rhs_scale(
 # hardware tests validated, T(32,128)(4,1), and the forward and dlhs kernels share it
 # (one copy per weight per use of the gathered weight instead of a re-tiling copy for
 # the forward plus a transposed copy for dlhs). Off until validated at 512.
+#
+# The same switch lets the forward read a [g, n, k] weight (ops-level transpose_rhs=True)
+# in place instead of through rhs.swapaxes(1, 2). With shard_mlp_moe_on_fsdp (moe.py) the
+# QAG gathers every expert weight along the rows of an [E, F, D] buffer, and when each
+# shard is a whole number of native row tiles (gathered_weight_in_native_tiling and
+# _gather_writes_native_row_tiles, e.g. 2048 / 64 = 32 rows of fp8) the all-gather lands
+# in T(32,128)(4,1) itself; then no copy is made and every kernel reads the gathered
+# buffer: the wi forward and wo dlhs kernels with the in-kernel transpose, the wi dlhs and
+# wo forward kernels plain.
 DLHS_USE_TRANSPOSED_RHS_KERNEL = False
 
 
