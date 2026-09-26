@@ -796,6 +796,20 @@ def _dlhs_scale_grad_by_rhs_scale(
     return grad * repeated_scale
 
 
+# Whether the dlhs matmul reads the weight in place with gmm_v2(transpose_rhs=True)
+# instead of materializing rhs.swapaxes(1, 2). The kernel path is bit-exact in
+# isolation, but in the 512-chip DeepSeek-V3 program the FSDP all-gather (offloaded
+# to the SparseCore; 7168 / 64 = 112-row shards, not a multiple of 32) lands the fp8
+# weight in an 8-row tiling, {2,1,0:T(8,128)(4,1)}, and because the Pallas custom
+# call only constrains the dimension order XLA feeds that buffer to the kernel
+# without re-tiling. With the transposed contraction on that operand two runs of
+# the same program produced different gradients from step 1-2 on. The combination
+# is not reachable in unit tests (jitted parameters get T(32,128)(4,1)), so the
+# path stays off until it is validated on hardware; off, the dlhs kernel gets the
+# explicit transposed copy as before.
+DLHS_USE_TRANSPOSED_RHS_KERNEL = False
+
+
 def _dlhs_run_tokamax_v2(
     dlhs_dout: jnp.ndarray | qpl.QArray,
     rhs: jnp.ndarray,
@@ -814,8 +828,14 @@ def _dlhs_run_tokamax_v2(
   #   in HBM (that copy costs one full read + write of the weight per call).
   # - transpose_rhs=True: rhs is [g, n, k], already the [g, contract, out]
   #   layout of a plain gmm_v2.
-  dlhs_rhs = rhs
-  dlhs_transpose_rhs = not transpose_rhs
+  # See DLHS_USE_TRANSPOSED_RHS_KERNEL for why the in-kernel transpose is off
+  # by default.
+  if DLHS_USE_TRANSPOSED_RHS_KERNEL:
+    dlhs_rhs = rhs
+    dlhs_transpose_rhs = not transpose_rhs
+  else:
+    dlhs_rhs = rhs if transpose_rhs else rhs.swapaxes(1, 2)
+    dlhs_transpose_rhs = False
   dlhs_lhs = dlhs_dout.qvalue if isinstance(dlhs_dout, qpl.QArray) else dlhs_dout
 
   if use_gmm_v2_heuristic_tiling:
