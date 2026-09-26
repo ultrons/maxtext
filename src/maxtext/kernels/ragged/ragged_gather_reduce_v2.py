@@ -637,6 +637,7 @@ _CAST_ROW_UNROLL = 8
 def _masked_rows_to_bf16_kernel(
     valid_rows_ref,
     counts_ref,
+    mask_words_ref,
     x_hbm_ref,
     out_ref,
     buf_ref,
@@ -649,15 +650,19 @@ def _masked_rows_to_bf16_kernel(
 
   Only the rows listed in ``valid_rows_ref`` (scalar-prefetched, compacted per
   tile, padded with repeats of the tile's last valid row to a multiple of
-  ``row_unroll``) are DMA'd from the float32 kernel output; the rest of the
-  tile is zero. The next tile's rows are fetched while this tile is converted.
+  ``row_unroll``) are DMA'd from the float32 kernel output; the next tile's rows
+  are fetched while this tile is converted. The other rows of the VMEM buffer
+  hold stale data and are never used: the convert selects zero for them from the
+  tile's row-validity bits (``mask_words_ref``, 32 rows per int32 word, row ``r``
+  in bit ``r % 32``), so there is no separate zero-fill pass, and the rows that
+  were DMA'd pass through the select unchanged (NaN payloads and -0.0 included).
   """
   i = pl.program_id(0)
   num_tiles = pl.num_programs(0)
   slot = i % 2
+  words_per_tile = tile_rows // 32
 
   def fetch(tile, s):
-    buf_ref[s] = jnp.zeros_like(buf_ref[s])
     base = tile * tile_rows
 
     def issue(k, carry):
@@ -692,8 +697,26 @@ def _masked_rows_to_bf16_kernel(
   def _():
     fetch(i + 1, 1 - slot)
 
+  # Row-validity mask of this tile as a (tile_rows, 128) predicate, built from
+  # the scalar words while the DMAs are in flight.
+  row = jax.lax.broadcasted_iota(jnp.int32, (tile_rows, 128), 0)
+  word = jnp.full((tile_rows, 128), mask_words_ref[i * words_per_tile], jnp.int32)
+  for w in range(1, words_per_tile):
+    word = jnp.where(row >= w * 32, mask_words_ref[i * words_per_tile + w], word)
+  row_valid = jax.lax.shift_right_logical(word, row & 31) & 1 != 0
+  # Repeating the (tile_rows, 128) predicate across the lane tiles reuses the
+  # same mask registers; a per-128-column loop instead makes Mosaic pack each
+  # float32 vreg alone and store half bf16 vregs (1.6x the convert's bundles).
+  row_valid = jnp.tile(row_valid, (1, out_ref.shape[1] // 128))
+
   wait(i, slot)
-  out_ref[...] = buf_ref[slot].astype(out_ref.dtype)
+  out_ref[...] = jnp.where(row_valid, buf_ref[slot], 0.0).astype(out_ref.dtype)
+
+
+def _row_mask_words(mask: jax.Array) -> jax.Array:
+  """Row-validity bits packed 32 rows per int32 word: row ``r`` in bit ``r % 32`` of word ``r // 32``."""
+  bits = mask.reshape(-1, 32).astype(jnp.uint32) << jnp.arange(32, dtype=jnp.uint32)
+  return jax.lax.bitcast_convert_type(jnp.sum(bits, axis=-1, dtype=jnp.uint32), jnp.int32)
 
 
 def _masked_rows_to_bf16(
@@ -717,6 +740,7 @@ def _masked_rows_to_bf16(
   """
   assert x.shape[1] == hidden_size, (x.shape, hidden_size)
   assert num_rows % tile_rows == 0, (num_rows, tile_rows)
+  assert tile_rows % 32 == 0 and hidden_size % 128 == 0, (tile_rows, hidden_size)
   num_tiles = num_rows // tile_rows
   mask = mask[:num_rows]
   # Per tile, the valid row indices compacted to the front, padded to a
@@ -731,12 +755,13 @@ def _masked_rows_to_bf16(
   last_valid = jnp.take_along_axis(order, jnp.maximum(counts - 1, 0)[:, None], axis=-1)
   order = jnp.where(slot < counts[:, None], order, last_valid)
   valid_rows = (order + (jnp.arange(num_tiles, dtype=jnp.int32) * tile_rows)[:, None]).reshape(-1).astype(jnp.int32)
+  mask_words = _row_mask_words(mask)
 
   grid_spec = pltpu.PrefetchScalarGridSpec(
-      num_scalar_prefetch=2,
+      num_scalar_prefetch=3,
       grid=(num_tiles,),
       in_specs=[pl.BlockSpec(memory_space=pl.ANY)],
-      out_specs=pl.BlockSpec((tile_rows, hidden_size), lambda i, valid_rows, counts: (i, 0)),
+      out_specs=pl.BlockSpec((tile_rows, hidden_size), lambda i, valid_rows, counts, mask_words: (i, 0)),
       scratch_shapes=[
           pltpu.VMEM((2, tile_rows, hidden_size), jnp.float32),
           pltpu.SemaphoreType.DMA((2,)),
@@ -749,6 +774,9 @@ def _masked_rows_to_bf16(
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("arbitrary",),
           vmem_limit_bytes=48 * 1024 * 1024,
+          # Every DMA is in bounds by construction: sources are rows of this
+          # tile below num_rows, destinations are rows of the tile's buffer.
+          disable_bounds_checks=True,
       ),
       cost_estimate=pl.CostEstimate(
           flops=num_rows * hidden_size,
@@ -757,7 +785,7 @@ def _masked_rows_to_bf16(
       ),
       interpret=interpret,
       name="ragged_gather_reduce_masked_cast",
-  )(valid_rows, padded_counts, x)
+  )(valid_rows, padded_counts, mask_words, x)
 
 
 @functools.partial(
