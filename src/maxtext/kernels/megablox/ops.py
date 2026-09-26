@@ -211,6 +211,12 @@ def _gmm_fwd(
     # pyrefly: ignore[bad-assignment]
     rhs = _fwd_gather_weight(rhs, weight_gather_axes)
 
+  if use_tokamax_backend and use_gmm_v2 and DLHS_USE_TRANSPOSED_RHS_KERNEL:
+    # One TensorCore-written copy of the (gathered) weight in the kernels' native
+    # tiling, shared by the forward kernel here and, through the residual, by the
+    # dlhs kernel; see DLHS_USE_TRANSPOSED_RHS_KERNEL.
+    rhs = _retile_gathered_weight(rhs)
+
   # Backend Execution Routing
   if use_tokamax_backend and not use_gmm_v2:
     out = _fwd_run_tokamax_v1(lhs, rhs, group_sizes, preferred_element_type, transpose_rhs, use_manual_quantization)
@@ -797,17 +803,47 @@ def _dlhs_scale_grad_by_rhs_scale(
 
 
 # Whether the dlhs matmul reads the weight in place with gmm_v2(transpose_rhs=True)
-# instead of materializing rhs.swapaxes(1, 2). The kernel path is bit-exact in
-# isolation, but in the 512-chip DeepSeek-V3 program the FSDP all-gather (offloaded
-# to the SparseCore; 7168 / 64 = 112-row shards, not a multiple of 32) lands the fp8
-# weight in an 8-row tiling, {2,1,0:T(8,128)(4,1)}, and because the Pallas custom
-# call only constrains the dimension order XLA feeds that buffer to the kernel
-# without re-tiling. With the transposed contraction on that operand two runs of
-# the same program produced different gradients from step 1-2 on. The combination
-# is not reachable in unit tests (jitted parameters get T(32,128)(4,1)), so the
-# path stays off until it is validated on hardware; off, the dlhs kernel gets the
-# explicit transposed copy as before.
+# instead of materializing rhs.swapaxes(1, 2), with the gathered weight first passed
+# through _copy_in_kernel_native_tiling so that every gmm_v2 kernel (forward,
+# rematerialized forward and dlhs) reads one TensorCore-written copy of it.
+#
+# Background: the kernel path is bit-exact in isolation, but in the 512-chip
+# DeepSeek-V3 program the FSDP all-gather (offloaded to the SparseCore; 7168 / 64 =
+# 112-row shards, not a multiple of 32) lands the fp8 weight in an 8-row tiling,
+# {2,1,0:T(8,128)(4,1)}. The Pallas custom call only constrains the dimension order
+# of its operands, so without a transposed copy in the way XLA fed that buffer to the
+# kernels without re-tiling, and 3 of 4 runs showed gradient spikes that 8 runs of the
+# baseline program did not. With the copy every kernel reads the layout the isolated
+# hardware tests validated, T(32,128)(4,1), and the forward and dlhs kernels share it
+# (one copy per weight per use of the gathered weight instead of a re-tiling copy for
+# the forward plus a transposed copy for dlhs). Off until validated at 512.
 DLHS_USE_TRANSPOSED_RHS_KERNEL = False
+
+
+def _copy_in_kernel_native_tiling(x: jnp.ndarray) -> jnp.ndarray:
+  """Materializes `x` through an XLA elementwise fusion whose output XLA lays out in
+  the Pallas kernels' native tiling (T(32,128) for 8-bit, T(16,128) for bf16).
+
+  `jax.experimental.layout.with_layout_constraint` would express this directly, but on
+  the jax / libtpu pair in use its `LayoutConstraint` custom call cannot be serialized
+  for the TPU plugin (`result_tilings` is not in plugin version 1.16.2), and Pallas
+  only supports explicit operand tilings for SparseCore kernels. A plain copy,
+  `optimization_barrier` or a convert round trip is folded away; a select on a
+  predicate that is true at run time but opaque to the compiler is not, and costs
+  exactly one read and one write of `x`, the same as the copy it replaces. The
+  predicate depends on `x` only (the first 128 bytes, read once), so every use of the
+  same gathered weight (forward, both token chunks, dlhs) CSEs to one fusion.
+  """
+  head = jax.lax.bitcast_convert_type(x.reshape(-1)[: 128 // jnp.dtype(x.dtype).itemsize], jnp.uint8).reshape(-1)
+  keep = jnp.sum(head.astype(jnp.int32)) >= 0  # a sum of 128 bytes is non-negative; XLA cannot prove it.
+  return jnp.where(keep, x, jnp.zeros_like(x))
+
+
+def _retile_gathered_weight(rhs: jnp.ndarray | qpl.QArray) -> jnp.ndarray | qpl.QArray:
+  """Applies _copy_in_kernel_native_tiling to the weight (or its qvalue)."""
+  if isinstance(rhs, qpl.QArray):
+    return dataclasses.replace(rhs, qvalue=_copy_in_kernel_native_tiling(rhs.qvalue))
+  return _copy_in_kernel_native_tiling(rhs)
 
 
 def _dlhs_run_tokamax_v2(
@@ -829,7 +865,7 @@ def _dlhs_run_tokamax_v2(
   # - transpose_rhs=True: rhs is [g, n, k], already the [g, contract, out]
   #   layout of a plain gmm_v2.
   # See DLHS_USE_TRANSPOSED_RHS_KERNEL for why the in-kernel transpose is off
-  # by default.
+  # by default; when it is on, rhs is the native-tiling copy made in _gmm_fwd.
   if DLHS_USE_TRANSPOSED_RHS_KERNEL:
     dlhs_rhs = rhs
     dlhs_transpose_rhs = not transpose_rhs
