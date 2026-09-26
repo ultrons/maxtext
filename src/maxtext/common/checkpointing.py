@@ -783,6 +783,7 @@ def load_state_if_possible(
         use_ocdbt=use_ocdbt,
         use_zarr3=use_zarr3,
         enable_single_replica_ckpt_restoring=bool(enable_single_replica_ckpt_restoring),
+        restore_experts_chunk_aligned=bool(getattr(maxtext_config, "shard_mlp_moe_on_fsdp", False)),
     )
     return None, restored_params
   elif load_full_state_from_path != "":
@@ -930,6 +931,98 @@ def maybe_dequantize_restored_params(restored_weights: Any, expected_param_pytre
   return out
 
 
+# Routed expert weights are direct leaves named like this (a dense MLP's are `.../wi_0/kernel`).
+_ROUTED_EXPERT_WEIGHT_NAMES = ("wi_0", "wi_1", "wo")
+
+
+def _mesh_axes_size(mesh, entry) -> int:
+  """Number of shards a PartitionSpec entry (None, an axis name or a tuple of names) makes."""
+  if entry is None:
+    return 1
+  names = entry if isinstance(entry, (tuple, list)) else (entry,)
+  size = 1
+  for name in names:
+    size *= mesh.shape[name]
+  return size
+
+
+def _chunks_per_shard(mesh, spec, shape, chunk_shape) -> int:
+  """Stored chunks one shard of `spec` spans along the last two dims.
+
+  Each of them is read and zstd-decoded in full by every shard that touches it.
+  """
+  count = 1
+  for d in (len(shape) - 2, len(shape) - 1):
+    shard = shape[d] // _mesh_axes_size(mesh, spec[d])
+    count *= -(-shard // chunk_shape[d])
+  return count
+
+
+def _chunk_aligned_expert_restore_target(request, stored):
+  """Restores routed expert weights in the checkpoint's layout when the target cuts across its chunks.
+
+  With shard_mlp_moe_on_fsdp the expert weights are FSDP-sharded on the mlp dim, while a checkpoint
+  written with the embed sharding is chunked along embed with the full mlp dim in each chunk (e.g.
+  [256, 58, 32, 2048] for a [256, 58, 7168, 2048] wi). Reading that into mlp shards makes every device
+  fetch and decode every chunk of the weight. For such a leaf the request uses the sharding with the
+  last two PartitionSpec entries swapped, which is the embed sharding the checkpoint was written with,
+  when a shard of it spans fewer stored chunks than a shard of the target; the caller reshards on
+  device afterwards.
+
+  Returns the request tree and {keypath: target sharding} for the leaves it changed.
+  """
+  targets = {}
+
+  def swap(keypath, leaf):
+    keys = tuple(getattr(k, "key", k) for k in keypath)
+    sharding = getattr(leaf, "sharding", None)
+    if (
+        keys[-1] not in _ROUTED_EXPERT_WEIGHT_NAMES
+        or not isinstance(leaf, jax.ShapeDtypeStruct)
+        or len(leaf.shape) < 3
+        or not isinstance(sharding, jax.sharding.NamedSharding)
+    ):
+      return leaf
+    storage = getattr(_lookup_path(stored, keys), "storage_metadata", None)
+    chunk_shape = getattr(storage, "chunk_shape", None)
+    if chunk_shape is None or len(chunk_shape) != len(leaf.shape):
+      return leaf
+    mesh = sharding.mesh
+    spec = tuple(sharding.spec) + (None,) * (len(leaf.shape) - len(sharding.spec))
+    swapped = spec[:-2] + (spec[-1], spec[-2])
+    if (
+        swapped == spec
+        or any(leaf.shape[d] % _mesh_axes_size(mesh, swapped[d]) for d in range(len(leaf.shape)))
+        or _chunks_per_shard(mesh, swapped, leaf.shape, chunk_shape)
+        >= _chunks_per_shard(mesh, spec, leaf.shape, chunk_shape)
+    ):
+      return leaf
+    targets[keypath] = sharding
+    return jax.ShapeDtypeStruct(
+        leaf.shape, leaf.dtype, sharding=jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*swapped))
+    )
+
+  request = jax.tree_util.tree_map_with_path(swap, request)
+  if targets:
+    max_logging.log(
+        f"Restoring {len(targets)} routed expert weight(s) in the checkpoint's chunk-aligned sharding, "
+        "then resharding them on device to the model's."
+    )
+  return request, targets
+
+
+def _reshard_restored(restored, targets):
+  """Moves each leaf named in `targets` to its target sharding (the sources stay live until the caller drops `restored`)."""
+
+  def reshard(keypath, leaf):
+    target = targets.get(keypath)
+    if target is None:
+      return leaf
+    return jax.jit(lambda x: x, out_shardings=target)(leaf)
+
+  return jax.tree_util.tree_map_with_path(reshard, restored)
+
+
 def load_params_from_path(
     load_parameters_from_path,
     abstract_unboxed_params,
@@ -937,8 +1030,14 @@ def load_params_from_path(
     use_ocdbt=True,
     use_zarr3=True,
     enable_single_replica_ckpt_restoring: bool = False,
+    restore_experts_chunk_aligned: bool = False,
 ):
-  """Load decode params from checkpoint at specified path."""
+  """Load decode params from checkpoint at specified path.
+
+  restore_experts_chunk_aligned (set by shard_mlp_moe_on_fsdp): read routed expert weights whose
+  target sharding cuts across the stored chunks in the checkpoint's own layout and reshard them on
+  device. See _chunk_aligned_expert_restore_target.
+  """
   assert load_parameters_from_path, "load_parameters_from_path is not defined."
   max_logging.log(f"restoring params from {load_parameters_from_path}")
 
@@ -1055,11 +1154,17 @@ def load_params_from_path(
             merged_stored = _deep_merge_dicts(merged_stored, stored_collection[col_name])
         stored_collection = merged_stored
       _raise_weight_problems(_weight_mismatches(want, stored_collection, check_missing=False))
+    request = {restore_key: params_collection}
+    reshard_targets = {}
+    if restore_experts_chunk_aligned and isinstance(stored, dict):
+      request, reshard_targets = _chunk_aligned_expert_restore_target(request, stored)
     restored = ocp.load(
         path,
-        {restore_key: params_collection},
+        request,
         checkpointable_name=checkpointable_name,  # pyrefly: ignore[bad-argument-type]
     )
+    if reshard_targets:
+      restored = _reshard_restored(restored, reshard_targets)
   restored_collection = restored[restore_key]  # pyrefly: ignore[bad-index]
   # Weights rescued out of a newer collection came back inside `params`; put them back
   # where the model expects them. The NNX branch below merges every collection by path,
