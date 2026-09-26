@@ -679,6 +679,10 @@ class AttentionOp(nnx.Module):
         self.use_splash_scheduler = self.config.local_use_splash_scheduler
         self.fuse_reciprocal = self.config.local_sa_fuse_reciprocal
         self.use_base2_exp = self.config.local_sa_use_base2_exp
+        # The diagonal skips assume a pure causal mask; sliding-window layers never qualify.
+        self.qk_diag_skip = False
+        self.sv_diag_skip = False
+        self.qk_diag_grid = self.config.sa_qk_diag_grid
       else:
         self.block_q = self.config.sa_block_q
         self.block_kv = self.config.sa_block_kv
@@ -701,6 +705,9 @@ class AttentionOp(nnx.Module):
         self.use_splash_scheduler = self.config.use_splash_scheduler
         self.fuse_reciprocal = self.config.sa_fuse_reciprocal
         self.use_base2_exp = self.config.sa_use_base2_exp
+        self.qk_diag_skip = self.config.sa_qk_diag_skip
+        self.sv_diag_skip = self.config.sa_sv_diag_skip
+        self.qk_diag_grid = self.config.sa_qk_diag_grid
     self.attn_logits_soft_cap = attn_logits_soft_cap
     self.sliding_window_size = sliding_window_size
     self.chunk_attn_window_size = chunk_attn_window_size
@@ -2037,6 +2044,21 @@ class AttentionOp(nnx.Module):
     # create_splash_attention config
     def create_sa_config(config, query, key, attn_logits_soft_cap):
       if config.use_tokamax_splash:
+        qk_diag_skip = self.qk_diag_skip
+        sv_diag_skip = self.sv_diag_skip
+        if qk_diag_skip or sv_diag_skip:
+          # Tokamax enforces square blocks for the diagonal skips. Eval usually runs a smaller
+          # block_q, so the skips are dropped there; in training a non-square config is a mistake.
+          fwd_square = block_q == block_kv == block_kv_compute
+          bwd_square = block_q_dkv == block_kv_dkv == block_kv_dkv_compute
+          if not (fwd_square and bwd_square):
+            if max_utils.is_eval(config):
+              qk_diag_skip = sv_diag_skip = False
+            else:
+              raise ValueError(
+                  "sa_qk_diag_skip / sa_sv_diag_skip require square splash blocks: "
+                  f"fwd {block_q}/{block_kv}/{block_kv_compute}, dkv {block_q_dkv}/{block_kv_dkv}/{block_kv_dkv_compute}."
+              )
         sa_config = tokamax_splash_kernel.SplashConfig(
             block_q=min(block_q, query.shape[2]),
             block_kv=min(block_kv, key.shape[2]),
@@ -2075,6 +2097,9 @@ class AttentionOp(nnx.Module):
                 else (_COMPRESSED_DQ_REDUCTION_STEPS if self.attention_type == AttentionType.COMPRESSED else None)
             ),
             use_experimental_scheduler=self.use_splash_scheduler,
+            qk_diag_skip=qk_diag_skip,
+            sv_diag_skip=sv_diag_skip,
+            qk_diag_grid=self.qk_diag_grid,
         )
       else:
         sa_config = splash_attention_kernel.BlockSizes(
