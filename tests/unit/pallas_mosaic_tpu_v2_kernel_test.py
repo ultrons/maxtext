@@ -16,6 +16,7 @@
 
 import collections
 import contextlib
+import re
 from unittest import mock
 import pytest
 
@@ -31,6 +32,7 @@ import numpy as np
 from maxtext.kernels.megablox import common
 from maxtext.kernels.megablox import ops as megablox_ops
 from maxtext.kernels.megablox import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
+import qwix.pallas as qpl
 from maxtext.kernels.megablox import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
 
 
@@ -1334,6 +1336,25 @@ class GmmTransposeRhsTest(parameterized.TestCase):
             self.assertEqual(spy.call_args.kwargs["rhs"].shape, (num_groups, k, n) if use_kernel else (num_groups, n, k))
     np.testing.assert_array_equal(np.asarray(outs[True]).view(np.uint16), np.asarray(outs[False]).view(np.uint16))
 
+  def test_retile_helper_is_identity(self):
+    """_copy_in_kernel_native_tiling returns its input bit for bit (fp8 and bf16, plain and QArray)."""
+    key = jax.random.key(3)
+    group_sizes = jnp.array([5, 0, 7, 4], jnp.int32)
+    for dtype in (jnp.float8_e4m3fn, jnp.bfloat16):
+      x = jax.random.normal(key, (4, 64, 128), jnp.float32).astype(dtype)
+      y = jax.block_until_ready(jax.jit(megablox_ops._copy_in_kernel_native_tiling)(x))  # pylint: disable=protected-access
+      np.testing.assert_array_equal(np.asarray(x).view(np.uint8), np.asarray(y).view(np.uint8))
+    q = qpl.QArray(
+        qvalue=x.astype(jnp.float8_e4m3fn),
+        scale=jnp.ones((1, 1, 128), jnp.float32),
+        zero_point=None,
+        qtype=jnp.float8_e4m3fn,
+    )
+    q2 = megablox_ops._retile_gathered_weight(q)  # pylint: disable=protected-access
+    self.assertIsInstance(q2, qpl.QArray)
+    np.testing.assert_array_equal(np.asarray(q.qvalue).view(np.uint8), np.asarray(q2.qvalue).view(np.uint8))
+    self.assertIs(q2.scale, q.scale)
+
   def test_rejects_fuse_act(self):
     lhs = jnp.zeros((256, 512), jnp.bfloat16)
     rhs_gnk = jnp.zeros((4, 512, 512), jnp.bfloat16)
@@ -1426,6 +1447,70 @@ class GmmTransposeRhsCompileTest(parameterized.TestCase):
     hlo = compiled.as_text()
     self.assertIn("f8e4m3fn[16,7168,2048]{2,1,0:T(8,128)(4,1)} parameter", hlo)
     self.assertNotRegex(hlo, r"= f8e4m3fn\[16,7168,2048\][^ ]* copy\(")
+
+  @pytest.mark.tpu_backend
+  def test_switch_on_kernels_share_one_native_tiling_copy(self):
+    """With DLHS_USE_TRANSPOSED_RHS_KERNEL on, the forward and dlhs kernels read one TensorCore-made T(32,128)(4,1) copy.
+
+    Mirrors the production wi weight: the gathered rhs arrives in {2,1,0:T(8,128)(4,1)}; the forward kernel (through
+    _fwd_run_tokamax_v2) and the dlhs kernel (through _dlhs_run_tokamax_v2 on the residual) must both consume the single
+    fusion produced by _copy_in_kernel_native_tiling, in T(32,128)(4,1), and no gmm_v2 custom call may read the 8-row
+    tiled parameter directly.
+    """
+    try:
+      topology = topologies.get_topology_desc("tpu7x:2x2x1", platform="tpu")
+      from jax.experimental.layout import Format, Layout  # pylint: disable=import-outside-toplevel
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      self.skipTest(f"tpu7x virtual topology or layout API unavailable: {e!r}")
+
+    m, k, n, num_groups = 40960, 2048, 7168, 16
+    x = jax.ShapeDtypeStruct((m, n), jnp.float8_e4m3fn)  # forward lhs [m, D]
+    dout = jax.ShapeDtypeStruct((m, k), jnp.float8_e5m2)  # dlhs lhs [m, F]
+    w_gkn = jax.ShapeDtypeStruct((num_groups, n, k), jnp.float8_e4m3fn)  # forward weight [g, D, F]
+    group_sizes = jax.ShapeDtypeStruct((num_groups,), jnp.int32)
+    rhs_format = Format(
+        Layout(major_to_minor=(0, 1, 2), tiling=((8, 128), (4, 1))),
+        jax.sharding.SingleDeviceSharding(topology.devices[0]),
+    )
+    tiling = (256, 7168, 1024, 256, 2048, 3584, 512, 1792, 2048)  # wi fwd / dlhs / drhs tiles of the 512 recipe
+
+    def fwd_and_dlhs(x, dout, w, group_sizes):
+      # Two token chunks with different group sizes, as in production: each chunk retiles the same gathered weight.
+      outs = []
+      for chunk_sizes in (group_sizes, group_sizes[::-1]):
+        w_chunk = megablox_ops._retile_gathered_weight(w)  # pylint: disable=protected-access
+        out = megablox_ops._fwd_run_tokamax_v2(  # pylint: disable=protected-access
+            x, w_chunk, chunk_sizes, jnp.bfloat16, tiling, False, None, None, False, None
+        )
+        dlhs = megablox_ops._dlhs_run_tokamax_v2(  # pylint: disable=protected-access
+            dout, w_chunk, chunk_sizes, None, jnp.bfloat16, tiling, False, False
+        )
+        outs += [out, dlhs]
+      return tuple(outs)
+
+    with mock.patch.object(megablox_ops, "DLHS_USE_TRANSPOSED_RHS_KERNEL", True):
+      with jax.default_device(topology.devices[0]):
+        compiled = (
+            jax.jit(fwd_and_dlhs, in_shardings=(None, None, rhs_format, None))
+            .lower(x, dout, w_gkn, group_sizes)
+            .compile()
+        )
+    hlo = compiled.as_text()
+    kernels = [l for l in hlo.splitlines() if "custom-call(" in l and "gmm_v2" in l]
+    self.assertEqual(len(kernels), 4, kernels)
+    self.assertTrue(any("-trhs" in l for l in kernels), "dlhs kernel should be the transposed-rhs variant")
+    rhs_operands = set()
+    for line in kernels:
+      operands = re.search(r"custom-call\(([^)]*)\)", line).group(1).split(", ")
+      rhs_operands.add(operands[-1])
+    self.assertEqual(len(rhs_operands), 1, f"all four kernels should share one rhs value, got {rhs_operands}")
+    rhs_name = next(iter(rhs_operands))
+    self.assertNotIn("#", rhs_name, "the retiling fusion must have a single output (one copy per weight)")
+    producer = [l for l in hlo.splitlines() if l.strip().startswith(rhs_name + " = ")]
+    self.assertEqual(len(producer), 1, producer)
+    self.assertIn("f8e4m3fn[16,7168,2048]{2,1,0:T(32,128)(4,1)}", producer[0])
+    self.assertIn(" fusion(", producer[0])
+    self.assertNotIn("parameter(", producer[0])
 
 
 if __name__ == "__main__":
