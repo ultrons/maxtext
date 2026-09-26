@@ -28,9 +28,11 @@ from flax import nnx
 
 from maxtext.common.common_types import ShardMode, MODEL_MODE_PREFILL, MODEL_MODE_TRAIN, Array, Config, DType, get_weight_dtype
 from maxtext.layers.initializers import Initializer, default_embed_init
+from maxtext.kernels import rope_pairwise
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils.sharding import logical_to_mesh_axes, create_sharding, truncate_out_sharding
+from maxtext.utils.sharding import get_logical_axis_rules
 
 _MAX_WAVELENGTH = 10_000
 
@@ -607,6 +609,13 @@ class YarnRotaryEmbedding(nnx.Module):
     rope_interleave: Whether complex representation is interleaved or concatenated.
     rope_truncate: Whether or not to floor lower bound and ceil upper bound for correction range.
     rope_attention_scaling: Whether or not to scale the rotary embedding output.
+    pairwise_kernel: With `pairwise=True`, run the rotation as the Pallas TPU kernel in
+      `maxtext.kernels.rope_pairwise` (bit-identical to the reshape form; interpreted on CPU) instead of the
+      reshape form. Backends other than TPU and CPU use the reshape form.
+    pairwise_kernel_axis_names: Logical axis names of the [batch, length, heads, head_dim] input (e.g. the
+      attention layer's query axis names). When given, the kernel runs under `jax.shard_map` with the matching
+      mesh specs so that each device rotates its own shard; without them a kernel under auto sharding would be
+      treated as replicated by XLA.
     rngs: rng keys passed in by nnx.bridge.to_linen.
   """
 
@@ -627,6 +636,8 @@ class YarnRotaryEmbedding(nnx.Module):
       truncate=True,
       attention_scaling=False,
       pairwise=False,
+      pairwise_kernel=True,
+      pairwise_kernel_axis_names=None,
       # Not used in YarnRotaryEmbedding but passed in by nnx.bridge.to_linen.
       # TODO: Remove when bridge no longer needed
       rngs: nnx.Rngs = None,
@@ -647,6 +658,8 @@ class YarnRotaryEmbedding(nnx.Module):
     self.shard_mode = shard_mode
     self.attention_scaling = attention_scaling
     self.pairwise = pairwise
+    self.pairwise_kernel = pairwise_kernel
+    self.pairwise_kernel_axis_names = pairwise_kernel_axis_names
 
     if self.pairwise and not self.interleave:
       raise ValueError("rope_pairwise=True requires rope_interleave=True.")
@@ -733,6 +746,37 @@ class YarnRotaryEmbedding(nnx.Module):
     linear_func = (jnp.arange(dim, dtype=jnp.float32) - min_val) / (max_val - min_val)
     return jnp.clip(linear_func, 0, 1)
 
+  def _pairwise_kernel(self, inputs, cos_rows, sin_rows, *, out_dtype, scale, interpret):
+    """Runs the pairwise kernel, under `jax.shard_map` over `self.mesh` when the input's logical axes are known.
+
+    Inside the shard map every device holds its own [batch, length, heads, head_dim] shard and the [batch, length,
+    head_dim // 2] rows of cos / sin; the head axis is left unsharded when the head count does not divide over its
+    mesh axes (the single-head k_pe of MLA), and the head_dim axis is never sharded.
+    """
+
+    def run(x, c, s):
+      if rope_pairwise.kernel_supports(x.shape):
+        return rope_pairwise.apply_pairwise_rope(x, c, s, out_dtype=out_dtype, scale=scale, interpret=interpret)
+      return rope_pairwise.pairwise_rope_reshape_form(x, c, s, out_dtype=out_dtype, scale=scale)
+
+    if self.pairwise_kernel_axis_names is None or self.mesh is None:
+      return run(inputs, cos_rows, sin_rows)
+    spec = tuple(logical_to_mesh_axes(self.pairwise_kernel_axis_names, self.mesh, rules=get_logical_axis_rules()))
+    batch_axes, length_axes, head_axes = (spec + (None, None, None))[:3]
+
+    def axis_size(axes):
+      if axes is None:
+        return 1
+      axes = (axes,) if isinstance(axes, str) else tuple(axes)
+      return math.prod(self.mesh.shape[a] for a in axes)
+
+    if inputs.shape[2] % axis_size(head_axes):
+      head_axes = None
+    x_spec = jax.sharding.PartitionSpec(batch_axes, length_axes, head_axes, None)
+    row_spec = jax.sharding.PartitionSpec(batch_axes, length_axes, None)
+    sharded = jax.shard_map(run, mesh=self.mesh, in_specs=(x_spec, row_spec, row_spec), out_specs=x_spec, check_vma=False)
+    return sharded(inputs, cos_rows, sin_rows)
+
   def __call__(self, inputs: Array, position: None | Array = None) -> Array:
     """Applies the rotary positional embedding using the precomputed complex frequencies.
 
@@ -767,13 +811,30 @@ class YarnRotaryEmbedding(nnx.Module):
       with jax.named_scope("rope_pairwise"):
         b, s, n, h = inputs.shape
         half_dim = h // 2
-        pairs = inputs.reshape(b, s, n, half_dim, 2)
-        pairs = pairs.astype(jnp.float32)
         # Named so that `remat_policy=custom` with `rope_freqs=device` keeps the gathered cos/sin rows as f32
         # residuals ([B, S, 1, half_dim] each, per layer) instead of rebuilding the whole
         # [max_position_embeddings, half_dim] table inside every rematerialized layer body.
-        cos = checkpoint_name(jnp.real(freqs), "rope_freqs")[..., jnp.newaxis]
-        sin = checkpoint_name(jnp.imag(freqs), "rope_freqs")[..., jnp.newaxis]
+        cos_rows = checkpoint_name(jnp.real(freqs), "rope_freqs")
+        sin_rows = checkpoint_name(jnp.imag(freqs), "rope_freqs")
+        kernel_backend = jax.default_backend() if self.pairwise_kernel else None
+        if kernel_backend in ("tpu", "cpu") and rope_pairwise.kernel_supports(inputs.shape):
+          # One Pallas kernel application (and one in the backward); same per-element arithmetic as the
+          # reshape form below, without the relayout copies XLA puts around the (..., half_dim, 2) reshape.
+          attention_scaling = 1.0
+          if self.attention_scaling:
+            attention_scaling = 1.0 if self.rope_factor <= 1 else (0.1 * math.log(self.rope_factor) + 1.0)
+          return self._pairwise_kernel(
+              inputs,
+              cos_rows[:, :, 0, :],
+              sin_rows[:, :, 0, :],
+              out_dtype=self.fprop_dtype if self.cast_as_fprop_dtype else jnp.float32,
+              scale=attention_scaling,
+              interpret=kernel_backend == "cpu",
+          )
+        pairs = inputs.reshape(b, s, n, half_dim, 2)
+        pairs = pairs.astype(jnp.float32)
+        cos = cos_rows[..., jnp.newaxis]
+        sin = sin_rows[..., jnp.newaxis]
         if self.shard_mode == ShardMode.EXPLICIT:
           rotated_sharding = create_sharding(self.mesh, ("activation_batch", "activation_length", None, None, None))
           cos = jnp.broadcast_to(cos, pairs.shape, out_sharding=rotated_sharding)

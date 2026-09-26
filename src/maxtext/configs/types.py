@@ -2636,6 +2636,14 @@ class YarnRope(BaseModel):
           "and 2 represents the real/imag coordinates, returning interleaved RoPE."
       ),
   )
+  rope_pairwise_kernel: bool = Field(
+      True,
+      description=(
+          "With rope_pairwise=True, apply the rotation with the Pallas TPU kernel in maxtext.kernels.rope_pairwise"
+          " (bit-identical to the reshape form, no relayout copies; interpreted on CPU). Backends other than TPU"
+          " and CPU fall back to the reshape form."
+      ),
+  )
 
   @model_validator(mode="after")
   def validate_rope_pairwise(self) -> "YarnRope":
