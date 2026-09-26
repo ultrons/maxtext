@@ -864,7 +864,7 @@ def _dlhs_scale_grad_by_rhs_scale(
 # in T(32,128)(4,1) itself; then no copy is made and every kernel reads the gathered
 # buffer: the wi forward and wo dlhs kernels with the in-kernel transpose, the wi dlhs and
 # wo forward kernels plain.
-DLHS_USE_TRANSPOSED_RHS_KERNEL = False
+DLHS_USE_TRANSPOSED_RHS_KERNEL = True
 
 
 def _copy_in_kernel_native_tiling(x: jnp.ndarray) -> jnp.ndarray:
