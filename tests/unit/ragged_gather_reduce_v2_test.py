@@ -122,6 +122,54 @@ class MaskedRowsToBf16Test(parameterized.TestCase):
     )
     np.testing.assert_array_equal(_bits(got), _bits(_reference(x, mask, num_rows, hidden)))
 
+  @parameterized.named_parameters(
+      # full tile, then empty tiles: the empty tiles reuse buffer slots that hold the stale rows of earlier tiles
+      ("full_then_empty", "full_then_empty"),
+      ("alternating_rows", "alternating"),
+      ("last_tile_partial_head", "last_head"),
+      ("last_tile_only_last_row", "last_row"),
+      ("single_row_per_tile_at_word_edges", "word_edges"),
+  )
+  def test_zero_rows_come_from_the_mask(self, pattern):
+    # The convert selects zero for rows without a valid source; the VMEM rows behind them are stale or uninitialised
+    # (NaN in the interpreter) and must never reach the output, while the real rows keep NaN payloads and -0.0.
+    num_rows, hidden, tile_rows, row_unroll = 512, 256, 128, 8
+    num_tiles = num_rows // tile_rows
+    rng = np.random.RandomState(2)
+    x = jnp.asarray(_f32_rows(rng, num_rows + 1, hidden))
+    mask = np.zeros(num_rows, bool)
+    if pattern == "full_then_empty":
+      mask[:tile_rows] = True
+    elif pattern == "alternating":
+      mask[::2] = True
+    elif pattern == "last_head":
+      mask[: (num_tiles - 1) * tile_rows] = rng.rand((num_tiles - 1) * tile_rows) < 0.4
+      mask[(num_tiles - 1) * tile_rows : (num_tiles - 1) * tile_rows + 3] = True
+    elif pattern == "last_row":
+      mask[tile_rows : 2 * tile_rows] = True
+      mask[num_rows - 1] = True
+    elif pattern == "word_edges":
+      for t in range(num_tiles):
+        mask[t * tile_rows + (0, 31, 32, 127)[t]] = True
+    mask = jnp.asarray(mask)
+    got = grv2._masked_rows_to_bf16(
+        x, mask, num_rows, hidden, jnp.bfloat16, tile_rows=tile_rows, row_unroll=row_unroll, interpret=_interpret_params()
+    )
+    np.testing.assert_array_equal(_bits(got), _bits(_reference(x, mask, num_rows, hidden)))
+    zero_rows = ~np.asarray(mask)
+    self.assertTrue(np.all(_bits(got)[zero_rows] == 0))  # +0.0, never NaN or -0.0 from stale VMEM
+
+  def test_mask_words(self):
+    # The packed validity words the kernel reads: row r of a tile in bit r % 32 of word r // 32, bit 31 included.
+    num_rows = 256
+    rng = np.random.RandomState(3)
+    mask = rng.rand(num_rows) < 0.5
+    mask[31] = mask[63] = True
+    bits = np.asarray(mask).reshape(-1, 32)
+    want = (bits.astype(np.uint64) << np.arange(32, dtype=np.uint64)).sum(-1).astype(np.uint32).view(np.int32)
+    got = grv2._row_mask_words(jnp.asarray(mask))
+    np.testing.assert_array_equal(np.asarray(got), want)
+
 
 class WrapperTest(absltest.TestCase):
 
