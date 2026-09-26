@@ -15,6 +15,7 @@
 """Unit tests for Pallas Mosaic TPU v2 kernels."""
 
 import collections
+import contextlib
 import pytest
 
 from absl.testing import absltest
@@ -23,7 +24,9 @@ import chex
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.experimental import topologies
 import jax.numpy as jnp
+import numpy as np
 from maxtext.kernels.megablox import common
 from maxtext.kernels.megablox import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
 from maxtext.kernels.megablox import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
@@ -1067,6 +1070,297 @@ class GmmTest(parameterized.TestCase):
       atol, rtol = 5e-2, 5e-2  # Unquantized Path (bfloat16 precision diffs)
 
     chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
+
+
+# ==============================================================================
+# transpose_rhs: gmm_v2 on a [g, n, k] rhs must match gmm_v2 on rhs.swapaxes(1, 2) bit for bit.
+# ==============================================================================
+
+
+def _interpret_internals():
+  """Returns the jax internals the CPU interpreter shim patches (raises if this jax version lacks them)."""
+  # pylint: disable=import-outside-toplevel,protected-access
+  from jax._src import tpu_info
+  from jax._src.pallas.mosaic.interpret import shared_memory
+  from jax._src.pallas.mosaic.interpret import utils as interpret_utils
+  from jax._src.state import types as state_types
+
+  for attr in ("registry", "_get_tpu_info_impl", "ChipVersion", "get_tpu_info"):
+    getattr(tpu_info, attr)
+  for attr in ("to_range", "_transform_slice_or_index", "_compose_slice_or_index"):
+    getattr(interpret_utils, attr)
+  getattr(shared_memory.SharedMemory, "store_buffer_content")
+  getattr(state_types, "ReshapeTransform")
+  return tpu_info, shared_memory, interpret_utils, state_types
+
+
+@contextlib.contextmanager
+def _cpu_interpret_gmm_v2(internals):
+  """Runs gmm_v2 under the Pallas TPU interpreter on a non-TPU backend.
+
+  The kernel DMAs from `ref.reshape(rows // sublanes, sublanes, cols)` views of
+  its 2-D HBM refs. The interpreter only folds NDIndexer transforms into a
+  numpy range, so this context folds a ReshapeTransform followed by an indexer
+  whose sublane axis is fully selected back into a row range on the original
+  buffer, and reshapes DMA payloads to the destination range at the store. It
+  also registers the TPU7x hardware info for the "cpu" device kind so that the
+  kernel's tiling logic can run. Everything is restored on exit.
+  """
+  # pylint: disable=protected-access
+  tpu_info, shared_memory, interpret_utils, state_types = internals
+
+  def to_range(transforms):
+    ret = ()
+    pending = None
+    for transform in transforms:
+      if isinstance(transform, state_types.ReshapeTransform):
+        assert pending is None
+        pending = tuple(int(d) for d in transform.shape)
+        continue
+      idx = tuple(interpret_utils._transform_slice_or_index(i) for i in transform.indices)
+      if pending is not None:
+        sublanes = pending[1]
+        idx = idx + tuple(slice(0, d, 1) for d in pending[len(idx) :])
+        assert idx[1] == slice(0, sublanes, 1), (idx, pending)
+        i0 = idx[0]
+        if isinstance(i0, int):
+          rows = slice(i0 * sublanes, (i0 + 1) * sublanes, 1)
+        else:
+          assert i0.step == 1
+          rows = slice(i0.start * sublanes, i0.stop * sublanes, 1)
+        idx = (rows,) + tuple(idx[2:])
+        pending = None
+      ret = interpret_utils._compose_slice_or_index(ret, idx)
+    return ret
+
+  orig_store = shared_memory.SharedMemory.store_buffer_content
+
+  def store_buffer_content(self, key, rnge, value, *args, **kwargs):
+    target = tuple((r.stop - r.start) // (r.step or 1) for r in rnge if isinstance(r, slice))
+    value = np.asarray(value)
+    if rnge and value.shape != target and value.size == int(np.prod(target)):
+      value = value.reshape(target)
+    return orig_store(self, key, rnge, value, *args, **kwargs)
+
+  orig_pallas_call = pl.pallas_call
+
+  def pallas_call(*args, **kwargs):
+    kwargs["interpret"] = pltpu.InterpretParams(uninitialized_memory="zero")
+    return orig_pallas_call(*args, **kwargs)
+
+  orig_to_range = interpret_utils.to_range
+  had_cpu_entry = "cpu" in tpu_info.registry
+  tpu_info.registry["cpu"] = lambda: tpu_info._get_tpu_info_impl(tpu_info.ChipVersion.TPU_7X, 1)
+  interpret_utils.to_range = to_range
+  shared_memory.SharedMemory.store_buffer_content = store_buffer_content
+  pl.pallas_call = pallas_call
+  try:
+    yield
+  finally:
+    pl.pallas_call = orig_pallas_call
+    shared_memory.SharedMemory.store_buffer_content = orig_store
+    interpret_utils.to_range = orig_to_range
+    if not had_cpu_entry:
+      del tpu_info.registry["cpu"]
+    cache_clear = getattr(tpu_info.get_tpu_info, "cache_clear", None)
+    if cache_clear is not None:
+      cache_clear()
+
+
+def _reference_gmm_transposed(lhs, rhs_gnk, group_sizes, group_offset, rhs_scale=None, lhs_scale=None, lhs_qtype=None):
+  """f32 reference of lhs[m, k] @ rhs_gnk[g, n, k].T per group; groups outside the local range give zeros."""
+  m = lhs.shape[0]
+  num_local_groups, n, _ = rhs_gnk.shape
+  lhs = np.asarray(lhs).astype(np.float32)
+  if lhs_qtype is not None:
+    # Same per-tensor fixed-scale quantization the kernel applies in VMEM.
+    qmax = float(jnp.finfo(lhs_qtype).max)
+    scale = float(np.asarray(lhs_scale).reshape(()))
+    lhs_q = jnp.clip(jnp.asarray(lhs) / scale, -qmax, qmax).astype(lhs_qtype)
+    lhs = np.asarray(lhs_q).astype(np.float32) * scale
+  rhs = np.asarray(rhs_gnk).astype(np.float32)
+  out = np.zeros((m, n), np.float32)
+  start = 0
+  for global_group in range(group_sizes.shape[0]):
+    end = start + int(group_sizes[global_group])
+    local_group = global_group - group_offset
+    if 0 <= local_group < num_local_groups and end > start:
+      acc = lhs[start:end] @ rhs[local_group].T
+      if rhs_scale is not None:
+        acc = acc * np.asarray(rhs_scale[local_group, 0, 0]).astype(np.float32)
+      out[start:end] = acc
+    start = end
+  return out
+
+
+# group sizes over 6 lhs groups; with group_offset=1 the four local groups have sizes 0, 91, 0, 60 (two empty), and the
+# group boundaries are not sublane aligned.
+_TRHS_GROUP_SIZES = (37, 0, 91, 0, 60, 68)
+# 16 local groups with several empty ones, for the production-like 16-expert shape.
+_TRHS_GROUP_SIZES_16 = (0, 40, 0, 96, 13, 0, 0, 77, 30, 0, 64, 5, 0, 99, 88, 0)
+
+
+class GmmTransposeRhsTest(parameterized.TestCase):
+  """gmm_v2(transpose_rhs=True) reads the [g, n, k] weight in place; its output must match the [g, k, n] path bit for bit.
+
+  Runs natively on TPU. On other backends it runs both kernels under the Pallas TPU interpreter (see
+  `_cpu_interpret_gmm_v2`), which checks the index maps, masking and scale handling but not the MXU numerics.
+  """
+
+  def _kernel_context(self):
+    if jax.default_backend() == "tpu":
+      return contextlib.nullcontext()
+    try:
+      internals = _interpret_internals()
+    except (ImportError, AttributeError) as e:
+      self.skipTest(f"Pallas TPU interpreter shim does not fit this jax version: {e!r}")
+    return _cpu_interpret_gmm_v2(internals)
+
+  @parameterized.named_parameters(
+      # name, m, k, n, num_local_groups, group_sizes, group_offset, lhs dtype, rhs dtype, tiles, quantize_lhs
+      ("bf16", 256, 512, 384, 4, _TRHS_GROUP_SIZES, 1, jnp.bfloat16, jnp.bfloat16, (128, 256, 256), False),
+      # Production dlhs: e5m2 gradient qvalue against the e4m3 weight qvalue, no in-kernel quantization.
+      ("fp8_dlhs", 256, 512, 384, 4, _TRHS_GROUP_SIZES, 1, jnp.float8_e5m2, jnp.float8_e4m3fn, (128, 256, 256), False),
+      # bf16 lhs quantized in VMEM with a fixed per-tensor scale against an e4m3 weight with a per-channel scale.
+      (
+          "fp8_quantize_lhs",
+          256,
+          512,
+          384,
+          4,
+          _TRHS_GROUP_SIZES,
+          1,
+          jnp.bfloat16,
+          jnp.float8_e4m3fn,
+          (128, 512, 256),
+          True,
+      ),
+      # size_k % tile_k != 0 exercises the valid_k mask, which sits on the minor axis of the transposed rhs tile.
+      ("bf16_ragged_k", 256, 384, 256, 4, _TRHS_GROUP_SIZES, 1, jnp.bfloat16, jnp.bfloat16, (128, 256, 256), False),
+      (
+          "fp8_ragged_k",
+          256,
+          384,
+          256,
+          4,
+          _TRHS_GROUP_SIZES,
+          1,
+          jnp.float8_e5m2,
+          jnp.float8_e4m3fn,
+          (128, 256, 256),
+          False,
+      ),
+      # wi dlhs of the 512-chip DeepSeek-V3 recipe at reduced m: k = mlp 2048, n = embed tile 3584, 16 experts.
+      (
+          "fp8_dlhs_16_experts",
+          512,
+          2048,
+          3584,
+          16,
+          _TRHS_GROUP_SIZES_16,
+          0,
+          jnp.float8_e5m2,
+          jnp.float8_e4m3fn,
+          (256, 2048, 3584),
+          False,
+      ),
+  )
+  def test_matches_swapaxes_path(
+      self, m, k, n, num_local_groups, group_sizes, group_offset, lhs_dtype, rhs_dtype, tiles, quantize_lhs
+  ):
+    key = jax.random.key(1)
+    key_lhs, key_rhs, key_scale = jax.random.split(key, 3)
+    lhs = jax.random.normal(key_lhs, (m, k), jnp.float32).astype(lhs_dtype)
+    # The weight as the caller holds it: [g, n, k] (e.g. the forward [g, k_fwd, n_fwd] weight seen from the dlhs
+    # matmul, which contracts over n_fwd).
+    rhs_gnk = jax.random.normal(key_rhs, (num_local_groups, n, k), jnp.float32).astype(rhs_dtype)
+    rhs_scale = lhs_scale = lhs_qtype = None
+    if quantize_lhs:
+      rhs_scale = jax.random.uniform(key_scale, (num_local_groups, 1, 1, n), jnp.float32, 0.5, 1.5)
+      lhs_scale = jnp.full((1, 1), 2.0, jnp.float32)
+      lhs_qtype = jnp.float8_e4m3fn
+    group_sizes = jnp.asarray(group_sizes, jnp.int32)
+    group_offset = jnp.array([group_offset], jnp.int32)
+    kwargs = {
+        "group_sizes": group_sizes,
+        "group_offset": group_offset,
+        "rhs_scale": rhs_scale,
+        "lhs_scale": lhs_scale,
+        "tile_info": gmm_backend.TileSizes(*tiles),
+        "maybe_quantize_lhs": quantize_lhs,
+        "preferred_element_type": jnp.bfloat16,
+    }
+
+    with self._kernel_context():
+      expected = gmm_backend.gmm_v2(lhs, rhs_gnk.swapaxes(1, 2), **kwargs)
+      actual = gmm_backend.gmm_v2(lhs, rhs_gnk, transpose_rhs=True, **kwargs)
+      expected, actual = jax.block_until_ready((expected, actual))
+
+    self.assertEqual(actual.shape, (m, n))
+    self.assertEqual(actual.dtype, expected.dtype)
+    max_abs_diff = float(jnp.max(jnp.abs(actual.astype(jnp.float32) - expected.astype(jnp.float32))))
+    np.testing.assert_array_equal(
+        np.asarray(actual).view(np.uint16),
+        np.asarray(expected).view(np.uint16),
+        err_msg=f"transpose_rhs output differs from the swapaxes path, max abs diff {max_abs_diff}",
+    )
+    # Sanity check against an f32 reference, so that a shared bug cannot hide behind the equality above.
+    reference = _reference_gmm_transposed(
+        lhs, rhs_gnk, group_sizes, int(group_offset[0]), rhs_scale, lhs_scale, lhs_qtype
+    )
+    chex.assert_trees_all_close(actual.astype(jnp.float32), jnp.asarray(reference), atol=0.5, rtol=5e-2)
+
+  def test_rejects_fuse_act(self):
+    lhs = jnp.zeros((256, 512), jnp.bfloat16)
+    rhs_gnk = jnp.zeros((4, 512, 512), jnp.bfloat16)
+    group_sizes = jnp.array([64, 64, 64, 64], jnp.int32)
+    with self._kernel_context():
+      with self.assertRaises(NotImplementedError):
+        gmm_backend.gmm_v2(
+            lhs,
+            rhs_gnk,
+            group_sizes,
+            tile_info=gmm_backend.TileSizes(128, 256, 256),
+            fuse_act="silu",
+            transpose_rhs=True,
+        )
+
+
+class GmmTransposeRhsCompileTest(parameterized.TestCase):
+  """Mosaic compiles the transposed-rhs kernel for tpu7x (virtual topology, no hardware)."""
+
+  @pytest.mark.tpu_backend
+  @parameterized.named_parameters(
+      # Production dlhs kernels of the 512-chip DeepSeek-V3 recipe (fp8_full, fixed calibration): lhs is the e5m2
+      # gradient qvalue, rhs the e4m3 weight qvalue, tiles from wi_tile_dlhs_* / wo_tile_dlhs_*.
+      ("wi_dlhs_fp8", 40960, 2048, 7168, 16, jnp.float8_e5m2, jnp.float8_e4m3fn, (256, 2048, 3584)),
+      ("wo_dlhs_fp8", 40960, 7168, 2048, 16, jnp.float8_e5m2, jnp.float8_e4m3fn, (512, 1792, 2048)),
+      ("bf16", 1024, 512, 384, 4, jnp.bfloat16, jnp.bfloat16, (128, 256, 256)),
+  )
+  def test_compiles_for_tpu7x(self, m, k, n, num_groups, lhs_dtype, rhs_dtype, tiles):
+    try:
+      topology = topologies.get_topology_desc("tpu7x:2x2x1", platform="tpu")
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      self.skipTest(f"tpu7x virtual topology unavailable (needs a TPU-enabled jax install): {e!r}")
+
+    lhs = jax.ShapeDtypeStruct((m, k), lhs_dtype)
+    rhs_gnk = jax.ShapeDtypeStruct((num_groups, n, k), rhs_dtype)
+    group_sizes = jax.ShapeDtypeStruct((num_groups,), jnp.int32)
+
+    def dlhs(lhs, rhs, group_sizes):
+      return gmm_backend.gmm_v2(
+          lhs,
+          rhs,
+          group_sizes,
+          tile_info=gmm_backend.TileSizes(*tiles),
+          maybe_quantize_lhs=False,
+          preferred_element_type=jnp.bfloat16,
+          transpose_rhs=True,
+      )
+
+    with jax.default_device(topology.devices[0]):
+      compiled = jax.jit(dlhs).lower(lhs, rhs_gnk, group_sizes).compile()
+    self.assertIn("gmm_v2", compiled.as_text())
 
 
 if __name__ == "__main__":
