@@ -817,7 +817,7 @@ def _dlhs_scale_grad_by_rhs_scale(
 # hardware tests validated, T(32,128)(4,1), and the forward and dlhs kernels share it
 # (one copy per weight per use of the gathered weight instead of a re-tiling copy for
 # the forward plus a transposed copy for dlhs). Off until validated at 512.
-DLHS_USE_TRANSPOSED_RHS_KERNEL = True
+DLHS_USE_TRANSPOSED_RHS_KERNEL = False
 
 
 def _copy_in_kernel_native_tiling(x: jnp.ndarray) -> jnp.ndarray:
