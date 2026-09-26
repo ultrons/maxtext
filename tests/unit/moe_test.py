@@ -4049,10 +4049,10 @@ class ShardMlpMoeOnFsdpTest(parameterized.TestCase):
         kernel_record.append(("gmm_v2", tuple(kwargs["rhs"].shape), kwargs.get("transpose_rhs", False)))
       return orig_kernel(*args, **kwargs)
 
-    def recording_retile(x):
+    def recording_retile(x, *args, **kwargs):
       if kernel_record is not None:
         kernel_record.append(("retile", tuple(x.shape), None))
-      return orig_retile(x)
+      return orig_retile(x, *args, **kwargs)
 
     with (
         jax.set_mesh(mesh),
@@ -4143,8 +4143,10 @@ class ShardMlpMoeOnFsdpTest(parameterized.TestCase):
       tgt, _, _ = self._run(cfg, params=params, kernel_record=tgt_kernels)
     # Which kernel variant reads which orientation, with the flag on (weights gathered as [E, F, D]):
     # wi forward transposed-rhs (switch on) or a swapaxes copy + plain (off); wi dlhs plain; wo forward plain;
-    # wo dlhs transposed-rhs (on) or swapaxes + plain (off); and no native-tiling copy (the gather writes whole
-    # 32-row tiles). The drhs goes through tgmm_v2 and is not recorded here.
+    # wo dlhs transposed-rhs (on) or swapaxes + plain (off). Native-tiling copies: none with the switch on (the
+    # gather writes whole 32-row tiles and the kernels read it); with the switch off one per ops.gmm call, for the
+    # kernel that would read the gathered [E, F, D] as is (wi dlhs, wo forward), so that no kernel reads the
+    # SparseCore-written gather directly. The drhs goes through tgmm_v2 and is not recorded here.
     e_local, emb, mlp = cfg.num_experts // ep, cfg.base_emb_dim, cfg.moe_mlp_dim
     gmm_calls = collections.Counter((shape, trhs) for kind, shape, trhs in tgt_kernels if kind == "gmm_v2")
     if switch:  # wi fwd + wo dlhs transposed-rhs on [E, F, D]; wi dlhs + wo fwd plain on [E, F, D]
@@ -4152,7 +4154,9 @@ class ShardMlpMoeOnFsdpTest(parameterized.TestCase):
     else:  # wi fwd + wo dlhs plain on a swapaxes copy [E, D, F]; wi dlhs + wo fwd plain on [E, F, D]
       expected = {((e_local, emb, mlp), False): 3, ((e_local, mlp, emb), False): 3}
     self.assertEqual(dict(gmm_calls), expected)
-    self.assertEqual([k for k in tgt_kernels if k[0] == "retile"], [])
+    self.assertEqual(
+        [k for k in tgt_kernels if k[0] == "retile"], [] if switch else [("retile", (e_local, mlp, emb), None)] * 3
+    )
     self.assertLen([k for k in ref_kernels if k[0] == "retile"], 3 if switch else 0)
     ref_leaves = jax.tree_util.tree_leaves_with_path(ref)
     tgt_leaves = jax.tree_util.tree_leaves_with_path(tgt)
