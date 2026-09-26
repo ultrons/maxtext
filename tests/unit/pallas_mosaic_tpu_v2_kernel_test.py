@@ -16,6 +16,7 @@
 
 import collections
 import contextlib
+from unittest import mock
 import pytest
 
 from absl.testing import absltest
@@ -28,6 +29,7 @@ from jax.experimental import topologies
 import jax.numpy as jnp
 import numpy as np
 from maxtext.kernels.megablox import common
+from maxtext.kernels.megablox import ops as megablox_ops
 from maxtext.kernels.megablox import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
 from maxtext.kernels.megablox import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
 
@@ -1310,6 +1312,28 @@ class GmmTransposeRhsTest(parameterized.TestCase):
     )
     chex.assert_trees_all_close(actual.astype(jnp.float32), jnp.asarray(reference), atol=0.5, rtol=5e-2)
 
+  def test_dlhs_switch_selects_kernel_and_matches(self):
+    """ops._dlhs_run_tokamax_v2 gives the same dlhs with the in-kernel transpose on and off (bit for bit off-TPU)."""
+    m, k, n, num_groups = 256, 512, 384, 4
+    key_lhs, key_rhs = jax.random.split(jax.random.key(2))
+    dout = jax.random.normal(key_lhs, (m, n), jnp.float32).astype(jnp.bfloat16)  # [m, n]
+    rhs_gkn = jax.random.normal(key_rhs, (num_groups, k, n), jnp.float32).astype(jnp.bfloat16)  # fwd weight [g, k, n]
+    group_sizes = jnp.array([100, 0, 60, 96], jnp.int32)
+    tiling = (128, 128, 128, 128, 256, 256, 128, 128, 128)  # dlhs tiles are tiling[3:6]
+    outs = {}
+    with self._kernel_context():
+      for use_kernel in (False, True):
+        with mock.patch.object(megablox_ops, "DLHS_USE_TRANSPOSED_RHS_KERNEL", use_kernel):
+          with mock.patch.object(gmm_backend, "gmm_v2", wraps=gmm_backend.gmm_v2) as spy:
+            outs[use_kernel] = jax.block_until_ready(
+                megablox_ops._dlhs_run_tokamax_v2(  # pylint: disable=protected-access
+                    dout, rhs_gkn, group_sizes, None, jnp.bfloat16, tiling, False, False
+                )
+            )
+            self.assertEqual(spy.call_args.kwargs["transpose_rhs"], use_kernel)
+            self.assertEqual(spy.call_args.kwargs["rhs"].shape, (num_groups, k, n) if use_kernel else (num_groups, n, k))
+    np.testing.assert_array_equal(np.asarray(outs[True]).view(np.uint16), np.asarray(outs[False]).view(np.uint16))
+
   def test_rejects_fuse_act(self):
     lhs = jnp.zeros((256, 512), jnp.bfloat16)
     rhs_gnk = jnp.zeros((4, 512, 512), jnp.bfloat16)
@@ -1361,6 +1385,47 @@ class GmmTransposeRhsCompileTest(parameterized.TestCase):
     with jax.default_device(topology.devices[0]):
       compiled = jax.jit(dlhs).lower(lhs, rhs_gnk, group_sizes).compile()
     self.assertIn("gmm_v2", compiled.as_text())
+
+  @pytest.mark.tpu_backend
+  def test_accepts_8_row_tiled_rhs_without_copy(self):
+    """The production operand: the FSDP-gathered fp8 weight arrives in {2,1,0:T(8,128)(4,1)} and XLA feeds it as is.
+
+    The Pallas custom call constrains only the dimension order of its operands, so an 8-row-tiled rhs (what the
+    SparseCore all-gather produces when the per-shard row count is not a multiple of 32, e.g. 7168 / 64) reaches the
+    kernel without a re-tiling copy and Mosaic lowers the tile DMAs against that tiling. This documents the condition
+    under which the transposed-rhs dlhs kernel runs in the 512-chip program; see ops.DLHS_USE_TRANSPOSED_RHS_KERNEL.
+    """
+    try:
+      topology = topologies.get_topology_desc("tpu7x:2x2x1", platform="tpu")
+      from jax.experimental.layout import Format, Layout  # pylint: disable=import-outside-toplevel
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      self.skipTest(f"tpu7x virtual topology or layout API unavailable: {e!r}")
+
+    m, k, n, num_groups = 40960, 2048, 7168, 16
+    lhs = jax.ShapeDtypeStruct((m, k), jnp.float8_e5m2)
+    rhs_gnk = jax.ShapeDtypeStruct((num_groups, n, k), jnp.float8_e4m3fn)
+    group_sizes = jax.ShapeDtypeStruct((num_groups,), jnp.int32)
+    rhs_format = Format(
+        Layout(major_to_minor=(0, 1, 2), tiling=((8, 128), (4, 1))),
+        jax.sharding.SingleDeviceSharding(topology.devices[0]),
+    )
+
+    def dlhs(lhs, rhs, group_sizes):
+      return gmm_backend.gmm_v2(
+          lhs,
+          rhs,
+          group_sizes,
+          tile_info=gmm_backend.TileSizes(256, 2048, 3584),
+          maybe_quantize_lhs=False,
+          preferred_element_type=jnp.bfloat16,
+          transpose_rhs=True,
+      )
+
+    with jax.default_device(topology.devices[0]):
+      compiled = jax.jit(dlhs, in_shardings=(None, rhs_format, None)).lower(lhs, rhs_gnk, group_sizes).compile()
+    hlo = compiled.as_text()
+    self.assertIn("f8e4m3fn[16,7168,2048]{2,1,0:T(8,128)(4,1)} parameter", hlo)
+    self.assertNotRegex(hlo, r"= f8e4m3fn\[16,7168,2048\][^ ]* copy\(")
 
 
 if __name__ == "__main__":
