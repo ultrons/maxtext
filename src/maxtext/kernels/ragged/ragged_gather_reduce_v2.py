@@ -43,6 +43,16 @@ class _Config:
   subcore_axis_name: str
 
   @property
+  def out_pack(self) -> int:
+    """Output rows per 32-bit output word: 2 for a bfloat16 output, 1 for float32.
+
+    The output is written through a uint32 view of the HBM buffer, so a
+    bfloat16 output packs two consecutive output rows into one word (the even
+    row in the low 16 bits, as in the input unpacking below).
+    """
+    return 32 // jax.dtypes.itemsize_bits(self.in_dtype)
+
+  @property
   def row_chunk_size(self) -> int:
     """Number of rows handled per row-pipeline block."""
     return self.num_simd_lanes * self.num_row_subchunks
@@ -97,13 +107,13 @@ def get_cost_estimate(
   else:
     # Bytes accessed:
     #   read  – input rows + src_indices (int32) + dst_indices (int32) + topk_weights (f32)
-    #   write – output rows (float32)
+    #   write – output rows (same dtype as the input)
     bytes_in = padded_input_size * aligned_hidden_size * input_dtype_bytes  # input rows
     bytes_in += padded_input_size * 4  # src_indices (int32)
     bytes_in += padded_input_size * 4  # dst_indices (int32)
     bytes_in += padded_input_size * 4  # topk_weights (float32)
     output_rows = padded_input_size // reduce_group_size
-    bytes_out = output_rows * aligned_hidden_size * 4  # output rows (float32)
+    bytes_out = output_rows * aligned_hidden_size * input_dtype_bytes  # output rows
     bytes_accessed = bytes_in + bytes_out
 
   return pl.CostEstimate(
@@ -121,6 +131,8 @@ class _Inputs:
   indices: Any
   topk_weights: Any
   sorted_by_validity: Any
+  empty_words: Any
+  num_empty_words_per_row_partition: Any
 
 
 # pylint: disable=missing-class-docstring
@@ -129,10 +141,15 @@ class _Inputs:
 class _Scratch:
   num_rows_per_row_partition_vmem: Any
   prev_iter_last_row_vmem: Any
+  prev_iter_last_word_vmem: Any
   prev_dst_row_smem: Any
   sorted_by_validity_vmem: Any
+  num_empty_words_vmem: Any
+  empty_words_vmem: Any
+  zero_row_vmem: Any
   src_indices_vmem: Any
   dst_indices_vmem: Any
+  pad_row_vmem: Any
   tw_f32_vmem: Any
   dma_src_row_vmem: Any
   dma_dst_row_vmem: Any
@@ -321,6 +338,155 @@ def _pack_scalars_to_vector(scalar_list: list[jax.Array], num_simd_lanes: int) -
   return vec
 
 
+def _round_f32_bits_to_bf16(bits: jax.Array, is_nan: jax.Array | None = None) -> jax.Array:
+  """Rounds float32 bit patterns to bfloat16 bit patterns (uint32 in, low 16 bits out).
+
+  Mirrors the TensorCore ``convert`` that the wrapper's ``astype`` used to run
+  on the kernel's float32 output, so the bfloat16 result is bit-identical to
+  the old two-pass path: round to nearest even on the magnitude and every NaN
+  mapped to the canonical quiet NaN 0x7FC0 (measured on a TPU; see
+  ``ragged_gather_reduce_v2_test``). The TensorCore convert also flushes
+  denormals to a signed zero; the SparseCore's float32 arithmetic already
+  flushes them, so the sums this rounds are never denormal and no flush is
+  needed here (checked on a TPU with products down to 2^-136). Runs on the
+  SparseCore vector unit and under plain XLA (tests).
+
+  Args:
+    bits: float32 values as uint32.
+    is_nan: optional precomputed NaN mask (``jnp.isnan`` of the float32
+      value, one vector compare in the kernel); derived from ``bits`` when
+      omitted.
+  """
+  lsb = jnp.bitwise_and(jnp.right_shift(bits, 16), jnp.uint32(1))
+  rounded = jnp.right_shift(bits + (jnp.uint32(0x7FFF) + lsb), 16)
+  if is_nan is None:
+    is_nan = jnp.bitwise_and(bits, jnp.uint32(0x7FFFFFFF)) > jnp.uint32(0x7F800000)
+  return jnp.where(is_nan, jnp.uint32(0x7FC0), rounded)
+
+
+def _pack_output_word(prev_word, bf16_bits, dst_row, same_word):
+  """Merges one output row's bfloat16 bits into the uint32 word of its row pair.
+
+  ``dst_row`` selects the half (even row: low 16 bits). When the previous row
+  belonged to the same pair (``same_word``) the other half is kept, otherwise
+  it starts a fresh word, which leaves a missing (empty) partner row at zero.
+  ``dst_row`` and ``same_word`` are scalars, so the masks are scalar work and
+  the vector unit does one shift, one and, one or per row.
+  """
+  is_low = jnp.bitwise_and(dst_row, 1) == 0
+  shift = jnp.where(is_low, 0, 16)
+  keep = jnp.where(is_low, jnp.uint32(0xFFFF0000), jnp.uint32(0x0000FFFF))
+  keep = jnp.where(same_word, keep, jnp.uint32(0))
+  return jnp.bitwise_or(jnp.bitwise_and(prev_word, keep), jnp.left_shift(bf16_bits, shift))
+
+
+def _reduce_row(prev_acc, data_f32, same_group, is_pad):
+  """One step of the segmented reduction; a padding row carries the previous value unchanged."""
+  acc = jnp.where(same_group, prev_acc + data_f32, data_f32)
+  return jnp.where(is_pad, prev_acc, acc)
+
+
+def _plan_row_block(
+    dst_rows: list[Any],
+    row_valid: list[Any],
+    prev_dst: Any,
+    *,
+    num_simd_lanes: int,
+    num_row_subchunks: int,
+    out_pack: int,
+) -> tuple[list[Any], list[Any], list[list[Any]], list[list[Any]]]:
+  """Scalar bookkeeping for one block of ``row_chunk_size`` sorted source rows.
+
+  Args:
+    dst_rows: per row, its output row (reduce group index), in sorted order.
+    row_valid: per row, whether it lies in the partition's valid prefix.
+    prev_dst: effective destination of the row before this block
+      (``-out_pack`` before the first block: no group and no output word).
+
+  Returns:
+    dst_eff: per row, its effective destination. Rows past the partition's
+      valid prefix (padding) become continuation rows: they take the
+      destination of the last valid row and, in the reduction, carry its value
+      unchanged, so their scatter rewrites the same word with the same value.
+      Only the last block has padding, and it always starts with a valid row.
+    is_pad: per row, 1 for a padding row, else 0.
+    dma_src, dma_dst: per sub-chunk and lane, the VMEM row whose output word
+      the lane scatters and the output word it writes. Rows sharing an output
+      word within the sub-chunk all scatter the word's last row (idempotent);
+      a row whose word continues into a later sub-chunk scatters its own
+      partial word, which the later sub-chunk overwrites once this one's DMAs
+      have been waited for.
+  """
+  row_chunk_size = num_simd_lanes * num_row_subchunks
+  dst_eff = []
+  prev = prev_dst
+  for r in range(row_chunk_size):
+    dst = jnp.where(row_valid[r], dst_rows[r], prev)
+    dst_eff.append(dst)
+    prev = dst
+  is_pad = [jnp.logical_not(valid).astype(jnp.int32) for valid in row_valid]
+  word_eff = [dst // out_pack for dst in dst_eff]
+
+  # For each source row, the VMEM row that will hold its output word's fully
+  # assembled value -- the last row of the word's run within this block.
+  # Scanning backwards, a row inherits its successor's merge target when they
+  # share an output word, otherwise it is its own target.
+  merge_target = [None] * row_chunk_size
+  for r in reversed(range(row_chunk_size)):
+    if r == row_chunk_size - 1:
+      merge_target[r] = r
+    else:
+      same_word_as_next = (word_eff[r] == word_eff[r + 1]).astype(jnp.int32)
+      merge_target[r] = same_word_as_next * merge_target[r + 1] + (1 - same_word_as_next) * r
+
+  dma_src = []
+  dma_dst = []
+  for s in range(num_row_subchunks):
+    sub_src = []
+    sub_dst = []
+    for i in range(num_simd_lanes):
+      r = s * num_simd_lanes + i
+      is_final_write = merge_target[r] < (s + 1) * num_simd_lanes
+      sub_src.append(jnp.where(is_final_write, merge_target[r] - s * num_simd_lanes, i))
+      sub_dst.append(word_eff[r])
+    dma_src.append(sub_src)
+    dma_dst.append(sub_dst)
+  return dst_eff, is_pad, dma_src, dma_dst
+
+
+def _empty_output_words(
+    mask: jax.Array,
+    num_row_partitions: int,
+    out_pack: int,
+    num_simd_lanes: int,
+) -> tuple[jax.Array, jax.Array]:
+  """Lists, per row partition, the output words that no valid source row writes.
+
+  The kernel only scatters words that own at least one valid source row, so it
+  zero-fills these itself (the wrapper used to mask them on the TensorCore).
+
+  Returns:
+    empty_words: int32 ``(num_row_partitions * pad_to,)``: per partition, the
+      global indices of its empty output words, compacted to the front. Slots
+      past the count repeat the partition's first empty word, so the kernel's
+      last, partial block of zero writes only re-zeroes an empty word.
+    num_empty_words: int32 per partition, padded to ``num_simd_lanes``.
+  """
+  num_words = mask.shape[0] // out_pack
+  word_valid = jnp.any(mask.reshape(num_words, out_pack), axis=-1).reshape(num_row_partitions, -1)
+  words_per_partition = word_valid.shape[1]
+  pad_to = _align_to(words_per_partition, num_simd_lanes)
+  # A stable sort of the validity bit puts the empty words first, in index order.
+  empty_first = jnp.argsort(word_valid, axis=-1, stable=True).astype(jnp.int32)
+  num_empty = jnp.sum(~word_valid, axis=-1).astype(jnp.int32)
+  empty_first = jnp.pad(empty_first, ((0, 0), (0, pad_to - words_per_partition)))
+  slot = jnp.arange(pad_to, dtype=jnp.int32)[None, :]
+  empty_first = jnp.where(slot < num_empty[:, None], empty_first, empty_first[:, :1])
+  empty_first = empty_first + (jnp.arange(num_row_partitions, dtype=jnp.int32) * words_per_partition)[:, None]
+  num_empty = jnp.pad(num_empty, (0, max(0, num_simd_lanes - num_row_partitions)))
+  return empty_first.reshape(-1), num_empty
+
+
 def _row_gather_spec(
     sorted_by_validity_vmem: jax.Ref,
     sub: int,
@@ -348,6 +514,7 @@ def main_kernel(
   col_chunk_size = cfg.col_chunk_size
   num_row_subchunks = cfg.num_row_subchunks
   row_chunk_size = cfg.row_chunk_size
+  out_pack = cfg.out_pack
 
   num_col_chunks = cfg.col_size // col_chunk_size
 
@@ -358,43 +525,96 @@ def main_kernel(
   row_partition_size_padded = inputs.sorted_by_validity.shape[0] // cfg.num_row_partitions
   row_start_padded = row_partition_id * row_partition_size_padded
   col_start = col_partition_id * cfg.col_size
+  words_per_partition_padded = inputs.empty_words.shape[0] // cfg.num_row_partitions
+  words_start_padded = row_partition_id * words_per_partition_padded
 
-  # Step 2: Stage this partition's row count and sort permutation into VMEM.
+  # Step 2: Stage this partition's row count, sort permutation and empty-word
+  # list into VMEM.
   recv_sem = scratch.sem.at[0]
-  num_rows_dma = pltpu.make_async_copy(
-      inputs.num_src_rows_per_row_partition.at[pl.ds(0, num_simd_lanes)],
-      scratch.num_rows_per_row_partition_vmem,
-      recv_sem,
+  send_sem = scratch.sem.at[1]
+  staging_dmas = (
+      pltpu.make_async_copy(
+          inputs.num_src_rows_per_row_partition.at[pl.ds(0, num_simd_lanes)],
+          scratch.num_rows_per_row_partition_vmem,
+          recv_sem,
+      ),
+      pltpu.make_async_copy(
+          inputs.sorted_by_validity.at[pl.ds(row_start_padded, row_partition_size_padded)],
+          scratch.sorted_by_validity_vmem,
+          recv_sem,
+      ),
+      pltpu.make_async_copy(
+          inputs.num_empty_words_per_row_partition.at[pl.ds(0, num_simd_lanes)],
+          scratch.num_empty_words_vmem,
+          recv_sem,
+      ),
+      pltpu.make_async_copy(
+          inputs.empty_words.at[pl.ds(words_start_padded, words_per_partition_padded)],
+          scratch.empty_words_vmem,
+          recv_sem,
+      ),
   )
-  sorted_dma = pltpu.make_async_copy(
-      inputs.sorted_by_validity.at[pl.ds(row_start_padded, row_partition_size_padded)],
-      scratch.sorted_by_validity_vmem,
-      recv_sem,
-  )
-  num_rows_dma.start()
-  sorted_dma.start()
-  num_rows_dma.wait()
-  sorted_dma.wait()
+  for dma in staging_dmas:
+    dma.start()
+  for dma in staging_dmas:
+    dma.wait()
 
   num_rows_per_row_partition = scratch.num_rows_per_row_partition_vmem[...]
+  num_empty_words_per_row_partition = scratch.num_empty_words_vmem[...]
   num_rows_current_row_partition = jnp.array(0, jnp.int32)
+  num_empty_words_current_row_partition = jnp.array(0, jnp.int32)
   for i in range(cfg.num_row_partitions):
     num_rows_current_row_partition = jnp.where(
         row_partition_id == i,
         num_rows_per_row_partition[i],
         num_rows_current_row_partition,
     )
+    num_empty_words_current_row_partition = jnp.where(
+        row_partition_id == i,
+        num_empty_words_per_row_partition[i],
+        num_empty_words_current_row_partition,
+    )
   num_row_blocks = pl.cdiv(num_rows_current_row_partition, row_chunk_size)
+  num_zero_blocks = pl.cdiv(num_empty_words_current_row_partition, num_simd_lanes)
 
-  # Step 3: Run the gather / weighted segmented-reduce / scatter pipeline.
+  # The output is written through a 32-bit view: a bfloat16 output packs two
+  # consecutive output rows per uint32 word (``cfg.out_pack``), float32 is 1:1.
+  # Single-row DMAs into a 16-bit-tiled buffer are not possible, so the kernel
+  # assembles each pair of output rows into one word and scatters whole words.
+  out_words_hbm_ref = out_hbm_ref.bitcast(jnp.uint32)
+
+  # Step 3: Zero-fill the output words that own no valid source row. The
+  # gather pipeline below never visits them, and the wrapper no longer masks.
+  def zero_row_loop(col_offset):
+    scratch.zero_row_vmem[pl.ds(col_offset, num_simd_lanes)] = jnp.zeros((num_simd_lanes,), jnp.uint32)
+
+  plsc.parallel_loop(0, cfg.col_size, step=num_simd_lanes)(zero_row_loop)
+
+  @pl.loop(0, num_zero_blocks)
+  def zero_fill_loop(block):
+    empty_word_slice = scratch.empty_words_vmem[pl.ds(block * num_simd_lanes, num_simd_lanes)]
+    copies = []
+    for i in range(num_simd_lanes):
+      copy = pltpu.make_async_copy(
+          scratch.zero_row_vmem.at[pl.ds(0, cfg.col_size)],
+          out_words_hbm_ref.at[empty_word_slice[i], pl.ds(col_start, cfg.col_size)],
+          send_sem,
+      )
+      copy.start()
+      copies.append(copy)
+    for copy in copies:
+      copy.wait()
+
+  # Step 4: Run the gather / weighted segmented-reduce / scatter pipeline.
 
   # The SparseCore indirect DMA requires 32-bit elements, so x is gathered
   # through a uint32 reinterpretation. bfloat16 packs two source rows per
   # uint32 row (row index >> 1); float32 is 1:1 (row index unchanged).
   in_32b_hbm_ref = inputs.x.bitcast(jnp.uint32)
 
-  # Sentinel for the cross-block reduction carry (no previous group).
-  scratch.prev_dst_row_smem[0] = -1
+  # Sentinel for the cross-block reduction carry (no previous group, and no
+  # previous output word under either rounding of the division by out_pack).
+  scratch.prev_dst_row_smem[0] = -out_pack
 
   # One gather per sub-chunk for ``indices``, then the same for
   # ``topk_weights``.
@@ -424,17 +644,18 @@ def main_kernel(
     (
         src_indices_vmem_sc,
         dst_indices_vmem_sc,
+        pad_row_vmem_sc,
         tw_f32_vmem_sc,
         dma_src_row_vmem_sc,
         dma_dst_row_vmem_sc,
         prev_dst_val_vmem_sc,
         out_vmem_sc,
         sem_sc,
-    ) = args[-8:]
+    ) = args[-9:]
 
     row_block_id = pl.program_id(0)
 
-    # Destination output row of each source row in this block.
+    # Destination output row of each source row in this block, as sorted.
     dst_indices_list = [
         scratch.sorted_by_validity_vmem[
             pl.ds(
@@ -446,11 +667,25 @@ def main_kernel(
         for s in range(num_row_subchunks)
     ]
 
-    # Stage the gathered indices/weights and the destinations in VMEM.
+    dst_rows = [dst_indices_list[r // num_simd_lanes][r % num_simd_lanes] for r in range(row_chunk_size)]
+    row_valid = [(row_block_id * row_chunk_size + r) < num_rows_current_row_partition for r in range(row_chunk_size)]
+    dst_eff, is_pad, dma_src_rows, dma_dst_rows = _plan_row_block(
+        dst_rows,
+        row_valid,
+        scratch.prev_dst_row_smem[0],
+        num_simd_lanes=num_simd_lanes,
+        num_row_subchunks=num_row_subchunks,
+        out_pack=out_pack,
+    )
+
+    # Stage the gathered indices/weights, the effective destinations and the
+    # padding flags in VMEM.
     for s in range(num_row_subchunks):
       sub = pl.ds(s * num_simd_lanes, num_simd_lanes)
+      lanes = slice(s * num_simd_lanes, (s + 1) * num_simd_lanes)
       src_indices_vmem_sc[sub] = src_indices_refs[s][...]
-      dst_indices_vmem_sc[sub] = dst_indices_list[s]
+      dst_indices_vmem_sc[sub] = _pack_scalars_to_vector(dst_eff[lanes], num_simd_lanes)
+      pad_row_vmem_sc[sub] = _pack_scalars_to_vector(is_pad[lanes], num_simd_lanes)
 
       tw = topk_weights_refs[s][...]
       if cfg.topk_dtype == jnp.bfloat16:
@@ -465,52 +700,8 @@ def main_kernel(
       if s == 0:
         prev_dst = scratch.prev_dst_row_smem[0]
       else:
-        prev_dst = dst_indices_list[s - 1][num_simd_lanes - 1]
+        prev_dst = dst_eff[s * num_simd_lanes - 1]
       prev_dst_val_vmem_sc[pl.ds(s * num_simd_lanes, num_simd_lanes)] = jnp.broadcast_to(prev_dst, (num_simd_lanes,))
-
-    def get_dst_idx(global_idx):
-      return dst_indices_list[global_idx // num_simd_lanes][global_idx % num_simd_lanes]
-
-    # For each source row, find the VMEM row that will hold its group's fully
-    # reduced value -- the last row of the group within this block. Scanning
-    # backwards, a row inherits its successor's merge target when they share
-    # a destination, otherwise it is its own target.
-    src_row_idx_in_vmem = []
-    row_valid_vec = []
-    for row_vmem_idx in reversed(range(row_chunk_size)):
-      global_row_idx = row_block_id * row_chunk_size + row_vmem_idx
-      row_valid_vec.append(global_row_idx < num_rows_current_row_partition)
-      if row_vmem_idx == row_chunk_size - 1:
-        src_row_idx_in_vmem.append(row_vmem_idx)
-      else:
-        same_group_as_next = jnp.logical_and(
-            row_valid_vec[-2],
-            get_dst_idx(row_vmem_idx) == get_dst_idx(row_vmem_idx + 1),
-        ).astype(jnp.int32)
-        src_row_idx_in_vmem.append(same_group_as_next * src_row_idx_in_vmem[-1] + (1 - same_group_as_next) * row_vmem_idx)
-    src_row_idx_in_vmem.reverse()
-    row_valid_vec.reverse()
-
-    # Per source row, the (VMEM source row, HBM destination row) of its
-    # scatter. Rows whose group is not yet fully reduced in this sub-chunk,
-    # and padding rows, are routed to a throwaway row.
-    garbage_dst = out_hbm_ref.shape[0] - 1
-    dma_src_rows = []
-    dma_dst_rows = []
-    for s in range(num_row_subchunks):
-      sub_src = []
-      sub_dst = []
-      for i in range(num_simd_lanes):
-        global_idx = s * num_simd_lanes + i
-        merge_target = src_row_idx_in_vmem[global_idx]
-        is_final_write = jnp.logical_and(
-            row_valid_vec[global_idx],
-            merge_target < (s + 1) * num_simd_lanes,
-        )
-        sub_src.append(jnp.where(is_final_write, merge_target % num_simd_lanes, 0))
-        sub_dst.append(jnp.where(is_final_write, dst_indices_list[s][i], garbage_dst))
-      dma_src_rows.append(sub_src)
-      dma_dst_rows.append(sub_dst)
 
     for s in range(num_row_subchunks):
       sub = pl.ds(s * num_simd_lanes, num_simd_lanes)
@@ -536,18 +727,21 @@ def main_kernel(
       s = pl.program_id(0)
       c = pl.program_id(1)
       col_hbm_start = col_start + c * col_chunk_size
-      send_sem = sem_inner.at[1]
+      send_sem_inner = sem_inner.at[1]
 
       row_slice = pl.ds(s * num_simd_lanes, num_simd_lanes)
       tw_slice = tw_f32_vmem_sc[row_slice]
       dst_slice = dst_indices_vmem_sc[row_slice]
+      pad_slice = pad_row_vmem_sc[row_slice]
       src_idx_slice = src_indices_vmem_sc[row_slice]
       prev_dst_vals_vec = prev_dst_val_vmem_sc[row_slice]
 
       def col_loop(col_compute_offset):
         col_slice = pl.ds(col_compute_offset, num_simd_lanes)
-        # Running sum, seeded by the carry from the previous sub-chunk.
+        # Running sum and running output word, seeded by the carry from the
+        # previous sub-chunk.
         previous_accumulated_data = scratch.prev_iter_last_row_vmem[c, col_slice]
+        previous_word = scratch.prev_iter_last_word_vmem[c, col_slice]
 
         for row_src in range(num_simd_lanes):
           val_u32 = gather_ref[row_src, col_slice]
@@ -564,40 +758,53 @@ def main_kernel(
 
           # Reduction: accumulate while the destination group is unchanged,
           # restart otherwise. Sorting guarantees rows of one group are
-          # contiguous.
+          # contiguous. Padding rows carry the previous value unchanged.
           dst_row_hbm = dst_slice[row_src]
           if row_src == 0:
             prev_dst = prev_dst_vals_vec[0]
           else:
             prev_dst = dst_slice[row_src - 1]
-          accumulated_data = jnp.where(
-              dst_row_hbm == prev_dst,
-              previous_accumulated_data + data_f32,
+          accumulated_data = _reduce_row(
+              previous_accumulated_data,
               data_f32,
+              dst_row_hbm == prev_dst,
+              pad_slice[row_src] != 0,
           )
           previous_accumulated_data = accumulated_data
 
-          # The output buffer stays float32: a bfloat16 output would be
-          # (16, 128)-tiled and the per-row scatter below writes a single
-          # row at an arbitrary, non-tile-aligned destination, which is only
-          # legal for 32-bit elements. The cast happens in the wrapper.
-          out_vmem_sc[row_src, col_slice] = accumulated_data
+          # Round the running float32 sum to the output dtype and place it in
+          # its half of the output word. The last row of a group leaves the
+          # group's final rounded value in the word; the word is complete at
+          # the last row of its pair of groups.
+          if out_pack == 1:
+            word = plsc.bitcast(accumulated_data, jnp.uint32)
+          else:
+            bf16_bits = _round_f32_bits_to_bf16(plsc.bitcast(accumulated_data, jnp.uint32), jnp.isnan(accumulated_data))
+            word = _pack_output_word(
+                previous_word,
+                bf16_bits,
+                dst_row_hbm,
+                dst_row_hbm // out_pack == prev_dst // out_pack,
+            )
+          previous_word = word
+
+          out_vmem_sc[row_src, col_slice] = word
           if row_src == num_simd_lanes - 1:
             scratch.prev_iter_last_row_vmem[c, col_slice] = accumulated_data
+            scratch.prev_iter_last_word_vmem[c, col_slice] = word
 
       plsc.parallel_loop(0, col_chunk_size, step=num_simd_lanes)(col_loop)
 
-      # Scatter every source row's reduced value to its output row. Rows
-      # that share a group write the same value (idempotent); rows routed to
-      # the garbage destination are harmless.
+      # Scatter every source row's output word to its destination word. Rows
+      # that share a word write the same value (idempotent).
       dma_src_row_slice = dma_src_row_vmem_sc[row_slice]
       dma_dst_row_slice = dma_dst_row_vmem_sc[row_slice]
       copies = []
       for i in range(num_simd_lanes):
         copy = pltpu.make_async_copy(
             out_vmem_sc.at[dma_src_row_slice[i], pl.ds(0, col_chunk_size)],
-            out_hbm_ref.at[dma_dst_row_slice[i], pl.ds(col_hbm_start, col_chunk_size)],
-            send_sem,
+            out_words_hbm_ref.at[dma_dst_row_slice[i], pl.ds(col_hbm_start, col_chunk_size)],
+            send_sem_inner,
         )
         copy.start()
         copies.append(copy)
@@ -606,7 +813,7 @@ def main_kernel(
 
     # pylint: disable=no-value-for-parameter
     col_pipeline(in_32b_hbm_ref, scratches=(sem_sc,))
-    scratch.prev_dst_row_smem[0] = dst_indices_list[-1][num_simd_lanes - 1]
+    scratch.prev_dst_row_smem[0] = dst_eff[-1]
 
   row_pipeline(
       *([inputs.indices] * num_row_subchunks),
@@ -614,6 +821,7 @@ def main_kernel(
       scratches=(
           scratch.src_indices_vmem,
           scratch.dst_indices_vmem,
+          scratch.pad_row_vmem,
           scratch.tw_f32_vmem,
           scratch.dma_src_row_vmem,
           scratch.dma_dst_row_vmem,
@@ -701,9 +909,11 @@ def ragged_gather_reduce(
   else:
     topk_weights_u32 = jax.lax.bitcast_convert_type(topk_weights, jnp.uint32)
 
-  # Pad the input so each row partition holds a whole number of reduce
-  # groups; no group is then split across two physical cores.
-  padded_input_size = _align_to(input_size, num_row_partitions * reduce_group_size)
+  # Pad the input so each row partition holds a whole number of output words
+  # (``out_pack`` reduce groups each); no group, and no pair of output rows
+  # packed into one 32-bit word, is then split across two physical cores.
+  out_pack = 32 // jax.dtypes.itemsize_bits(x.dtype)
+  padded_input_size = _align_to(input_size, num_row_partitions * reduce_group_size * out_pack)
   valid_rows_mask = jnp.pad(
       valid_rows_mask,
       (0, padded_input_size - input_size),
@@ -717,6 +927,7 @@ def ragged_gather_reduce(
       num_simd_lanes,
       row_chunk_size,
   )
+  empty_words, num_empty_words_per_row_partition = _empty_output_words(mask, num_row_partitions, out_pack, num_simd_lanes)
 
   # Step 4: Launch the SparseCore kernel.
   vector_mesh = plsc.VectorSubcoreMesh(
@@ -740,12 +951,14 @@ def ragged_gather_reduce(
       subcore_axis_name=vector_mesh.subcore_axis_name,
   )
 
-  # The output gets one extra row: the kernel's garbage scatter destination.
+  # The kernel writes the final output dtype itself (rounded and packed on
+  # the SparseCore) and zero-fills the output rows of empty groups, so no
+  # TensorCore pass over the output is needed afterwards.
   out = pl.kernel(
       functools.partial(main_kernel, cfg=cfg),
       out_type=jax.ShapeDtypeStruct(
-          (padded_input_size // reduce_group_size + 1, aligned_hidden_size),
-          jnp.float32,
+          (padded_input_size // reduce_group_size, aligned_hidden_size),
+          x.dtype,
       ),
       compiler_params=pltpu.CompilerParams(
           use_tc_tiling_on_sc=True,
@@ -764,15 +977,20 @@ def ragged_gather_reduce(
           _Scratch(
               num_rows_per_row_partition_vmem=pltpu.VMEM((num_simd_lanes,), jnp.int32),
               prev_iter_last_row_vmem=pltpu.VMEM((col_size // col_chunk_size, col_chunk_size), jnp.float32),
+              prev_iter_last_word_vmem=pltpu.VMEM((col_size // col_chunk_size, col_chunk_size), jnp.uint32),
               prev_dst_row_smem=pltpu.SMEM((1,), jnp.int32),
               sorted_by_validity_vmem=pltpu.VMEM((sorted_by_validity.size // num_row_partitions,), jnp.int32),
+              num_empty_words_vmem=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+              empty_words_vmem=pltpu.VMEM((empty_words.size // num_row_partitions,), jnp.int32),
+              zero_row_vmem=pltpu.VMEM((col_size,), jnp.uint32),
               src_indices_vmem=pltpu.VMEM((row_chunk_size,), jnp.int32),
               dst_indices_vmem=pltpu.VMEM((row_chunk_size,), jnp.int32),
+              pad_row_vmem=pltpu.VMEM((row_chunk_size,), jnp.int32),
               tw_f32_vmem=pltpu.VMEM((row_chunk_size,), jnp.float32),
               dma_src_row_vmem=pltpu.VMEM((row_chunk_size,), jnp.int32),
               dma_dst_row_vmem=pltpu.VMEM((row_chunk_size,), jnp.int32),
               prev_dst_val_vmem=pltpu.VMEM((row_chunk_size,), jnp.int32),
-              out_vmem=pltpu.VMEM((num_simd_lanes, col_chunk_size), jnp.float32),
+              out_vmem=pltpu.VMEM((num_simd_lanes, col_chunk_size), jnp.uint32),
               sem=pltpu.SemaphoreType.DMA((2,)),
           ),
       ),
@@ -785,10 +1003,14 @@ def ragged_gather_reduce(
           indices=indices,
           topk_weights=topk_weights_u32,
           sorted_by_validity=sorted_by_validity,
+          empty_words=empty_words,
+          num_empty_words_per_row_partition=num_empty_words_per_row_partition,
       ),
   )
 
-  # Step 5: Post-process the output (drop padding, zero empty groups, cast).
-  out = out[: input_size // reduce_group_size, :hidden_size]
-  out = jnp.where(mask[: input_size // reduce_group_size, None], out, jnp.zeros_like(out))
-  return out.astype(x.dtype)
+  # Step 5: Drop the padding rows/columns, if any (a no-op slice in the
+  # production shapes, where the kernel output is consumed as is).
+  num_output_rows = input_size // reduce_group_size
+  if out.shape != (num_output_rows, hidden_size):
+    out = out[:num_output_rows, :hidden_size]
+  return out
