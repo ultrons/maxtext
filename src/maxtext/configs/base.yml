@@ -447,6 +447,7 @@ mla_q: 'remat'
 mla_kv: 'remat'
 attention_out: 'remat'
 engram: 'remat'
+rope_freqs: 'device' # per-position rotary frequencies gathered by YarnRotaryEmbedding ([B, S, H // 2] complex64 per layer); 'device' avoids rebuilding the frequency table in every rematerialized layer
 
 optimizer_memory_host_offload: false
 parameter_memory_host_offload: false
