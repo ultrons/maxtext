@@ -807,8 +807,15 @@ def _dlhs_run_tokamax_v2(
     transpose_rhs: bool,
 ) -> jnp.ndarray:
   """Executes Tokamax GMM V2 backend for DLHS = DLHS_dout @ RHS^T."""
-  # NOTE: We manually transpose RHS here because gmm_v2 lacks native transpose_rhs support.
-  dlhs_rhs = rhs if transpose_rhs else rhs.swapaxes(1, 2)
+  # DLHS contracts dout's n axis with rhs's n axis.
+  # - transpose_rhs=False: rhs is [g, k, n]. gmm_v2 with transpose_rhs=True
+  #   reads it as [g, out=k, contract=n] and contracts the minor axis of both
+  #   operands inside the kernel, so no transposed copy of rhs is materialized
+  #   in HBM (that copy costs one full read + write of the weight per call).
+  # - transpose_rhs=True: rhs is [g, n, k], already the [g, contract, out]
+  #   layout of a plain gmm_v2.
+  dlhs_rhs = rhs
+  dlhs_transpose_rhs = not transpose_rhs
   dlhs_lhs = dlhs_dout.qvalue if isinstance(dlhs_dout, qpl.QArray) else dlhs_dout
 
   if use_gmm_v2_heuristic_tiling:
@@ -827,6 +834,7 @@ def _dlhs_run_tokamax_v2(
       group_offset=group_offset,
       # Bypass internal quantization if incoming dlhs_dout is already a QArray.
       maybe_quantize_lhs=not isinstance(dlhs_dout, qpl.QArray),
+      transpose_rhs=dlhs_transpose_rhs,
   )
 
   # Rescale dlhs by dlhs_dout.scale when incoming gradient was pre-quantized QArray.
