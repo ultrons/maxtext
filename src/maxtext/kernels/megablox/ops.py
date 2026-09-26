@@ -86,7 +86,10 @@ def gmm(
   whole number of native row tiles (32 rows for fp8, `_gather_writes_native_row_tiles`),
   the gathered buffer can land in the kernels' native tiling, and with
   DLHS_USE_TRANSPOSED_RHS_KERNEL on the kernels read it directly instead of through
-  _copy_in_kernel_native_tiling. See `shard_mlp_moe_on_fsdp` in moe.py.
+  _copy_in_kernel_native_tiling. With the switch off, the kernel that would read the
+  gathered weight as is reads that copy instead (see the comment after
+  DLHS_USE_TRANSPOSED_RHS_KERNEL). See
+  `shard_mlp_moe_on_fsdp` in moe.py.
   """
   if interpret is None:
     # Default to native (TPU) lowering. `jax.devices()[0]` is NOT the compile TARGET:
@@ -213,6 +216,7 @@ def _gmm_fwd(
 
   # Quantization All-Gather (QAG) for weight: only supported for following conditions
   gathered_in_native_row_tiles = False
+  local_rhs_qvalue = None
   if (
       use_tokamax_backend
       and quantization_rule
@@ -224,6 +228,7 @@ def _gmm_fwd(
     gathered_in_native_row_tiles = gathered_weight_in_native_tiling and _gather_writes_native_row_tiles(
         rhs.qvalue, weight_gather_axes
     )
+    local_rhs_qvalue = rhs.qvalue
     # pyrefly: ignore[bad-assignment]
     rhs = _fwd_gather_weight(rhs, weight_gather_axes)
 
@@ -232,6 +237,24 @@ def _gmm_fwd(
     # tiling, shared by the forward kernel here and, through the residual, by the
     # dlhs kernel; see DLHS_USE_TRANSPOSED_RHS_KERNEL.
     rhs = _retile_gathered_weight(rhs)
+
+  # With the switch off, the forward kernel reads rhs.swapaxes(1, 2) if transpose_rhs else rhs,
+  # and the dlhs kernel (through the residual) rhs if transpose_rhs else rhs.swapaxes(1, 2).
+  # A swapaxes is a TensorCore transpose copy; the other reader would take the gathered buffer
+  # as is, so that reader gets a copy; see the comment after DLHS_USE_TRANSPOSED_RHS_KERNEL.
+  residual_rhs = rhs
+  if (
+      use_tokamax_backend
+      and use_gmm_v2
+      and not DLHS_USE_TRANSPOSED_RHS_KERNEL
+      and gathered_weight_in_native_tiling
+      and local_rhs_qvalue is not None
+  ):
+    copied = _retile_gathered_weight(rhs, key=local_rhs_qvalue)
+    if transpose_rhs:
+      residual_rhs = copied  # the wi dlhs reads [g, n, k] as is
+    else:
+      rhs = copied  # the wo forward (and its rematerialization) reads [g, k, n] as is
 
   # Backend Execution Routing
   if use_tokamax_backend and not use_gmm_v2:
@@ -265,7 +288,7 @@ def _gmm_fwd(
 
   return out, (
       lhs,
-      rhs,
+      residual_rhs,
       group_sizes,
       group_offset,
       partial_sum,
@@ -866,8 +889,20 @@ def _dlhs_scale_grad_by_rhs_scale(
 # wo forward kernels plain.
 DLHS_USE_TRANSPOSED_RHS_KERNEL = False
 
+# With the switch off and gathered_weight_in_native_tiling set (shard_mlp_moe_on_fsdp), the
+# gathered [E, F, D] weight already has the orientation and tiling of the plain wo forward
+# and wi dlhs kernels, so without an explicit copy those kernels read the SparseCore-written
+# all-gather output directly, also in the rematerialized backward. That program showed
+# intermittent single-step gradient corruption in 512-chip runs, like every other program in
+# which a Mosaic kernel in the backward read an SC-written gather directly, while the flag-off
+# program, whose kernels read TensorCore copies, did not. So in that case _gmm_fwd gives the
+# one kernel that would read the gathered buffer as is a _copy_in_kernel_native_tiling copy
+# instead: the wo forward (and its rematerialization; the remat replays the forward rule, so
+# the layer forward takes this copy too) and, through the residual, the wi dlhs. The other
+# kernel of each weight already reads a TensorCore transpose copy (rhs.swapaxes(1, 2)).
 
-def _copy_in_kernel_native_tiling(x: jnp.ndarray) -> jnp.ndarray:
+
+def _copy_in_kernel_native_tiling(x: jnp.ndarray, key: jnp.ndarray | None = None) -> jnp.ndarray:
   """Materializes `x` through an XLA elementwise fusion whose output XLA lays out in
   the Pallas kernels' native tiling (T(32,128) for 8-bit, T(16,128) for bf16).
 
@@ -878,19 +913,25 @@ def _copy_in_kernel_native_tiling(x: jnp.ndarray) -> jnp.ndarray:
   `optimization_barrier` or a convert round trip is folded away; a select on a
   predicate that is true at run time but opaque to the compiler is not, and costs
   exactly one read and one write of `x`, the same as the copy it replaces. The
-  predicate depends on `x` only (the first 128 bytes, read once), so every use of the
-  same gathered weight (forward, both token chunks, dlhs) CSEs to one fusion.
+  predicate depends on `x` (or `key`) only (the first 128 bytes, read once), so every use of the
+  same gathered weight (forward, both token chunks, dlhs) CSEs to one fusion. `key`, when
+  given, is read for the predicate instead of `x`: for a gathered weight the caller passes
+  the local shard it was gathered from, because reading any bytes of the gathered buffer
+  made XLA relayout all of it (one or two full copies) for the predicate. The bytes are
+  sliced from the first row in the array's own shape for the same reason.
   """
-  head = jax.lax.bitcast_convert_type(x.reshape(-1)[: 128 // jnp.dtype(x.dtype).itemsize], jnp.uint8).reshape(-1)
+  key = x if key is None else key
+  first_row = key[(0,) * (key.ndim - 1)]
+  head = jax.lax.bitcast_convert_type(first_row[: 128 // jnp.dtype(key.dtype).itemsize], jnp.uint8).reshape(-1)
   keep = jnp.sum(head.astype(jnp.int32)) >= 0  # a sum of 128 bytes is non-negative; XLA cannot prove it.
   return jnp.where(keep, x, jnp.zeros_like(x))
 
 
-def _retile_gathered_weight(rhs: jnp.ndarray | qpl.QArray) -> jnp.ndarray | qpl.QArray:
+def _retile_gathered_weight(rhs: jnp.ndarray | qpl.QArray, key: jnp.ndarray | None = None) -> jnp.ndarray | qpl.QArray:
   """Applies _copy_in_kernel_native_tiling to the weight (or its qvalue)."""
   if isinstance(rhs, qpl.QArray):
-    return dataclasses.replace(rhs, qvalue=_copy_in_kernel_native_tiling(rhs.qvalue))
-  return _copy_in_kernel_native_tiling(rhs)
+    return dataclasses.replace(rhs, qvalue=_copy_in_kernel_native_tiling(rhs.qvalue, key))
+  return _copy_in_kernel_native_tiling(rhs, key)
 
 
 def _dlhs_run_tokamax_v2(
