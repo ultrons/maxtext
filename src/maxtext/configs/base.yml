@@ -1277,6 +1277,9 @@ use_splash_scheduler: false # to use tokamax splash attention scheduler.
 ring_scan_unroll: 1 # unroll factor for Tokamax ring attention scans; 0 or >= ring size fully unrolls.
 sa_fuse_reciprocal: true # defaults to true in Tokamax
 sa_use_base2_exp: true # defaults to true in Tokamax
+sa_qk_diag_skip: false # Tokamax only: skip QK sub-tiles above the causal line on diagonal blocks (bit-exact; needs square blocks)
+sa_sv_diag_skip: false # Tokamax only: skip SV sub-tiles above the causal line on diagonal blocks (needs square blocks)
+sa_qk_diag_grid: 2 # sub-grid for the diagonal skips; power of 2 >= 2 (4 recommended at seq 4096 / block 2048)
 # local_sa_* variants apply to local (sliding window) attention layers;
 # if None, each inherits from the corresponding global sa_* flag.
 local_sa_block_q: None  # inherits from sa_block_q if None
