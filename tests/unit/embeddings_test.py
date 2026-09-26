@@ -162,6 +162,92 @@ class LLaMARotaryEmbeddingTest(unittest.TestCase):
     np.testing.assert_allclose(outputs, expected, atol=1e-5)
 
 
+class _YarnPairwiseTestBase(unittest.TestCase):
+  """Shared setup for the pairwise YaRN tests: a mesh and a layer factory with the DeepSeek-V3 frequency settings."""
+
+  def setUp(self):
+    super().setUp()
+    self.rngs = nnx.Rngs(params=0)
+    config_arguments = {
+        "per_device_batch_size": 1.0,
+        "run_name": "test",
+        "enable_checkpointing": False,
+        "max_target_length": 128,
+    }
+    argv = [sys.argv[0], get_test_config_path()]
+    self.cfg = pyconfig.initialize(argv, **config_arguments)
+    devices_array = maxtext_utils.create_device_mesh(self.cfg)
+    self.mesh = jax.sharding.Mesh(devices_array, self.cfg.mesh_axes)
+
+  def _layer(self, embedding_dims, **kwargs):
+    """A pairwise YaRN layer with the DeepSeek-V3 frequency settings unless overridden."""
+    defaults = {
+        "max_position_embeddings": 163840,
+        "original_max_position_embeddings": 4096,
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "rope_theta": 10000.0,
+        "rope_factor": 40.0,
+        "interleave": True,
+        "pairwise": True,
+        "rngs": self.rngs,
+    }
+    defaults.update(kwargs)
+    return embeddings.YarnRotaryEmbedding(embedding_dims=embedding_dims, mesh=self.mesh, **defaults)
+
+  @staticmethod
+  def _bits(x):
+    x = np.asarray(x)
+    return x.view(np.uint16 if x.dtype.itemsize == 2 else np.uint32)
+
+
+class YarnRopeFreqsResidualTest(_YarnPairwiseTestBase):
+  """The gathered cos/sin rows can be kept as a `rope_freqs` residual instead of being rematerialized."""
+
+  def test_rope_freqs_saved_under_custom_remat(self):
+    """With `rope_freqs` saved, the rematerialized backward does not rebuild the frequency table."""
+    layer = self._layer(64)
+    inputs = jax.random.normal(jax.random.PRNGKey(6), (1, 64, 2, 64), jnp.float32)
+    position = jnp.arange(64, dtype=jnp.int32)[None, :]
+
+    def loss(x):
+      return jnp.sum(layer(x, position).astype(jnp.float32) ** 2)
+
+    saved = jax.checkpoint(loss, policy=jax.checkpoint_policies.save_only_these_names("rope_freqs"))
+    rematted = jax.checkpoint(loss, policy=jax.checkpoint_policies.nothing_saveable)
+    grad_saved = jax.grad(saved)(inputs)
+    grad_rematted = jax.grad(rematted)(inputs)
+    np.testing.assert_array_equal(self._bits(grad_saved), self._bits(grad_rematted))
+
+    def count_table_ops(fn):
+      # Every op that builds the [max_position_embeddings, half_dim] table carries that shape in the jaxpr.
+      return str(jax.make_jaxpr(fn)(inputs)).count(f"[{layer.max_position_embeddings},32]")
+
+    n_rematted = count_table_ops(jax.grad(rematted))
+    n_saved = count_table_ops(jax.grad(saved))
+    self.assertGreater(n_saved, 0)
+    self.assertLess(n_saved, n_rematted)
+
+  def test_config_rope_freqs_default_on_device(self):
+    cfg = pyconfig.initialize(
+        [sys.argv[0], get_test_config_path()],
+        per_device_batch_size=1.0,
+        run_name="test",
+        enable_checkpointing=False,
+        remat_policy="custom",
+    )
+    self.assertIn("rope_freqs", cfg.tensors_on_device)
+    cfg = pyconfig.initialize(
+        [sys.argv[0], get_test_config_path()],
+        per_device_batch_size=1.0,
+        run_name="test",
+        enable_checkpointing=False,
+        remat_policy="custom",
+        rope_freqs="remat",
+    )
+    self.assertNotIn("rope_freqs", cfg.tensors_on_device)
+
+
 class YarnRotaryEmbeddingTest(unittest.TestCase):
 
   def setUp(self):

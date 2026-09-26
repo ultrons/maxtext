@@ -20,6 +20,7 @@ from typing import Any
 
 import jax
 from jax import lax
+from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 
@@ -768,8 +769,11 @@ class YarnRotaryEmbedding(nnx.Module):
         half_dim = h // 2
         pairs = inputs.reshape(b, s, n, half_dim, 2)
         pairs = pairs.astype(jnp.float32)
-        cos = jnp.real(freqs)[..., jnp.newaxis]
-        sin = jnp.imag(freqs)[..., jnp.newaxis]
+        # Named so that `remat_policy=custom` with `rope_freqs=device` keeps the gathered cos/sin rows as f32
+        # residuals ([B, S, 1, half_dim] each, per layer) instead of rebuilding the whole
+        # [max_position_embeddings, half_dim] table inside every rematerialized layer body.
+        cos = checkpoint_name(jnp.real(freqs), "rope_freqs")[..., jnp.newaxis]
+        sin = checkpoint_name(jnp.imag(freqs), "rope_freqs")[..., jnp.newaxis]
         if self.shard_mode == ShardMode.EXPLICIT:
           rotated_sharding = create_sharding(self.mesh, ("activation_batch", "activation_length", None, None, None))
           cos = jnp.broadcast_to(cos, pairs.shape, out_sharding=rotated_sharding)

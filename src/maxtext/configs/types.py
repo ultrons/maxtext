@@ -1908,6 +1908,14 @@ class RematAndOffload(BaseModel):
       description="Remat policy for the attention output.",
   )
   engram: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the engram output.")
+  rope_freqs: RematLocation = Field(
+      RematLocation.DEVICE,
+      description=(
+          "Remat policy for the per-position rotary frequencies gathered by YarnRotaryEmbedding ([B, S, H // 2]"
+          " complex64 per layer). 'device' keeps them as a residual so the rematerialized backward does not rebuild"
+          " the full [max_position_embeddings, H // 2] frequency table in every layer."
+      ),
+  )
 
   optimizer_memory_host_offload: bool = Field(False, description="Offload optimizer state to host memory.")
   parameter_memory_host_offload: bool = Field(False, description="Offload parameters to host memory.")
@@ -4480,6 +4488,7 @@ class MaxTextConfig(
           "qkv_proj",
           "attention_out",
           "out_proj",
+          "rope_freqs",
       ]
       self.tensors_on_device = [t for t in tensors if getattr(self, t) == "device"]
       self.tensors_to_offload = [t for t in tensors if getattr(self, t) == "offload"]
