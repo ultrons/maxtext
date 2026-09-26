@@ -1130,6 +1130,7 @@ rope_attention_scaling: false # Scale the rotary embedding output
 # Keep rank-5 pair tensor intact [batch_size, sequence_length, num_heads, half_dim, 2]
 # where half_dim is the number of 2D rotation planes and 2 contains [real, imag] coordinates, returning interleaved RoPE
 rope_pairwise: false
+rope_pairwise_kernel: true # with rope_pairwise=true, rotate with the Pallas TPU kernel (maxtext.kernels.rope_pairwise); bit-identical to the reshape form, no relayout copies
 
 # Ahead of time Compilation (aka AOT)
 # Only set these arguments if you are running train_compile or loading a compiled train step.

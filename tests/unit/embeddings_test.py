@@ -14,8 +14,10 @@
 
 """Tests for embeddings.py."""
 
+import math
 import sys
 import unittest
+from flax import linen as nn
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -25,6 +27,7 @@ from maxtext.layers import embeddings
 from maxtext.configs import pyconfig
 from maxtext.utils import maxtext_utils
 from tests.utils.test_helpers import get_test_config_path
+from tests.unit import rope_pairwise_kernel_test as rope_kernel_test
 
 
 class EmbedTest(unittest.TestCase):
@@ -246,6 +249,85 @@ class YarnRopeFreqsResidualTest(_YarnPairwiseTestBase):
         rope_freqs="remat",
     )
     self.assertNotIn("rope_freqs", cfg.tensors_on_device)
+
+
+class YarnPairwiseKernelTest(_YarnPairwiseTestBase):
+  """`pairwise_kernel=True` (the default) against the reshape form on the layer's own YaRN frequencies.
+
+  Each element must equal one of the two IEEE-legal f32 evaluations of the shared expression (strict rounding, or the
+  multiply-add fused as XLA:CPU does for the interpreted kernel body); the reshape form run eagerly is the strict one.
+  The bit-level tests on exactly representable inputs are in rope_pairwise_kernel_test.py.
+  """
+
+  def _rows(self, layer, position):
+    """The layer's per-pair cos / sin rows at `position`."""
+    freqs = layer.freqs_cis.at[position.astype(jnp.int32)].get()
+    return jnp.real(freqs), jnp.imag(freqs)
+
+  def _check_case(self, embedding_dims, shape, in_dtype, seed, **layer_kwargs):
+    """Kernel layer vs reshape layer on random inputs, forward and backward, against the legal evaluations."""
+    kernel_layer = self._layer(embedding_dims, pairwise_kernel=True, **layer_kwargs)
+    reshape_layer = self._layer(embedding_dims, pairwise_kernel=False, **layer_kwargs)
+    key_x, key_p, key_ct = jax.random.split(jax.random.PRNGKey(seed), 3)
+    inputs = (jax.random.normal(key_x, shape, jnp.float32) * 3.0).astype(in_dtype)
+    position = jax.random.randint(key_p, shape[:2], 0, kernel_layer.max_position_embeddings)
+    cotangent = jax.random.normal(key_ct, shape, jnp.float32)
+    cos_rows, sin_rows = self._rows(kernel_layer, position)
+    scale = 1.0
+    if kernel_layer.attention_scaling:
+      scale = 1.0 if kernel_layer.rope_factor <= 1 else (0.1 * math.log(kernel_layer.rope_factor) + 1.0)
+    out_dtype = kernel_layer.fprop_dtype if kernel_layer.cast_as_fprop_dtype else jnp.float32
+
+    actual = kernel_layer(inputs, position)
+    expected = reshape_layer(inputs, position)
+    self.assertEqual(actual.dtype, expected.dtype)
+    legal = rope_kernel_test.legal_evaluations(inputs, cos_rows, sin_rows, out_dtype, scale)
+    np.testing.assert_array_equal(self._bits(expected), self._bits(legal[0]))
+    rope_kernel_test.assert_legal(actual, *legal)
+
+    def loss(layer, x):
+      return jnp.sum(layer(x, position).astype(jnp.float32) * cotangent)
+
+    grad_new = jax.grad(lambda x: loss(kernel_layer, x))(inputs)
+    grad_ref = jax.grad(lambda x: loss(reshape_layer, x))(inputs)
+    g = cotangent.astype(out_dtype).astype(jnp.float32) if out_dtype != jnp.float32 else cotangent
+    legal = rope_kernel_test.legal_evaluations(g, cos_rows, sin_rows, in_dtype, scale, negate_sin=True, scale_first=True)
+    np.testing.assert_array_equal(self._bits(grad_ref), self._bits(legal[0]))
+    rope_kernel_test.assert_legal(grad_new, *legal)
+
+  def test_production_q_pe(self):
+    self._check_case(64, (1, 4096, 128, 64), jnp.bfloat16, seed=0)
+
+  def test_production_k_pe(self):
+    self._check_case(64, (1, 4096, 1, 64), jnp.bfloat16, seed=1)
+
+  def test_sharded_kernel_path_matches_unsharded(self):
+    # With logical axis names the kernel runs under jax.shard_map (the production path); on the test mesh every
+    # axis has size one, so the shard is the whole array and the two must agree bit for bit, forward and backward.
+    names = ("activation_kv_batch", "activation_length", "activation_kv_heads", "activation_kv_head_dim")
+    with nn.logical_axis_rules(self.cfg.logical_axis_rules):
+      sharded = self._layer(64, pairwise_kernel=True, pairwise_kernel_axis_names=names)
+      plain = self._layer(64, pairwise_kernel=True)
+      key_x, key_p, key_ct = jax.random.split(jax.random.PRNGKey(7), 3)
+      for shape in ((1, 4096, 128, 64), (1, 4096, 1, 64)):
+        inputs = (jax.random.normal(key_x, shape, jnp.float32) * 3.0).astype(jnp.bfloat16)
+        position = jax.random.randint(key_p, shape[:2], 0, sharded.max_position_embeddings)
+        cotangent = jax.random.normal(key_ct, shape, jnp.float32)
+        np.testing.assert_array_equal(self._bits(sharded(inputs, position)), self._bits(plain(inputs, position)))
+
+        def loss(layer, x):
+          return jnp.sum(layer(x, position).astype(jnp.float32) * cotangent)
+
+        np.testing.assert_array_equal(
+            self._bits(jax.grad(lambda x: loss(sharded, x))(inputs)),
+            self._bits(jax.grad(lambda x: loss(plain, x))(inputs)),
+        )
+
+  def test_f32_no_cast(self):
+    self._check_case(64, (2, 512, 8, 64), jnp.float32, seed=2, cast_as_fprop_dtype=False)
+
+  def test_attention_scaling_d128(self):
+    self._check_case(128, (2, 256, 4, 128), jnp.bfloat16, seed=3, attention_scaling=True)
 
 
 class YarnRotaryEmbeddingTest(unittest.TestCase):

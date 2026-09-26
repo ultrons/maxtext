@@ -955,6 +955,8 @@ class Attention(nnx.Module):
           truncate=self.config.rope_truncate,
           attention_scaling=self.config.rope_attention_scaling,
           pairwise=self.config.rope_pairwise,
+          pairwise_kernel=self.config.rope_pairwise_kernel,
+          pairwise_kernel_axis_names=self.query_axis_names,
           shard_mode=self.config.shard_mode,
           rngs=self.rngs,
       )
