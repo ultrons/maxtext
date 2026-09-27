@@ -3397,7 +3397,7 @@ class ShardMlpMoeOnFsdpTest(parameterized.TestCase):
       self.skipTest(f"Pallas TPU interpreter shim does not fit this jax version: {e!r}")
     return kt.cpu_interpret_megablox_v2()
 
-  def _cfg(self, ici_expert_parallelism, shard_mlp_moe_on_fsdp):
+  def _cfg(self, ici_expert_parallelism, shard_mlp_moe_on_fsdp, bwd_calibration="absmax"):
     return pyconfig.initialize(
         [None, get_test_config_path()],
         run_name="shard_mlp_moe_on_fsdp_test",
@@ -3428,7 +3428,7 @@ class ShardMlpMoeOnFsdpTest(parameterized.TestCase):
         use_qwix_quantization=True,
         weight_quantization_calibration_method="fixed,-224,224",
         act_quantization_calibration_method="fixed,-224,224",
-        bwd_quantization_calibration_method="absmax",
+        bwd_quantization_calibration_method=bwd_calibration,
         wi_tile_fwd_batch_seq=128,
         wi_tile_fwd_embed_dim=256,
         wi_tile_fwd_mlp_dim=256,
@@ -3477,8 +3477,9 @@ class ShardMlpMoeOnFsdpTest(parameterized.TestCase):
   def _run(self, cfg, params=None, record=None, kernel_record=None):
     """Loss, output and gradients of mean(out**2) + lb_loss.
 
-    `record` collects the ops.gmm calls; `kernel_record` the gmm_v2 kernel calls (rhs shape, transpose_rhs) and
-    the native-tiling copies (`retile`) traced for the jitted forward/backward.
+    `record` collects the ops.gmm calls; `kernel_record` the gmm_v2 kernel calls (rhs shape, transpose_rhs), the
+    native-tiling copies (`retile`) and the tgmm_v2 calls (lhs / rhs shape and dtype, rhs_scale shape, output
+    dtype and shape) traced for the jitted forward/backward.
     """
     from maxtext.kernels.megablox import ops as mblx_ops  # pylint: disable=import-outside-toplevel
 
@@ -3510,12 +3511,26 @@ class ShardMlpMoeOnFsdpTest(parameterized.TestCase):
       return orig_gmm(*args, **kwargs)
 
     orig_kernel = mblx_ops.gmm_v2.gmm_v2
+    orig_tgmm = mblx_ops.tgmm_v2.tgmm_v2
     orig_retile = mblx_ops._copy_in_kernel_native_tiling  # pylint: disable=protected-access
 
     def recording_kernel(*args, **kwargs):
       if kernel_record is not None:
         kernel_record.append(("gmm_v2", tuple(kwargs["rhs"].shape), kwargs.get("transpose_rhs", False)))
       return orig_kernel(*args, **kwargs)
+
+    def recording_tgmm(*args, **kwargs):
+      out = orig_tgmm(*args, **kwargs)
+      if kernel_record is not None:
+        lhs, rhs, scale = kwargs["lhs"], kwargs["rhs"], kwargs.get("rhs_scale")
+        kernel_record.append(
+            (
+                "tgmm_v2",
+                (tuple(lhs.shape), jnp.dtype(lhs.dtype).name, tuple(rhs.shape), jnp.dtype(rhs.dtype).name),
+                (None if scale is None else tuple(scale.shape), jnp.dtype(out.dtype).name, tuple(out.shape)),
+            )
+        )
+      return out
 
     def recording_retile(x, *args, **kwargs):
       if kernel_record is not None:
@@ -3528,6 +3543,7 @@ class ShardMlpMoeOnFsdpTest(parameterized.TestCase):
         self._kernel_context(),
         mock.patch.object(moe.mblx, "gmm", recording_gmm),
         mock.patch.object(mblx_ops.gmm_v2, "gmm_v2", recording_kernel),
+        mock.patch.object(mblx_ops.tgmm_v2, "tgmm_v2", recording_tgmm),
         mock.patch.object(mblx_ops, "_copy_in_kernel_native_tiling", recording_retile),
     ):
       variables = model.init({"params": rng_model, "dropout": rng_model}, x)
@@ -3594,20 +3610,28 @@ class ShardMlpMoeOnFsdpTest(parameterized.TestCase):
     )
 
   @parameterized.named_parameters(
-      {"testcase_name": f"ep{ep}_switch_{'on' if switch else 'off'}", "ep": ep, "switch": switch}
-      for ep in (1, 2)
-      for switch in (False, True)
+      [
+          {"testcase_name": f"ep{ep}_switch_{'on' if switch else 'off'}", "ep": ep, "switch": switch}
+          for ep in (1, 2)
+          for switch in (False, True)
+      ]
+      + [
+          # The production gradient calibration (fixed, per-tensor scale) with the switch off, as in the recipe.
+          {"testcase_name": f"ep{ep}_switch_off_fixed_bwd", "ep": ep, "switch": False, "bwd": "fixed,0.01"}
+          for ep in (1, 2)
+      ]
   )
-  def test_flag_on_matches_flag_off_bitwise(self, ep, switch):
+  def test_flag_on_matches_flag_off_bitwise(self, ep, switch, bwd="absmax"):
     """Loss, output and every gradient are bit-identical with the weights FSDP-sharded on mlp vs embed."""
     from maxtext.kernels.megablox import ops as mblx_ops  # pylint: disable=import-outside-toplevel
 
     ref_kernels, tgt_kernels = [], []
     with mock.patch.object(mblx_ops, "DLHS_USE_TRANSPOSED_RHS_KERNEL", switch):
       ref, params, _ = self._run(
-          self._cfg(ici_expert_parallelism=ep, shard_mlp_moe_on_fsdp=False), kernel_record=ref_kernels
+          self._cfg(ici_expert_parallelism=ep, shard_mlp_moe_on_fsdp=False, bwd_calibration=bwd),
+          kernel_record=ref_kernels,
       )
-      cfg = self._cfg(ici_expert_parallelism=ep, shard_mlp_moe_on_fsdp=True)
+      cfg = self._cfg(ici_expert_parallelism=ep, shard_mlp_moe_on_fsdp=True, bwd_calibration=bwd)
       tgt, _, _ = self._run(cfg, params=params, kernel_record=tgt_kernels)
     # Which kernel variant reads which orientation, with the flag on (weights gathered as [E, F, D]):
     # wi forward transposed-rhs (switch on) or a swapaxes copy + plain (off); wi dlhs plain; wo forward plain;
@@ -3626,6 +3650,25 @@ class ShardMlpMoeOnFsdpTest(parameterized.TestCase):
         [k for k in tgt_kernels if k[0] == "retile"], [] if switch else [("retile", (e_local, mlp, emb), None)] * 3
     )
     self.assertLen([k for k in ref_kernels if k[0] == "retile"], 3 if switch else 0)
+    # Weight-gradient tgmm calls, as ((lhs shape, dtype), (rhs shape, dtype)) -> (rhs_scale shape, out dtype, out).
+    # Flag off: wi drhs [E, D, F] = x[m, D]^T @ dout[m, F]. Flag on: wi drhs in the [E, F, D] layout of the gathered
+    # weight, dout[m, F]^T @ x[m, D] (operands swapped). wo is [E, F, D] either way. The per-tensor (fixed) gradient
+    # scale goes into the kernel over the output columns; a per-channel (absmax) one on F is applied to an f32 output.
+    per_tensor = bwd != "absmax"
+
+    def tgmm_calls(kernels):
+      return collections.Counter(
+          ((lhs[1:], lhs_t, rhs[1:], rhs_t), out)
+          for _, (lhs, lhs_t, rhs, rhs_t), out in (k for k in kernels if k[0] == "tgmm_v2")
+      )
+
+    x_t, g_t = "float8_e4m3fn", "float8_e5m2"
+    wo_call = (((mlp,), x_t, (emb,), g_t), ((1, 1, emb), "bfloat16", (e_local, mlp, emb)))
+    wi_ref_call = (((emb,), x_t, (mlp,), g_t), ((1, 1, mlp), "bfloat16", (e_local, emb, mlp)))
+    wi_tgt_out = ((1, 1, emb), "bfloat16") if per_tensor else (None, "float32")
+    wi_tgt_call = (((mlp,), g_t, (emb,), x_t), wi_tgt_out + ((e_local, mlp, emb),))
+    self.assertEqual(dict(tgmm_calls(ref_kernels)), {wi_ref_call: 2, wo_call: 1})
+    self.assertEqual(dict(tgmm_calls(tgt_kernels)), {wi_tgt_call: 2, wo_call: 1})
     ref_leaves = jax.tree_util.tree_leaves_with_path(ref)
     tgt_leaves = jax.tree_util.tree_leaves_with_path(tgt)
     self.assertEqual([p for p, _ in ref_leaves], [p for p, _ in tgt_leaves])

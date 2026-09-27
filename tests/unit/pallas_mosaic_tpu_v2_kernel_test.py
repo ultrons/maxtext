@@ -1625,5 +1625,137 @@ class GmmTransposeRhsCompileTest(parameterized.TestCase):
     self.assertNotIn("parameter(", producer[0])
 
 
+class DrhsTransposeOutTest(parameterized.TestCase):
+  """ops._drhs_run_tokamax_v2(transpose_out=True) returns the [g, k, n] drhs as [g, n, k], bit for bit.
+
+  The transposed drhs is the same tgmm with its two operands and its (tile_k, tile_n) swapped (shard_mlp_moe_on_fsdp:
+  the wi gradient in the [E, F, D] layout of the gathered weight). Off TPU both run under the Pallas TPU interpreter
+  shim, where the block products are computed by XLA:CPU; the MXU accumulation order is not covered.
+  """
+
+  def _kernel_context(self):
+    if jax.default_backend() == "tpu":
+      return contextlib.nullcontext()
+    try:
+      _interpret_internals()
+    except (ImportError, AttributeError) as e:
+      self.skipTest(f"Pallas TPU interpreter shim does not fit this jax version: {e!r}")
+    return cpu_interpret_megablox_v2()
+
+  @parameterized.named_parameters(
+      # name, m, k (= D), n (= F), group_sizes, group_offset, num_local_groups, scale, tiles (tm, tk over D, tn over F)
+      # The 512 recipe's wi drhs at a quarter of D and F: fp8 operands, per-tensor (fixed) gradient scale, 16 experts
+      # with empty and ragged groups, tiles scaled from wi_tile_drhs_* (512, 1792, 2048).
+      ("fp8_per_tensor_16_experts", 512, 1792, 512, _TRHS_GROUP_SIZES_16, 0, 16, "per_tensor", (128, 896, 512)),
+      # Local experts at a group offset (EP), two of the four local groups empty, group boundaries not sublane aligned.
+      ("fp8_per_tensor_group_offset", 256, 512, 384, _TRHS_GROUP_SIZES, 1, 4, "per_tensor", (128, 256, 128)),
+      # absmax gradient calibration: a per-channel (per-F) scale, applied after an f32 kernel output.
+      ("fp8_per_channel_group_offset", 256, 512, 384, _TRHS_GROUP_SIZES, 1, 4, "per_channel", (128, 256, 128)),
+      ("fp8_per_channel_16_experts", 512, 1792, 512, _TRHS_GROUP_SIZES_16, 0, 16, "per_channel", (128, 896, 512)),
+      # Unquantized bf16 operands, no scale.
+      ("bf16", 256, 512, 384, _TRHS_GROUP_SIZES, 1, 4, None, (128, 256, 128)),
+  )
+  def test_matches_swapaxes_of_current_path(self, m, k, n, group_sizes, group_offset, num_local_groups, scale, tiles):
+    key_lhs, key_dout, key_scale = jax.random.split(jax.random.key(4), 3)
+    group_sizes = jnp.asarray(group_sizes, jnp.int32)
+    self.assertEqual(int(jnp.sum(group_sizes)), m)
+    if scale is None:
+      lhs = jax.random.normal(key_lhs, (m, k), jnp.float32).astype(jnp.bfloat16)
+      drhs_dout = jax.random.normal(key_dout, (m, n), jnp.float32).astype(jnp.bfloat16)
+    else:
+      lhs = jax.random.normal(key_lhs, (m, k), jnp.float32).astype(jnp.float8_e4m3fn)
+      scale_shape = (1, 1) if scale == "per_tensor" else (1, n)
+      drhs_dout = qpl.QArray(
+          qvalue=jax.random.normal(key_dout, (m, n), jnp.float32).astype(jnp.float8_e5m2),
+          scale=jax.random.uniform(key_scale, scale_shape, jnp.float32, 1e-3, 3e-3),
+          zero_point=None,
+          qtype=jnp.float8_e5m2,
+      )
+    # ops tiling tuple: drhs tiles are tiling[6:9] = (tm, tk, tn) of the [g, k, n] tgmm.
+    tiling = (128, 128, 128, 128, 128, 128) + tuple(tiles)
+    offset = jnp.array([group_offset], jnp.int32)
+
+    def run(transpose_out):
+      return megablox_ops._drhs_run_tokamax_v2(  # pylint: disable=protected-access
+          drhs_dout,
+          lhs,
+          group_sizes,
+          offset,
+          num_local_groups,
+          jnp.bfloat16,
+          tiling,
+          False,
+          transpose_out=transpose_out,
+      )
+
+    with self._kernel_context():
+      with mock.patch.object(tgmm_backend, "tgmm_v2", wraps=tgmm_backend.tgmm_v2) as spy:
+        expected = jax.block_until_ready(run(False))  # [g, k, n]
+        actual = jax.block_until_ready(run(True))  # [g, n, k]
+    # The transposed call is the tgmm with the operands and the (tile_k, tile_n) swapped.
+    ref_call, t_call = spy.call_args_list
+    self.assertEqual(t_call.kwargs["lhs"].shape, (m, n))
+    self.assertEqual(t_call.kwargs["rhs"].shape, (m, k))
+    self.assertEqual(ref_call.kwargs["tile_info"], gmm_backend.TileSizes(tiles[0], tiles[1], tiles[2]))
+    self.assertEqual(t_call.kwargs["tile_info"], gmm_backend.TileSizes(tiles[0], tiles[2], tiles[1]))
+    if scale == "per_tensor":
+      self.assertEqual(t_call.kwargs["rhs_scale"].shape, (1, 1, k))
+    else:
+      self.assertIsNone(t_call.kwargs["rhs_scale"])
+    self.assertEqual(expected.shape, (num_local_groups, k, n))
+    self.assertEqual(actual.shape, (num_local_groups, n, k))
+    self.assertEqual(actual.dtype, jnp.bfloat16)
+    expected_t = np.asarray(expected.swapaxes(1, 2))
+    actual = np.asarray(actual)
+    max_abs_diff = float(np.max(np.abs(actual.astype(np.float32) - expected_t.astype(np.float32))))
+    print(f"drhs transpose_out {self._testMethodName}: max abs diff vs swapaxes of current path = {max_abs_diff}")
+    np.testing.assert_array_equal(
+        actual.view(np.uint16), expected_t.view(np.uint16), err_msg=f"max abs diff {max_abs_diff}"
+    )
+    # Empty local groups are zero; every other group is not (so the equality is not vacuous).
+    local_sizes = np.asarray(group_sizes)[group_offset : group_offset + num_local_groups]
+    self.assertGreater(int(np.sum(local_sizes == 0)), 0)
+    for g, size in enumerate(local_sizes):
+      if size == 0:
+        self.assertFalse(np.any(actual[g] != 0), msg=f"empty group {g}")
+      else:
+        self.assertTrue(np.any(actual[g] != 0), msg=f"group {g}")
+
+
+class DrhsTransposeOutCompileTest(parameterized.TestCase):
+  """Mosaic compiles the operand-swapped tgmm of the transposed wi drhs for tpu7x (virtual topology, no hardware)."""
+
+  @pytest.mark.tpu_backend
+  def test_compiles_for_tpu7x_production_shape(self):
+    try:
+      topology = topologies.get_topology_desc("tpu7x:2x2x1", platform="tpu")
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      self.skipTest(f"tpu7x virtual topology unavailable (needs a TPU-enabled jax install): {e!r}")
+    # wi drhs of the 512-chip recipe (m of the normal program), transposed: lhs = e5m2 gradient [m, F], rhs = e4m3
+    # activation [m, D], per-tensor gradient scale broadcast over D, tiles (tm, F tile, D tile) = (512, 2048, 1792).
+    m, d, f, num_groups = 40960, 7168, 2048, 16
+    lhs = jax.ShapeDtypeStruct((m, f), jnp.float8_e5m2)
+    rhs = jax.ShapeDtypeStruct((m, d), jnp.float8_e4m3fn)
+    rhs_scale = jax.ShapeDtypeStruct((1, 1, d), jnp.float32)
+    group_sizes = jax.ShapeDtypeStruct((num_groups,), jnp.int32)
+
+    def drhs_t(lhs, rhs, rhs_scale, group_sizes):
+      return tgmm_backend.tgmm_v2(
+          lhs,
+          rhs,
+          group_sizes,
+          num_groups,
+          rhs_scale=rhs_scale,
+          preferred_element_type=jnp.bfloat16,
+          tile_info=gmm_backend.TileSizes(512, 2048, 1792),
+      )
+
+    with jax.default_device(topology.devices[0]):
+      compiled = jax.jit(drhs_t).lower(lhs, rhs, rhs_scale, group_sizes).compile()
+    hlo = compiled.as_text()
+    self.assertIn("tgmm_v2-g_16-m_40960-k_2048", hlo)
+    self.assertRegex(hlo, r"bf16\[16,2048,7168\]")
+
+
 if __name__ == "__main__":
   absltest.main()
