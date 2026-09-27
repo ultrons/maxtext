@@ -558,7 +558,7 @@ def _gmm_bwd(
     rhs_vma_axes: tuple,
     use_gmm_v2: bool,
     use_gmm_v2_heuristic_tiling: bool,
-    gathered_weight_in_native_tiling: bool,  # pylint: disable=unused-argument
+    gathered_weight_in_native_tiling: bool,
     residual: tuple[
         jnp.ndarray | qpl.QArray,
         jnp.ndarray | qpl.QArray,
@@ -633,8 +633,12 @@ def _gmm_bwd(
   # 4. DRHS Gradient Execution
   # The tgmm computes drhs as [g, k, n]; with transpose_rhs=True the weight (and the
   # axes it was gathered on) is [g, n, k], so the reduce-scatter axes 1 and 2 swap.
+  # Under gathered_weight_in_native_tiling (shard_mlp_moe_on_fsdp) the tgmm instead
+  # produces the [g, n, k] gradient directly (see _drhs_run_tokamax_v2), so it is
+  # reduce-scattered on the gathered axis itself and needs no final swap.
+  drhs_in_rhs_layout = gathered_weight_in_native_tiling and transpose_rhs and use_tokamax_backend and use_gmm_v2
   drhs_scatter_axes = weight_gather_axes
-  if transpose_rhs and weight_gather_axes:
+  if transpose_rhs and weight_gather_axes and not drhs_in_rhs_layout:
     drhs_scatter_axes = [(axis_name, {1: 2, 2: 1}.get(axis_idx, axis_idx)) for axis_name, axis_idx in weight_gather_axes]
   drhs = _compute_drhs(
       drhs_dout,
@@ -652,6 +656,7 @@ def _gmm_bwd(
       rhs_vma_axes,
       quantization_rule,
       use_gmm_v2_heuristic_tiling,
+      transpose_out=drhs_in_rhs_layout,
   )
 
   # 5. Output Formatting
@@ -659,7 +664,7 @@ def _gmm_bwd(
   # return the transpose of the rhs gradient that we calculated above.
   #
   # TODO(tgale, enriqueps, apaske): Fuse this transposition into the tgmm.
-  drhs = drhs.swapaxes(1, 2) if transpose_rhs else drhs
+  drhs = drhs.swapaxes(1, 2) if transpose_rhs and not drhs_in_rhs_layout else drhs
   dpartial_sum = grad if partial_sum_fwd is not None else None
   d_existing_out = None if use_tokamax_backend else grad
 
@@ -1034,13 +1039,27 @@ def _compute_drhs(
     rhs_vma_axes: tuple,
     quantization_rule: qwix.QtRule | None,
     use_gmm_v2_heuristic_tiling: bool,
+    transpose_out: bool = False,
 ) -> jnp.ndarray:
-  """Routes execution of DRHS based on backend choices."""
+  """Routes execution of DRHS based on backend choices.
+
+  `transpose_out` (tokamax gmm_v2 backend only): return drhs as [g, n, k] instead of [g, k, n].
+  """
+  if transpose_out and not (use_tokamax_backend and use_gmm_v2):
+    raise NotImplementedError("transpose_out drhs needs the tokamax gmm_v2 backend.")
   if use_tokamax_backend and not use_gmm_v2:
     drhs = _drhs_run_tokamax_v1(drhs_dout, lhs, group_sizes, rhs_dtype, use_manual_quantization)
   elif use_tokamax_backend and use_gmm_v2:
     drhs = _drhs_run_tokamax_v2(
-        drhs_dout, lhs, group_sizes, group_offset, num_actual_groups, rhs_dtype, tiling, use_gmm_v2_heuristic_tiling
+        drhs_dout,
+        lhs,
+        group_sizes,
+        group_offset,
+        num_actual_groups,
+        rhs_dtype,
+        tiling,
+        use_gmm_v2_heuristic_tiling,
+        transpose_out=transpose_out,
     )
   else:
     drhs = _drhs_run_megablox(
@@ -1109,31 +1128,57 @@ def _drhs_run_tokamax_v2(
     rhs_dtype: jax.typing.DTypeLike,
     tiling: tuple,
     use_gmm_v2_heuristic_tiling: bool,
+    transpose_out: bool = False,
 ) -> jnp.ndarray:
-  """Executes Tokamax TGMM V2 backend for DRHS = LHS^T @ DRHS_dout."""
+  """Executes Tokamax TGMM V2 backend for DRHS = LHS^T @ DRHS_dout.
+
+  With `transpose_out`, returns DRHS^T [g, n, k] = DRHS_dout^T @ LHS instead: the same tgmm with the two
+  operands swapped and the (tile_k, tile_n) tiles swapped, so every output tile covers the same elements and
+  accumulates the same products over the same gm tiles, written in the other memory order. This is the
+  physical layout of a [g, n, k] (transpose_rhs) weight, whose gradient then needs no transpose before its
+  reduce-scatter on axis 1. The per-n scale of DRHS_dout becomes a per-row scale of the output: a per-tensor
+  scale is passed to the kernel broadcast over k; a per-channel one is applied after an f32 kernel output,
+  i.e. the same f32 multiply before the cast as inside the kernel.
+  """
   drhs_rhs = drhs_dout.qvalue if isinstance(drhs_dout, qpl.QArray) else drhs_dout
   drhs_lhs = lhs
 
-  rhs_scale = None
-  if isinstance(drhs_dout, qpl.QArray):
-    rhs_scale = _drhs_prepare_bwd_scale(drhs_dout)
-
   if use_gmm_v2_heuristic_tiling:
     drhs_tiling = tgmm_v2.calculate_tgmm_tiling
+  elif transpose_out:
+    drhs_tiling = gmm_v2.TileSizes(tile_m=tiling[6], tile_k=tiling[8], tile_n=tiling[7])
   else:
     drhs_tiling = gmm_v2.TileSizes(tile_m=tiling[6], tile_k=tiling[7], tile_n=tiling[8])
 
-  return tgmm_v2.tgmm_v2(
+  rhs_scale = None
+  row_scale = None
+  out_dtype = rhs_dtype
+  if transpose_out:
+    drhs_lhs, drhs_rhs = drhs_rhs, drhs_lhs
+    if isinstance(drhs_dout, qpl.QArray):
+      if drhs_dout.scale.size == 1:
+        rhs_scale = jnp.broadcast_to(drhs_dout.scale.reshape(1, 1, 1), (1, 1, drhs_rhs.shape[1]))
+      else:
+        # per channel: (1, n) -> (1, n, 1), applied to the f32 [g, n, k] output below.
+        row_scale = drhs_dout.scale.reshape(1, drhs_dout.shape[1], 1).astype(jnp.float32)
+        out_dtype = jnp.float32
+  elif isinstance(drhs_dout, qpl.QArray):
+    rhs_scale = _drhs_prepare_bwd_scale(drhs_dout)
+
+  drhs = tgmm_v2.tgmm_v2(
       lhs=drhs_lhs,
       rhs=drhs_rhs,
       group_sizes=group_sizes,
       num_actual_groups=num_actual_groups,
       rhs_scale=rhs_scale,
       precision=jax.lax.Precision.DEFAULT,
-      preferred_element_type=rhs_dtype,  # pyrefly: ignore[bad-argument-type]
+      preferred_element_type=out_dtype,  # pyrefly: ignore[bad-argument-type]
       group_offset=group_offset,
       tile_info=drhs_tiling,
   )
+  if row_scale is not None:
+    drhs = (drhs * row_scale).astype(rhs_dtype)
+  return drhs
 
 
 def _drhs_run_megablox(
