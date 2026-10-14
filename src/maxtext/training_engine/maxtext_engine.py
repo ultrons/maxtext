@@ -20,6 +20,7 @@ the MaxRL AbstractTrainer interface without running an outer loop.
 
 from __future__ import annotations
 
+import collections
 from collections.abc import Callable, Iterator, Mapping
 import concurrent.futures
 import contextlib
@@ -27,6 +28,7 @@ import dataclasses
 import functools
 import gc
 import os
+import threading
 import time
 from typing import Any, Optional
 
@@ -165,6 +167,45 @@ def _split_static_and_dynamic(batch: Any) -> tuple[Any, dict[str, Any]]:
     else:
       dynamic[key] = value
   return dynamic, static
+
+
+STAGE_BATCH_ENV = "TUNIX_STAGE_BATCH"
+STAGE_BATCH_MODES = ("off", "stage", "serialize")
+
+
+def stage_batch_mode() -> str:
+  """How `fwd_bwd` moves a micro-batch's traced inputs onto the devices; read from `TUNIX_STAGE_BATCH`.
+
+  `off` (unset, 0/false/no/off): the compiled kernel is called on the host (numpy) leaves and the jit call
+  transfers them. `stage` (1/true/yes/on/stage): a caller may `stage_batch` a payload ahead of its `fwd_bwd`,
+  whose transfer is then issued while the previous micro-batch computes; `fwd_bwd` consumes the staged device
+  tree, and a payload that was not staged is transferred explicitly, after the previous transfer finished.
+  `serialize`: nothing is staged, but `fwd_bwd` transfers its inputs explicitly and waits for the previous
+  call's input transfer first, so two micro-batch transfers never share the host-to-device path (the
+  contention control for `stage`). Read once per engine, at `__init__`, by the process that runs the engine.
+  """
+  value = os.environ.get(STAGE_BATCH_ENV, "").strip().lower()
+  if value in ("", "0", "false", "no", "off"):
+    return "off"
+  if value in ("1", "true", "yes", "on", "stage"):
+    return "stage"
+  if value == "serialize":
+    return "serialize"
+  raise ValueError(f"{STAGE_BATCH_ENV}={value!r}: expected one of {STAGE_BATCH_MODES} (or 1/0).")
+
+
+@dataclasses.dataclass
+class _StagedBatch:
+  """A micro-batch whose traced inputs were transferred ahead of its `fwd_bwd` (`stage_batch`)."""
+
+  # Caller's name for the payload (e.g. the train request id), or None; matched when both sides give one.
+  key: Any
+  signature: Any
+  static: dict[str, Any]
+  # The traced half, as `jax.Array`s on `_batch_data_shardings`; the transfer may still be in flight.
+  dynamic: Any
+  host_bytes: int
+  staged_at: float
 
 
 def _batch_signature(dynamic_batch: Any, static_batch: dict[str, Any]) -> Any:
@@ -966,6 +1007,19 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     self._moe_audit_missing_step = False
     # The last micro-batch, whose overflow flag is read after the next one is dispatched (or in `update`).
     self._pending_overflow_check: _PendingOverflowCheck | None = None
+    # TUNIX_STAGE_BATCH (see `stage_batch_mode`): micro-batches transferred ahead of their `fwd_bwd` by
+    # `stage_batch`, consumed in FIFO order; and the last input transfer this engine issued (staged or not), which
+    # the next one waits for so two transfers never share the host-to-device path. `stage_batch` may run on another
+    # thread than `fwd_bwd`; both touch the FIFO and the transfer handle only under `_stage_lock`.
+    self._stage_mode = stage_batch_mode()
+    self._staged_batches: collections.deque[_StagedBatch] = collections.deque()
+    self._stage_lock = threading.Lock()
+    self._last_input_transfer: Any = None
+    self._stage_warned: set[str] = set()
+    if self._stage_mode != "off":
+      logging.info("%s=%s: micro-batch input transfers are %s.", STAGE_BATCH_ENV, self._stage_mode,
+                   "staged ahead of fwd_bwd when the caller stages them, else explicit and serialized"
+                   if self._stage_mode == "stage" else "explicit and serialized (no staging)")
     # Set when this run resumed from an intra-step checkpoint, cleared once the step it
     # resumed into completes and its finished state has been checkpointed.
     self._resumed_mid_step = False
@@ -2408,17 +2462,147 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     cast = iter(self._cast_uncast_grads([g for g, is_uncast in zip(leaves, uncast) if is_uncast]))
     return treedef.unflatten([next(cast) if is_uncast else g for g, is_uncast in zip(leaves, uncast)])
 
+  @property
+  def stage_batch_mode(self) -> str:
+    """The `TUNIX_STAGE_BATCH` mode this engine was built with: `off`, `stage` or `serialize`."""
+    return self._stage_mode
+
+  @property
+  def staged_batch_count(self) -> int:
+    """How many staged micro-batches wait to be consumed by `fwd_bwd`."""
+    with self._stage_lock:
+      return len(self._staged_batches)
+
+  def _stage_warn_once(self, what: str, msg: str, *args: Any) -> None:
+    if what not in self._stage_warned:
+      self._stage_warned.add(what)
+      logging.warning(msg, *args)
+
+  def _wait_for_input_transfer(self) -> None:
+    """Waits for the last issued micro-batch input transfer: its leaves' readiness only, never any compute.
+
+    Caller holds `_stage_lock`. A `jax.Array` from `device_put` is ready when its transfer landed, whether or not a
+    computation that reads it has run, so this never waits on a dispatched `fwd_bwd`.
+    """
+    previous, self._last_input_transfer = self._last_input_transfer, None
+    if previous is not None:
+      jax.block_until_ready(previous)
+
+  def _issue_input_transfer(self, dynamic_batch: Any) -> Any:
+    """Transfers a traced batch half onto `_batch_data_shardings`, after the previous transfer finished.
+
+    Caller holds `_stage_lock`. Returns the device tree (same structure, `jax.Array` leaves) and keeps it as the
+    transfer the next call waits for. Flattened by hand: the sharding tree has `None` where the batch does, and
+    `flatten_up_to` keeps the two aligned without relying on `device_put`'s own prefix matching.
+    """
+    self._wait_for_input_transfer()
+    leaves, treedef = jax.tree.flatten(dynamic_batch)
+    shardings = treedef.flatten_up_to(self._batch_data_shardings(dynamic_batch))
+    inputs = treedef.unflatten(jax.device_put(leaves, shardings)) if leaves else dynamic_batch
+    self._last_input_transfer = inputs
+    return inputs
+
+  def stage_batch(self, payload: abstract_engine.TrainerPayload, key: Any = None) -> bool:
+    """Transfers a micro-batch's traced inputs onto the devices ahead of its `fwd_bwd` (`TUNIX_STAGE_BATCH=stage`).
+
+    Runs `_prepare_batch` and the static/dynamic split as `fwd_bwd` will, issues one `jax.device_put` of the traced
+    half onto the compiled kernel's input shardings, and queues the device tree. The put is asynchronous: this call
+    returns once the transfer is issued, after waiting for the previous one (staged or not) to finish, so transfers
+    never overlap each other but do overlap whatever computes meanwhile. The next `fwd_bwd` whose batch signature
+    (treedef, shapes, dtypes, static half) matches the queue head consumes it in place of the host leaves; the
+    executable, its `in_shardings` and the results are the same, only the transfer moved earlier. May be called
+    from another thread than `fwd_bwd` (it touches the queue only under its lock).
+
+    Args:
+      payload: The micro-batch, as it will be passed to `fwd_bwd`.
+      key: Optional name for it (the train request id). When both this and `fwd_bwd`'s `stage_key` are given they
+        must agree; `fwd_bwd(None, stage_key=key)` runs the staged batch without a payload of its own.
+
+    Returns:
+      True if the batch was staged; False (logged once per reason) when staging is off, or before the first
+      `compile()` request (the eager path takes host leaves straight into the kernel).
+    """
+    if self._stage_mode != "stage":
+      self._stage_warn_once("mode", "stage_batch called with %s=%s; nothing is staged.", STAGE_BATCH_ENV, self._stage_mode)
+      return False
+    if not self._compile_requested:
+      self._stage_warn_once("eager", "stage_batch called before compile(); the eager path is not staged.")
+      return False
+    t0 = time.perf_counter()
+    dynamic_batch, static_batch = _split_static_and_dynamic(self._prepare_batch(payload))
+    signature = _batch_signature(dynamic_batch, static_batch)
+    host_bytes = sum(int(getattr(leaf, "nbytes", 0)) for leaf in jax.tree.leaves(dynamic_batch))
+    with self._stage_lock:
+      t1 = time.perf_counter()
+      # Waited here, outside `_issue_input_transfer`'s own (then no-op) wait, so the two times are logged apart.
+      self._wait_for_input_transfer()
+      t2 = time.perf_counter()
+      inputs = self._issue_input_transfer(dynamic_batch)
+      self._staged_batches.append(
+          _StagedBatch(key=key, signature=signature, static=static_batch, dynamic=inputs, host_bytes=host_bytes,
+                       staged_at=time.perf_counter())
+      )
+      queued = len(self._staged_batches)
+    logging.info(
+        "STAGE_BATCH key=%s host_bytes=%d prepare_s=%.4f wait_prev_s=%.4f issue_s=%.4f queued=%d",
+        key, host_bytes, t1 - t0, t2 - t1, time.perf_counter() - t2, queued,
+    )
+    return True
+
+  def _take_staged_batch(self, signature: Any, key: Any) -> _StagedBatch | None:
+    """Pops the staged batch `fwd_bwd` should run: the queue head whose signature matches, or the one named `key`.
+
+    A head whose signature differs from the incoming payload's is dropped with a warning (its structure changed, so
+    the transfer was wasted), and the payload takes the explicit transfer. `signature=None` (a `fwd_bwd` with no
+    payload) takes the entry by key, or the head when no key was given.
+    """
+    with self._stage_lock:
+      if not self._staged_batches:
+        return None
+      staged = self._staged_batches[0]
+      if key is not None and staged.key is not None and key != staged.key:
+        named = [s for s in self._staged_batches if s.key == key]
+        if not named:
+          return None
+        staged = named[0]
+        self._staged_batches.remove(staged)
+        logging.warning("fwd_bwd took staged batch %r out of FIFO order (head was %r).", key, self._staged_batches[0].key)
+        return staged
+      if signature is not None and self._needs_recompile(signature, staged.signature):
+        self._staged_batches.popleft()
+        self._stage_warn_once(
+            "signature",
+            "Staged batch %r does not match the fwd_bwd payload's structure; dropped, the payload is transferred "
+            "explicitly. Logged once.",
+            staged.key,
+        )
+        return None
+      self._staged_batches.popleft()
+      return staged
+
   @_profiled_step("fwd_bwd", control_profile=True)
-  def fwd_bwd(self, payload: abstract_engine.TrainerPayload, **kwargs: Any) -> None:
+  def fwd_bwd(self, payload: abstract_engine.TrainerPayload | None, **kwargs: Any) -> None:
     """Executes a micro-batch forward-backward pass and accumulates gradients.
 
     Args:
-      payload: Packed micro-batch training input.
+      payload: Packed micro-batch training input. None under `TUNIX_STAGE_BATCH=stage` runs the staged batch
+        named by `stage_key` (or the queue head) without a payload of its own.
       **kwargs: Implementation-specific options. `apply_optimizer` (bool), which Tunix passes as the
         orchestrator's flag for the step's final micro-batch, selects the final micro-batch's dropless program
-        under `retry_dropless_final_micro_batch`; everything else is ignored.
+        under `retry_dropless_final_micro_batch`; `stage_key` names the staged batch to consume (see
+        `stage_batch`); everything else is ignored.
     """
-    batch = self._prepare_batch(payload)
+    stage_key = kwargs.get("stage_key")
+    staged: _StagedBatch | None = None
+    if payload is None:
+      if self._stage_mode != "stage" or not self._compile_requested:
+        raise ValueError(f"fwd_bwd(None) needs {STAGE_BATCH_ENV}=stage and a compiled engine (stage_key={stage_key!r}).")
+      staged = self._take_staged_batch(None, stage_key)
+      if staged is None:
+        raise ValueError(f"fwd_bwd(None, stage_key={stage_key!r}): no such staged batch ({self.staged_batch_count} queued).")
+      batch = None
+    else:
+      batch = self._prepare_batch(payload)
     apply_optimizer = kwargs.get("apply_optimizer")
     final = False
     if self._dropless_replay and self._final_dropless:
@@ -2446,20 +2630,43 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     model = getattr(self._state, _MODEL_STATE_KEY, self._model)
 
     if self._compile_requested:
-      dynamic_batch, static_batch = _split_static_and_dynamic(batch)
-      # A compiled kernel is valid only for the batch it was built against: the traced
-      # half is baked into `in_shardings`, and the static half is closed over. Either
-      # changing needs a fresh kernel -- reusing it would raise an in_shardings mismatch
-      # for the first, and silently use stale values for the second.
-      signature = _batch_signature(dynamic_batch, static_batch)
+      if staged is not None:
+        dynamic_batch, static_batch, signature = staged.dynamic, staged.static, staged.signature
+      else:
+        dynamic_batch, static_batch = _split_static_and_dynamic(batch)
+        # A compiled kernel is valid only for the batch it was built against: the traced
+        # half is baked into `in_shardings`, and the static half is closed over. Either
+        # changing needs a fresh kernel -- reusing it would raise an in_shardings mismatch
+        # for the first, and silently use stale values for the second.
+        signature = _batch_signature(dynamic_batch, static_batch)
       if not self._compiled or self._needs_recompile(signature, self._compiled_signature):
         # Settled first: its rerun and add run on the kernels and accumulator layout being replaced.
         self._resolve_overflow_check()
         self._compile_for_batch(dynamic_batch, static_batch)
+      if self._stage_mode == "stage" and staged is None:
+        # A batch staged ahead of this call: same signature (so the same executable and in_shardings), its transfer
+        # already issued while the previous micro-batch computed.
+        staged = self._take_staged_batch(signature, stage_key)
+        if staged is not None:
+          dynamic_batch = staged.dynamic
+        else:
+          self._stage_warn_once(
+              "fallback",
+              "fwd_bwd found no staged batch (stage_key=%r); its inputs are transferred explicitly, after the "
+              "previous transfer. Logged once.",
+              stage_key,
+          )
+      if self._stage_mode != "off" and staged is None:
+        # `serialize`, or `stage` without a staged batch: the transfer is issued here rather than inside the jit
+        # call, so the next one can wait for it (`_wait_for_input_transfer`) and the two never run at once.
+        with self._stage_lock:
+          dynamic_batch = self._issue_input_transfer(dynamic_batch)
       # The compiled `fwd_bwd` closes over the static half, so it is passed the traced one only.
       fwd_bwd_kernel, accumulate_kernel, inputs = self._compiled_fwd_bwd, self._compiled_accumulate, dynamic_batch
       dropless_kernel = None
     else:
+      if batch is None:
+        raise ValueError("fwd_bwd(None) is only valid on the compiled path (after compile()).")
       # The eager path honours `optimizer_memory_host_offload` too, as `_compile_for_batch` does.
       self._offload_optimizer_state()
       fwd_bwd_kernel, accumulate_kernel, inputs = self._fwd_bwd_kernel, self._accumulate_kernel, batch
