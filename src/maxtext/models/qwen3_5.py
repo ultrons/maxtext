@@ -207,7 +207,8 @@ class Qwen3_5ScannableBlock(nnx.Module):
     tie_sublayer = -1
     tied: list[tuple[int, str, nnx.Module]] = []
     tied_kernels: list[Array] = []
-    if cfg.scan_weight_prefetch == "block_tie" and kv_cache is None:
+    # getattr: the block is also driven with stub configs that carry only the cycle interval (nnx_decoders_test).
+    if getattr(cfg, "scan_weight_prefetch", None) == "block_tie" and kv_cache is None:
       tie_sublayer = cfg.scan_weight_prefetch_tie_sublayer
       tied = [m for m in self._scan_weight_prefetch_modules() if m[0] >= tie_sublayer]
       if tied:
