@@ -1118,6 +1118,25 @@ def get_physical_spec_without_axes(full_logical, mesh, axes_to_remove, logical_a
   return remove_mesh_axes_from_sharding(physical, axes_to_remove)
 
 
+DENSE_GATHER_AXES = FSDP_MESH_AXES + ("context", "expert")
+
+
+def dense_kernel_gathered_sharding(kernel_axes, mesh, logical_axis_rules=None):
+  """The physical sharding of a dense kernel with the FSDP, context and expert mesh axes peeled.
+
+  Constraining the kernel to this sharding is the explicit form of the all-gather the dot partitioner
+  would otherwise insert for a dense kernel whose embed dim is sharded over those axes (under
+  `cp-as-ep` every dense kernel is sharded `[fsdp, context, expert]` on embed and nothing else, so
+  the result is fully replicated). Used by the scanned-block weight prefetch (`scan_weight_prefetch`).
+
+  Args:
+    kernel_axes: The kernel's logical axis names (a plain tuple, as `DenseGeneral.kernel_axes`).
+    mesh: The device mesh.
+    logical_axis_rules: Logical-to-physical rules; defaults to the ambient rules context.
+  """
+  return get_physical_spec_without_axes(P(*kernel_axes), mesh, DENSE_GATHER_AXES, logical_axis_rules)
+
+
 def get_physical_spec_no_fsdp(full_logical, mesh, logical_axis_rules):
   """
   Generates a physical sharding spec for fully replicated weights.

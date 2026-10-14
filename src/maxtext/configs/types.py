@@ -1270,6 +1270,45 @@ class MoEGeneral(BaseModel):
           " and logs a warning."
       ),
   )
+  scan_weight_prefetch: None | Literal["block_tie", "scan_carry"] = Field(
+      None,
+      description=(
+          "Dense-weight gather prefetch inside the scanned Qwen3.5 layer block (requires scan_layers=True and"
+          " decoder_block=qwen3_5; None ('none' on the command line) is off). 'block_tie' gathers the selected dense"
+          " kernels (scan_weight_prefetch_set) explicitly at the top of the block, ties them to the input of sub-layer"
+          " scan_weight_prefetch_tie_sublayer with a forward-only jax.lax.optimization_barrier and installs the gathered"
+          " values into the modules, so the scheduler issues those gathers under the preceding GDN+MoE sub-layers"
+          " instead of inside the attention sub-layer's KV-gather window. The barrier is the identity, so the math is"
+          " unchanged. Only the forward schedule is constrained; the backward regathers as before. Kernels consumed by"
+          " a sub-layer before the tie point are left to the partitioner as today. 'scan_carry' (prefetch through the"
+          " scan carry, one iteration ahead) is reserved and raises NotImplementedError. When"
+          " --xla_tpu_aggressive_opt_barrier_removal=true or ENABLED applies (compile_xla_flags overrides"
+          " LIBTPU_INIT_ARGS and XLA_FLAGS) the validator logs a warning and sets the knob to None."
+      ),
+  )
+  scan_weight_prefetch_set: Literal["attn_q_shared_wi", "attn_layer"] = Field(
+      "attn_q_shared_wi",
+      description=(
+          "Which dense kernels scan_weight_prefetch gathers. 'attn_q_shared_wi': the full-attention sub-layer's query"
+          " kernel and every sub-layer's shared-expert wi kernels. 'attn_layer': the full-attention sub-layer's query,"
+          " key, value and output kernels, its shared-expert wi/wo kernels and its router gate kernel."
+      ),
+  )
+  scan_weight_prefetch_tie_sublayer: int = Field(
+      2,
+      description=(
+          "block_tie only: index of the sub-layer in the layer cycle (0 <= k < inhomogeneous_layer_cycle_interval)"
+          " at whose input the gathered kernels are tied. The gathers of kernels consumed by sub-layers k.. are"
+          " then issued under sub-layers 0..k-1."
+      ),
+  )
+  scan_weight_prefetch_sparse_core_id: int = Field(
+      -1,
+      description=(
+          "block_tie only: when >= 0, the explicit gathers run under compute_on('tpu_sparsecore') pinned to this"
+          " SparseCore id (as moe_fsdp_all_gather_sparse_core_id); -1 leaves the placement to XLA."
+      ),
+  )
   shard_exp_on_fsdp: bool = Field(
       False,
       description="Shard the expert dimension of the MLP weights on the FSDP axis, "
@@ -3612,6 +3651,40 @@ FORCED_ROUTING_SUPPORTED_DECODER_BLOCKS = (
 )
 
 
+def validate_scan_weight_prefetch(config) -> None:
+  """Validates the scan_weight_prefetch knobs on a MaxTextConfig or RLConfig (shared by both).
+
+  'block_tie' needs the scanned Qwen3.5 layer block (the only block with the layer_i cycle structure the tie point
+  refers to) and a tie sub-layer inside the cycle. 'scan_carry' is reserved. When XLA strips optimization barriers
+  the tie could order nothing, so the knob is switched off with a warning rather than compiling a no-op.
+  """
+  mode = config.scan_weight_prefetch
+  if mode is None:
+    return
+  if mode == "scan_carry":
+    raise NotImplementedError("scan_weight_prefetch=scan_carry is reserved (design step 2) and not implemented.")
+  if not config.scan_layers:
+    raise ValueError("scan_weight_prefetch requires scan_layers=True: the prefetch lives in the scanned layer block.")
+  if config.decoder_block != DecoderBlockType.QWEN3_5:
+    raise ValueError(
+        "scan_weight_prefetch requires decoder_block=qwen3_5 (Qwen3_5ScannableBlock), got"
+        f" decoder_block={config.decoder_block.value!r}."
+    )
+  cycle = config.inhomogeneous_layer_cycle_interval
+  tie = config.scan_weight_prefetch_tie_sublayer
+  if not 0 <= tie < cycle:
+    raise ValueError(
+        f"scan_weight_prefetch_tie_sublayer={tie} must be in [0, inhomogeneous_layer_cycle_interval={cycle})."
+    )
+  if max_utils.xla_strips_optimization_barriers(config.compile_xla_flags):
+    max_logging.warning(
+        f"scan_weight_prefetch={mode} is disabled: --xla_tpu_aggressive_opt_barrier_removal=true (or ENABLED)"
+        " removes optimization barriers before scheduling, so the tie could not order the gathers. Set it to false"
+        " to use the prefetch."
+    )
+    config.scan_weight_prefetch = None
+
+
 def check_forced_routing_support(decoder_block: DecoderBlockType) -> None:
   """Raises NotImplementedError if `decoder_block` does not support router replay."""
   if decoder_block not in FORCED_ROUTING_SUPPORTED_DECODER_BLOCKS:
@@ -5149,6 +5222,7 @@ class MaxTextConfig(
     self.validate_num_moe_emb_chunks()
     self.validate_moe_quantize_token_all_gather()
     self.validate_moe_expert_weight_prefetch()
+    validate_scan_weight_prefetch(self)
     self.validate_mllog()
 
     if self.enable_streaming_diloco:
@@ -5984,6 +6058,7 @@ class RLConfig(
       raise ValueError(
           "moe_expert_weight_prefetch requires sparse_matmul=True: only the sparse-matmul MoE path places the barrier."
       )
+    validate_scan_weight_prefetch(self)
 
     # Set tokenizer_path based on model_name if not explicitly provided.
     tokenizer_path = getattr(self, "tokenizer_path", None)

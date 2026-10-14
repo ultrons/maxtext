@@ -20,12 +20,15 @@ import functools
 from typing import Any, cast
 
 from flax import nnx
+import jax
 from jax.ad_checkpoint import checkpoint_name
+from jax.experimental.compute_on import compute_on
 import jax.numpy as jnp
 from jax.sharding import Mesh
 from maxtext.common.common_types import MODEL_MODE_TRAIN, Array, Config, ShardMode, get_weight_dtype
 from maxtext.layers import initializers as max_initializers
 from maxtext.layers import nnx_wrappers
+from maxtext.layers.moe import barrier_tie
 from maxtext.layers.normalizations import Qwen3NextRMSNorm
 from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.models.qwen3 import (
@@ -33,8 +36,15 @@ from maxtext.models.qwen3 import (
     Qwen3NextGatedDeltaNet,
     Qwen3NextSparseMoeBlock,
 )
+from maxtext.utils import max_logging
 from maxtext.utils import max_utils
-from maxtext.utils.sharding import create_sharding, get_logical_axis_rules, maybe_shard_with_logical
+from maxtext.utils.sharding import (
+    create_sharding,
+    dense_kernel_gathered_sharding,
+    get_logical_axis_rules,
+    maybe_shard_with_logical,
+    maybe_shard_with_name,
+)
 
 # -----------------------------------------
 # Qwen3.5 Layer Implementations
@@ -78,6 +88,94 @@ class Qwen3_5ScannableBlock(nnx.Module):
       )
       setattr(self, layer_name, layer)
 
+  def _scan_weight_prefetch_modules(self) -> list[tuple[int, str, nnx.Module]]:
+    """The dense-kernel modules `scan_weight_prefetch` gathers, as `(sub-layer index, path, module)`.
+
+    `attn_q_shared_wi`: the full-attention sub-layer's query kernel and every sub-layer's shared-expert
+    wi kernels (the two gathers measured exposed inside the KV-gather window). `attn_layer`: the
+    full-attention sub-layer's query, key, value and output kernels, its shared-expert wi/wo kernels
+    and its router gate kernel.
+    """
+    cfg = self.config
+    layers = [getattr(self, f"layer_{i}") for i in range(cfg.inhomogeneous_layer_cycle_interval)]
+
+    def shared_wi_wo(layer, i):
+      mlp = layer.mlp.shared_expert
+      if mlp is None:
+        return [], []
+      if cfg.fused_mlp:
+        wi = [(i, f"layer_{i}.mlp.shared_expert.wi", mlp.wi)]
+      else:
+        names = ["wi"] if len(mlp.activations) == 1 else [f"wi_{k}" for k in range(len(mlp.activations))]
+        wi = [(i, f"layer_{i}.mlp.shared_expert.{n}", getattr(mlp, n)) for n in names]
+      return wi, [(i, f"layer_{i}.mlp.shared_expert.wo", mlp.wo)]
+
+    def attention_projections(layer, i, all_of_them):
+      attn = layer.attention.attention
+      prefix = f"layer_{i}.attention.attention"
+      if cfg.fused_qkv:
+        mods = [(i, f"{prefix}.qkv_proj", attn.qkv_proj)]
+      else:
+        mods = [(i, f"{prefix}.query", attn.query)]
+        if all_of_them:
+          mods.append((i, f"{prefix}.key", attn.key))
+          if not attn.share_kv_projections:
+            mods.append((i, f"{prefix}.value", attn.value))
+      if all_of_them:
+        mods.append((i, f"{prefix}.out", attn.out))
+      return mods
+
+    selected = []
+    if cfg.scan_weight_prefetch_set == "attn_q_shared_wi":
+      for i, layer in enumerate(layers):
+        if isinstance(layer.attention, Qwen3_5FullAttention):
+          selected += attention_projections(layer, i, all_of_them=False)
+      for i, layer in enumerate(layers):
+        selected += shared_wi_wo(layer, i)[0]
+    elif cfg.scan_weight_prefetch_set == "attn_layer":
+      for i, layer in enumerate(layers):
+        if not isinstance(layer.attention, Qwen3_5FullAttention):
+          continue
+        selected += attention_projections(layer, i, all_of_them=True)
+        wi, wo = shared_wi_wo(layer, i)
+        selected += wi + wo
+        selected.append((i, f"layer_{i}.mlp.routed_experts.gate", layer.mlp.routed_experts.gate))
+    else:
+      raise ValueError(f"unknown scan_weight_prefetch_set {cfg.scan_weight_prefetch_set!r}")
+    return selected
+
+  def _prefetch_dense_kernels(self, modules):
+    """Explicit all-gathers of the selected kernels, in each module's compute dtype.
+
+    Each kernel is constrained to its physical sharding with the fsdp, fsdp_transpose, context and
+    expert axes peeled (`dense_kernel_gathered_sharding`), which is the gather the dot partitioner
+    would insert on its own; once the value is already in that layout the partitioner inserts no
+    second gather. The cast mirrors `DenseGeneral.__call__` / `GateLogit.__call__`, which cast the
+    kernel they read to their `dtype` before the dot, so the gathered bytes are the same as today's.
+    With `scan_weight_prefetch_sparse_core_id >= 0` the gathers run under `compute_on("tpu_sparsecore")`
+    pinned to that core, as `moe_pin_sparse_core_all_gathers` does for the expert weights.
+    """
+    cfg = self.config
+    rules = get_logical_axis_rules()
+    core_id = cfg.scan_weight_prefetch_sparse_core_id
+
+    def gather(kernel, sharding):
+      return maybe_shard_with_name(kernel, sharding, cfg.shard_mode, debug_sharding=cfg.debug_sharding)
+
+    if core_id >= 0:
+      gather = compute_on(
+          gather,
+          compute_type="tpu_sparsecore",
+          out_memory_spaces=jax.memory.Space.Device,
+          compiler_options={"sparse_core_config": {"core_ids": [core_id]}},
+      )
+
+    gathered = []
+    for _, _, mod in modules:
+      kernel = jnp.asarray(mod.kernel[...], mod.dtype)
+      gathered.append(gather(kernel, dense_kernel_gathered_sharding(mod.kernel_axes, self.mesh, rules)))
+    return gathered
+
   def __call__(
       self,
       carry: jnp.ndarray,
@@ -98,8 +196,35 @@ class Qwen3_5ScannableBlock(nnx.Module):
     # list before the scan and ungroups the returned tuple afterwards.
     updated_kv_caches = []
 
+    # scan_weight_prefetch=block_tie (design note scan_prefetch_design_1014.md, step 1): gather the selected dense
+    # kernels at the top of the block and tie them to the input of sub-layer `tie_sublayer` with a forward-only
+    # optimization barrier. Nothing computed from the tied `x` can start before the gathers are done, so the
+    # scheduler has to issue them under sub-layers 0..tie_sublayer-1 instead of inside the attention sub-layer,
+    # where today they queue behind the context-parallel KV sequence gathers on the SparseCore. The barrier is the
+    # identity and the gathered bytes are the ones the partitioner would have gathered anyway, so the math is
+    # unchanged; the backward is untouched (it regathers as before). Kernels consumed by a sub-layer before the tie
+    # point cannot be ordered by it (their own dot already forces the gather) and are left to the partitioner.
+    tie_sublayer = -1
+    tied: list[tuple[int, str, nnx.Module]] = []
+    tied_kernels: list[Array] = []
+    if cfg.scan_weight_prefetch == "block_tie" and kv_cache is None:
+      tie_sublayer = cfg.scan_weight_prefetch_tie_sublayer
+      tied = [m for m in self._scan_weight_prefetch_modules() if m[0] >= tie_sublayer]
+      if tied:
+        tied_kernels = self._prefetch_dense_kernels(tied)
+        max_logging.info(
+            f"scan_weight_prefetch=block_tie: {len(tied_kernels)} dense kernel gather(s) tied to the input of"
+            f" sub-layer {tie_sublayer}: {', '.join(path for _, path, _ in tied)}"
+        )
+
     for i in range(cfg.inhomogeneous_layer_cycle_interval):
       layer = getattr(self, f"layer_{i}")
+      if i == tie_sublayer and tied_kernels:
+        # Both outputs of the tie replace both inputs downstream: `x` feeds this and the later sub-layers, and the
+        # gathered kernels are installed into their modules, whose dots read them.
+        x, tied_kernels = barrier_tie(x, tuple(tied_kernels))
+        for (_, _, mod), kernel in zip(tied, tied_kernels):
+          mod.kernel.value = kernel
       # forced_routed_experts, when present, is shaped
       # [inhomogeneous_layer_cycle_interval, batch, seq, top_k]: one slice per
       # sub-layer in this cycle (see nnx_decoders.py's scan wiring).
