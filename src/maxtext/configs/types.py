@@ -749,6 +749,10 @@ class LogitsAndLoss(BaseModel):
       False,
       description="All gather the output head weight once before the tiled loss so the backward reuses it.",
   )
+  grpo_logps_head_ag_once: bool = Field(
+      False,
+      description="Tunix chunked log-probs: all gather the output head once before the chunk scan, reduce its gradient once after.",
+  )
 
 
 class Attention(BaseModel):

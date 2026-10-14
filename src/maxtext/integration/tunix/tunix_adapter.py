@@ -29,6 +29,13 @@ from jax import Array
 from maxtext.checkpoint_conversion.utils.hf_model_configs import HF_MODEL_CONFIGS  # pylint: disable=ungrouped-imports
 from maxtext.integration.tunix.utils import VllmWeightMapping
 from maxtext.models.models import Transformer
+from maxtext.utils.sharding import (
+    FSDP_MESH_AXES,
+    get_logical_axis_rules,
+    get_physical_spec_without_axes,
+    maybe_shard_with_name,
+)
+from maxtext.utils.vocabulary_tiling import _is_output_head_param_path
 
 
 import jax
@@ -174,6 +181,30 @@ class TunixMaxTextAdapter(nnx.Module):
         deterministic=True,
         model_mode=getattr(self.base, "model_mode", "train"),
     )
+
+  def gather_output_head(self) -> "TunixMaxTextAdapter":
+    """Returns a copy whose output-head params are replicated over the embed-sharding mesh axes.
+
+    Tunix's `compute_chunked_logps` calls this once before its scan over sequence chunks, so the
+    head (`decoder_norm`, `logits_dense`, and the embedding when logits are tied) is all-gathered
+    once instead of inside every chunk of the forward and the remat backward, and the head
+    gradient is accumulated across chunks and reduced once, by the transpose of the constraint,
+    after the loop. Same gather as `vocab_tiling_nnx_loss` under `vocab_tiling_ag_once`. The
+    gathered table keeps the params' dtype. `self` is not modified; with
+    `grpo_logps_head_ag_once` off this returns `self`.
+    """
+    config = self.base.config
+    if not getattr(config, "grpo_logps_head_ag_once", False):
+      return self
+    graphdef, head_params, rest = nnx.split(self, nnx.All(nnx.Param, _is_output_head_param_path), ...)
+    head_physical_spec = get_physical_spec_without_axes(
+        nnx.get_partition_spec(head_params),
+        self.base.mesh,
+        FSDP_MESH_AXES + ("context", "context_usp_ulysses", "expert"),
+        get_logical_axis_rules() or config.logical_axis_rules,
+    )
+    head_params = maybe_shard_with_name(head_params, head_physical_spec, shard_mode=config.shard_mode)
+    return nnx.merge(graphdef, head_params, rest, copy=True)
 
   def to_hf_mappings(self):
     if self.use_no_op_mappings:

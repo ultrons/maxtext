@@ -831,6 +831,10 @@ num_vocab_tiling: 1
 # reuses it instead of re-gathering per chunk. Faster when steps are short enough to expose
 # the gathers; holds the gathered head in memory for the backward.
 vocab_tiling_ag_once: false
+# Tunix RL chunked log-probs (TunixMaxTextAdapter.gather_output_head): all gather the output head once
+# before the chunk scan and reduce its gradient once after it, instead of per chunk. Holds the
+# gathered head and its gradient accumulator in memory for the scan.
+grpo_logps_head_ag_once: false
 
 # Tokenizer
 vocab_size: 32_000 # powers of 2 for sharding

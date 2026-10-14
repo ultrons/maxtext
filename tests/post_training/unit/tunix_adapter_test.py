@@ -449,6 +449,14 @@ class TunixAdapterChunkedLogpsTest(unittest.TestCase):
     self.assertEqual(logits.shape, (2, 3, 2))
     self.assertTrue(base.captured["vocab_tiling_deterministic"])
 
+  def test_gather_output_head_is_identity_when_flag_off(self):
+    base = _NNXLinearBase(vocab_size=8, emb_dim=4)
+    adapter = TunixMaxTextAdapter(base_model=base, pad_id=0)
+    # A config without the key (older configs) and one with it off both return the adapter itself.
+    self.assertIs(adapter.gather_output_head(), adapter)
+    base.config.grpo_logps_head_ag_once = False
+    self.assertIs(adapter.gather_output_head(), adapter)
+
   def test_compute_per_token_logps_chunked_matches_unchunked_and_differentiable(
       self,
   ):
