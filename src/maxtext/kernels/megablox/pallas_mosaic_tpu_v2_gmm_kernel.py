@@ -18,6 +18,7 @@
 
 from abc import ABC, abstractmethod
 import dataclasses
+import os
 import functools
 from typing import Any, Callable, Tuple
 
@@ -1233,6 +1234,15 @@ def make_gmm_configs(
         "fp8/int8 matmul."
     )
   has_lhs_scale = lhs_scale is not None and lhs_q_dtype is not None
+  if os.environ.get("MAXTEXT_GMM_V2_TRACE_LOG"):
+    # Trace-time receipt of which matmul dtypes a gmm_v2 call compiles to.
+    print(
+        f"GMM_V2_TRACE m={dims.size_m} k={dims.size_k} n={dims.size_n} g={dims.size_group}"
+        f" lhs={jnp.dtype(lhs.dtype).name} rhs={jnp.dtype(rhs.dtype).name}"
+        f" rhs_scale={None if rhs_scale is None else tuple(rhs_scale.shape)}"
+        f" lhs_q_dtype={None if lhs_q_dtype is None else jnp.dtype(lhs_q_dtype).name}",
+        flush=True,
+    )
 
   lhs_cfgs = InputConfigs(
       quant_dtype=lhs_q_dtype,

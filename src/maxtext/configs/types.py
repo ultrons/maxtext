@@ -1335,6 +1335,18 @@ class MoEGeneral(BaseModel):
           " on weight sync. Activations stay in dtype."
       ),
   )
+  fp8_moe_gmm: bool = Field(
+      False,
+      description=(
+          "Run the routed-expert forward GMMs (tokamax gmm_v2, wi and wo) in FP8: the bf16 expert weights are"
+          " quantized inside the GMM custom VJP to float8_e4m3fn with one absmax scale per expert and output"
+          " channel (the fp8_moe rollout grid, quantize_weight_per_channel), and gmm_v2 quantizes the"
+          " activations dynamically to e4m3 (per row and 512-wide K block). The backward dlhs/drhs run in"
+          " the dtype as before, against the dequantized weight, with a straight-through weight gradient."
+          " Replaces fp8_moe_fake_quant for the GMM kernels. Requires sparse_matmul, use_tokamax_gmm and"
+          " use_gmm_v2."
+      ),
+  )
   rollout_fp8_moe: bool = Field(
       False,
       description=(

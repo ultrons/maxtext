@@ -43,6 +43,19 @@ DRHS_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
 )
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Fp8MoeGmmRule(qwix.QtRule):
+  """fp8_moe_gmm: forward-only FP8 GMM rule (gmm_v2 only).
+
+  The forward quantizes the bf16 weight with `quantizations.quantize_weight_per_channel` (float8_e4m3fn,
+  one absmax scale per group and output channel, i.e. the fp8_moe rollout grid), and gmm_v2 quantizes
+  lhs dynamically to e4m3 because rhs carries a scale. The backward dequantizes the saved weight to the
+  weight dtype and runs dlhs/drhs unquantized; act_qtype/bwd_qtype stay None, so lhs and the incoming
+  gradient are never quantized there. The weight gradient is straight-through (rhs enters the custom
+  VJP unquantized).
+  """
+
+
 def gmm(
     lhs: jnp.ndarray,
     rhs: jnp.ndarray,
@@ -76,6 +89,7 @@ def gmm(
     use_gmm_v2: bool = False,
     use_gmm_v2_heuristic_tiling: bool = False,
     partial_sum: jnp.ndarray | None = None,
+    fp8_moe_gmm: bool = False,
 ):
   """Grouped matrix multiplication operation."""
   if interpret is None:
@@ -106,6 +120,13 @@ def gmm(
           act_qtype=lhs_quantize_dtype,
           act_calibration_method="absmax",
       )
+
+  if fp8_moe_gmm:
+    if not (use_tokamax_backend and use_gmm_v2):
+      raise ValueError("fp8_moe_gmm requires the tokamax gmm_v2 backend.")
+    if quantization_rule is not None:
+      raise ValueError("fp8_moe_gmm cannot be combined with another GMM quantization rule.")
+    quantization_rule = Fp8MoeGmmRule(weight_qtype=jnp.float8_e4m3fn, weight_calibration_method="absmax")
 
   gmm_fwd_bwd = lambda *args: _gmm_fwd(*args)[0]  # pylint: disable=C3001
   gmm_fwd_bwd = jax.custom_vjp(
@@ -269,6 +290,11 @@ def _fwd_quantize_activation_and_weight(
         # pyrefly: ignore[bad-argument-type]
         calibration_method=quantization_rule.act_calibration_method,
     )
+
+  if isinstance(quantization_rule, Fp8MoeGmmRule) and not isinstance(rhs, qpl.QArray):
+    # Per (group, output channel) e4m3 codes, bit-identical to the fp8_moe rollout's weight-sync quantization.
+    q, scale = quantizations.quantize_weight_per_channel(rhs, channel_axis=1 if transpose_rhs else 2)
+    return lhs, qpl.QArray(qvalue=q, scale=scale, zero_point=None, qtype=jnp.float8_e4m3fn)
 
   if quantization_rule.weight_qtype and not isinstance(rhs, qpl.QArray):
     if not use_manual_quantization:
@@ -639,6 +665,9 @@ def _bwd_prepare_inputs(
   # Assume channelwise scale on rhs n.
   # Apply rhs.scale to dlhs_dout to avoid dequantizing or requantizing rhs.
   # We cannot apply the scale to dlhs because axis n will disappear there.
+  if isinstance(quantization_rule, Fp8MoeGmmRule) and isinstance(rhs, qpl.QArray):
+    # Same formula as fake_quantize_weight_per_channel: dlhs runs against exactly the forward's weight values.
+    rhs = (rhs.qvalue.astype(jnp.float32) * rhs.scale).astype(grad.dtype)
   if isinstance(rhs, qpl.QArray):
     # rhs - qvalue: [g, k, n] scale: [1, 1, n], assume transpose_rhs=False
     if not use_gmm_v2:

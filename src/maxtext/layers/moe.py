@@ -708,6 +708,13 @@ class RoutedMoE(nnx.Module):
       weight_dtype = weight_quant.weight_dtype
     elif getattr(config, "fp8_moe", False):
       weight_dtype = jnp.float8_e4m3fn
+    if getattr(config, "fp8_moe_gmm", False):
+      if config.fp8_moe:
+        raise ValueError("fp8_moe stores the expert weights in FP8 already; fp8_moe_gmm needs them unquantized.")
+      if not (config.sparse_matmul and config.use_tokamax_gmm and config.use_gmm_v2):
+        raise ValueError("fp8_moe_gmm requires sparse_matmul=true, use_tokamax_gmm=true and use_gmm_v2=true.")
+      if config.quantization:
+        raise ValueError("fp8_moe_gmm is its own GMM quantization; it requires quantization=''.")
     if config.fp8_moe_fake_quant:
       if config.fp8_moe:
         raise ValueError("fp8_moe stores the expert weights in FP8 already; fp8_moe_fake_quant needs them unquantized.")
@@ -2141,6 +2148,7 @@ class RoutedMoE(nnx.Module):
             use_gmm_v2_heuristic_tiling=self.config.use_gmm_v2_heuristic_tiling,
             partial_sum=partial_sum,
             interpret=megablox_interpret,
+            fp8_moe_gmm=self.config.fp8_moe_gmm,
         )
       else:
         # jax.lax.ragged_dot
@@ -4481,7 +4489,8 @@ class RoutedMoE(nnx.Module):
         w0_kernel = _maybe_native_gmm_weight(self.wi_0[...], wi_0_scale)
         w1_kernel = _maybe_native_gmm_weight(self.wi_1[...], wi_1_scale)
 
-    if cfg.fp8_moe_fake_quant and not is_fused_moe_path:
+    # fp8_moe_gmm quantizes the GMM weights itself, onto the same per-channel grid (inside the GMM custom VJP).
+    if cfg.fp8_moe_fake_quant and not is_fused_moe_path and not cfg.fp8_moe_gmm:
       # Axis 2 is the output dim of wi_0/wi_1 (mlp) and wo (embed). An fp8_moe rollout quantizes the
       # fused wi = [wi_0 | wi_1] per output channel, so rounding the halves separately is identical.
       w0_kernel = quantizations.fake_quantize_weight_per_channel(w0_kernel)
